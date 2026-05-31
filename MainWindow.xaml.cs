@@ -1,0 +1,3313 @@
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Data;
+using System.Windows.Documents;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Threading;
+using ExtremeSignalAppCS.Helper;
+using ExtremeSignalAppCS.Models;
+using ExtremeSignalAppCS.Services;
+using ExtremeSignalAppCS.Controls;
+using KeyEventArgs = System.Windows.Input.KeyEventArgs;
+using Color = System.Windows.Media.Color;
+using ColorConverter = System.Windows.Media.ColorConverter;
+using MessageBox = System.Windows.MessageBox;
+using DataGrid = System.Windows.Controls.DataGrid;
+using Brushes = System.Windows.Media.Brushes;
+using Application = System.Windows.Application;
+
+namespace ExtremeSignalAppCS
+{
+    /// <summary>
+    /// 專業交易系統主介面控制中心。
+    /// 負責雙軌行情資料流調度、COM 行情連接點事件監聽、背景非同步計算 Debounce 與頂級 UI 著色更新。
+    /// </summary>
+    public partial class MainWindow : Window
+    {
+        // 核心運算與推播服務
+        private readonly TradingEngine _engine;
+        private readonly TelegramService _tgService;
+        // 原生元大 COM 行情連線相關欄位
+        private AxYuantaQuoteHost? _axHost;
+        private YuantaQuoteWrapper? _yuantaQuote;
+        private string[] _symbolsToRegister = [];
+
+        // 雙軌行情資料快取 (大臺/小臺, 日盤/夜盤)
+        private readonly Dictionary<string, Dictionary<string, List<TradeTick>>> _liveSymbolTrades;
+        private readonly Dictionary<string, Dictionary<string, List<TradeTick>>> _replaySymbolTrades;
+
+        // O(1) 累計狀態 (實時與回放雙軌隔離)
+        private readonly Dictionary<string, Dictionary<string, TradingState>> _rtState;
+        private readonly Dictionary<string, Dictionary<string, TradingState>> _replayRtState;
+
+        private readonly System.Threading.Lock _rtLock = new(); // C# 13 新型執行緒同步安全鎖
+
+        // 靜態編譯期 Regex 產生器
+        [System.Text.RegularExpressions.GeneratedRegex(@"Symbol=([^, \t\r\n]+)")]
+        private static partial System.Text.RegularExpressions.Regex SymbolRegex();
+
+        [System.Text.RegularExpressions.GeneratedRegex(@"mattime=([^, \t\r\n]+)")]
+        private static partial System.Text.RegularExpressions.Regex MatTimeRegex();
+
+        [System.Text.RegularExpressions.GeneratedRegex(@"matpri=([-]?\d+)")]
+        private static partial System.Text.RegularExpressions.Regex MatPriRegex();
+
+        [System.Text.RegularExpressions.GeneratedRegex(@"tmatqty=([-]?\d+)")]
+        private static partial System.Text.RegularExpressions.Regex TMatQtyRegex();
+
+        [System.Text.RegularExpressions.GeneratedRegex(@"bestbp=([\d,]*)")]
+        private static partial System.Text.RegularExpressions.Regex BestBpRegex();
+
+        [System.Text.RegularExpressions.GeneratedRegex(@"bestsp=([\d,]*)")]
+        private static partial System.Text.RegularExpressions.Regex BestSpRegex();
+
+        // 實時行情背景 Debounce 計算執行緒相關
+        private readonly AutoResetEvent _analysisEvent = new(false);
+        private CancellationTokenSource? _analysisCts;
+        private Task? _analysisTask;
+
+        // 復盤回放背景執行緒相關
+        private CancellationTokenSource? _replayCts;
+        private Task? _replayTask;
+        private List<TradeTick> _allParsedTicks = [];
+        private bool _isReplaying;
+        private bool _wasPlayingBeforeDrag;
+
+        // 快取與狀態變數
+        private readonly HashSet<(string Symbol, string Session, string Type, int Price, string ATime)> _rtNotifiedKeys = [];
+        private readonly Dictionary<string, double?> _rtLastNetSpeedsTop = new() { { "TXF", null }, { "MXF", null } };
+        private readonly Dictionary<string, double?> _rtLastNetSpeedsBot = new() { { "TXF", null }, { "MXF", null } };
+        private readonly Dictionary<string, int> _rtLastMatchQty = [];
+
+        // 智慧操作感知型降頻快取 (Interaction-Aware Throttle)
+        private string _lastRenderedContent = string.Empty;
+        private double _lastTxtRenderTime;
+        private int _replayThrottleCounter;
+
+        // 參數與狀態
+        private string _currentSessionName = "日盤";
+        private int _currentRealtimePort = 443;
+        private int _currentTargetDays = 60;
+        private int _currentKlineInterval = 30;
+        private int _currentObsN = 25;
+        private int? _lastMxfPrice;
+        private string? _currentReplayDir;
+        private string _currentReplaySession = "日盤";
+        private string? _lastAutofillKlineTime;
+        private List<(string Symbol, string Session, int DayMin, int DayMax, List<SimulationResult> Details)> _lastRtStatusSnapshot = [];
+        private readonly bool _isInitialized = false; // WPF 視窗初始化安全防護標記
+
+        // UI 表格資料繫結 Observable 容器
+        private readonly ObservableCollection<KlineBar> _klineCollection = [];
+        private readonly ObservableCollection<SimulationResult> _obsCollection = [];
+
+        public MainWindow()
+        {
+            _engine = new TradingEngine();
+            _tgService = new TelegramService();
+
+            // 1. 初始化資料結構
+            _liveSymbolTrades = new Dictionary<string, Dictionary<string, List<TradeTick>>>
+            {
+                { "TXF", new Dictionary<string, List<TradeTick>> { { "日盤", new() }, { "夜盤", new() } } },
+                { "MXF", new Dictionary<string, List<TradeTick>> { { "日盤", new() }, { "夜盤", new() } } }
+            };
+
+            _replaySymbolTrades = new Dictionary<string, Dictionary<string, List<TradeTick>>>
+            {
+                { "TXF", new Dictionary<string, List<TradeTick>> { { "日盤", new() }, { "夜盤", new() } } },
+                { "MXF", new Dictionary<string, List<TradeTick>> { { "日盤", new() }, { "夜盤", new() } } }
+            };
+
+            _rtState = new Dictionary<string, Dictionary<string, TradingState>>
+            {
+                { "TXF", new Dictionary<string, TradingState> { { "日盤", new() }, { "夜盤", new() } } },
+                { "MXF", new Dictionary<string, TradingState> { { "日盤", new() }, { "夜盤", new() } } }
+            };
+
+            _replayRtState = new Dictionary<string, Dictionary<string, TradingState>>
+            {
+                { "TXF", new Dictionary<string, TradingState> { { "日盤", new() }, { "夜盤", new() } } },
+                { "MXF", new Dictionary<string, TradingState> { { "日盤", new() }, { "夜盤", new() } } }
+            };
+
+            InitializeComponent();
+
+            // 2. 繫結 WPF DataGrid 容器
+            dgKline.ItemsSource = _klineCollection;
+            dgObserver.ItemsSource = _obsCollection;
+
+            // 3. 註冊視窗載入與關閉事件
+            Loaded += MainWindow_Loaded;
+            Closed += MainWindow_Closed;
+
+            _isInitialized = true; // 所有元件與事件綁定完成，正式開放事件處理
+        }
+
+        private void MainWindow_Loaded(object sender, RoutedEventArgs e)
+        {
+            // 載入設定檔
+            LoadConfig();
+
+            // 初始化未破停損分K監控與 K線圖
+            wndUnbrokenK.Initialize(_engine, this);
+
+            // 啟動非同步背景 Telegram 傳送
+            _tgService.Start();
+
+            // 啟動實時行情背景 Debounce 分析 Task
+            _analysisCts = new CancellationTokenSource();
+            _analysisTask = Task.Run(() => AnalysisWorkerLoopAsync(_analysisCts.Token));
+
+            AppendLog("【系統】C# WPF 高性能交易看盤軟體載入成功。");
+
+            // 啟動自動連線與訂閱商品 (開機即時載入)
+            StartRealtime();
+        }
+
+        private void MainWindow_Closed(object? sender, EventArgs e)
+        {
+            StopReplay();
+            StopRealtime();
+
+            // 釋放背景 Task 與 Channel
+            _analysisCts?.Cancel();
+            _analysisCts?.Dispose();
+            _tgService.Dispose();
+
+            wndUnbrokenK.Reset();
+            klineChart.Reset();
+        }
+
+        // ==================== 0. 設定載入 ====================
+
+        private void LoadConfig()
+        {
+            try
+            {
+                string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
+                if (File.Exists(configPath))
+                {
+                    string json = File.ReadAllText(configPath, Encoding.UTF8);
+                    using var doc = JsonDocument.Parse(json);
+                    var root = doc.RootElement;
+                    
+                    if (root.TryGetProperty("telegram_token", out var tokenProp))
+                        _tgService.Token = tokenProp.GetString() ?? "";
+                    if (root.TryGetProperty("telegram_chat_id", out var chatProp))
+                        _tgService.ChatId = chatProp.GetString() ?? "";
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"【系統】載入 config.json 出錯: {ex.Message}");
+            }
+        }
+
+        // ==================== 1. 元大 COM API 連接與斷開 ====================
+
+        private void StartRealtime()
+        {
+            if (_yuantaQuote != null) return;
+
+            AppendLog("【行情】正在嘗試加載原生 32-bit 元大行情 COM 控制項...");
+            btnRealtime.Content = "停止即時行情";
+            btnRealtime.Background = System.Windows.Media.Brushes.Orange;
+
+            // 1. 智慧檢測與 Port 判定 (日盤443/夜盤442)
+            var (port, session) = CheckSessionPort();
+            _currentRealtimePort = port;
+            _currentSessionName = session;
+            lblRealtimeStatus.Content = "加載元件中...";
+            lblRealtimeStatus.Foreground = System.Windows.Media.Brushes.Orange;
+            AppendLog($"\n--- 啟動即時行情 ({session} Port:{port}) ---");
+
+            lock (_rtLock)
+            {
+                _liveSymbolTrades["TXF"]["日盤"].Clear();
+                _liveSymbolTrades["TXF"]["夜盤"].Clear();
+                _liveSymbolTrades["MXF"]["日盤"].Clear();
+                _liveSymbolTrades["MXF"]["夜盤"].Clear();
+
+                _rtState["TXF"]["日盤"].Reset();
+                _rtState["TXF"]["夜盤"].Reset();
+                _rtState["MXF"]["日盤"].Reset();
+                _rtState["MXF"]["夜盤"].Reset();
+                
+                _rtNotifiedKeys.Clear();
+                _rtLastNetSpeedsTop["TXF"] = null;
+                _rtLastNetSpeedsTop["MXF"] = null;
+                _rtLastNetSpeedsBot["TXF"] = null;
+                _rtLastNetSpeedsBot["MXF"] = null;
+                _rtLastMatchQty.Clear();
+            }
+
+            try
+            {
+                // 2. 讀取商品合約代碼 (優先從 code.json 讀取)
+                string symbolsArg = "";
+                string codeJsonPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "code.json");
+                if (!System.IO.File.Exists(codeJsonPath))
+                {
+                    codeJsonPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "..", "..", "code.json");
+                }
+                
+                if (System.IO.File.Exists(codeJsonPath))
+                {
+                    try
+                    {
+                        string json = System.IO.File.ReadAllText(codeJsonPath, System.Text.Encoding.UTF8);
+                        using var doc = System.Text.Json.JsonDocument.Parse(json);
+                        var root = doc.RootElement;
+                        if (root.TryGetProperty("future", out var futureArray) && futureArray.ValueKind == System.Text.Json.JsonValueKind.Array)
+                        {
+                            var list = new System.Collections.Generic.List<string>();
+                            foreach (var item in futureArray.EnumerateArray())
+                            {
+                                string? sym = item.GetString();
+                                if (!string.IsNullOrEmpty(sym)) list.Add(sym);
+                            }
+                            symbolsArg = string.Join("|", list);
+                            AppendLog($"【系統】成功從 code.json 載入自動註冊商品清單: {symbolsArg}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        AppendLog($"【系統】讀取 code.json 商品代碼出錯: {ex.Message}，將回退至月份推算代碼。");
+                    }
+                }
+
+                // 備用機制：若 code.json 讀取失敗或無商品，以近月月份月份代碼推算 TXF/MXF
+                if (string.IsNullOrEmpty(symbolsArg))
+                {
+                    string monthCode = _engine.GetMonthCode();
+                    symbolsArg = $"TXF{monthCode}|MXF{monthCode}";
+                    AppendLog($"【系統】月份代碼推算商品清單: {symbolsArg}");
+                }
+
+                _symbolsToRegister = symbolsArg.Split('|', StringSplitOptions.RemoveEmptyEntries);
+
+                // 3. 載入帳號密碼
+                string user = "";
+                string pwd = "";
+                string configPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
+                if (System.IO.File.Exists(configPath))
+                {
+                    try
+                    {
+                        string json = System.IO.File.ReadAllText(configPath, System.Text.Encoding.UTF8);
+                        using var doc = System.Text.Json.JsonDocument.Parse(json);
+                        var root = doc.RootElement;
+                        if (root.TryGetProperty("username", out var u)) user = u.GetString() ?? "";
+                        if (root.TryGetProperty("password", out var p)) pwd = p.GetString() ?? "";
+                    }
+                    catch (Exception ex)
+                    {
+                        AppendLog($"【系統】讀取 config.json 帳密出錯: {ex.Message}");
+                    }
+                }
+
+                // 4. 動態加載 32-bit 元大行情 COM API 元件
+                Type? type = Type.GetTypeFromProgID("YUANTAQUOTE.YuantaQuoteCtrl.1");
+                if (type == null)
+                {
+                    AppendLog("【系統錯誤】本機尚未登錄元大行情 COM API 元件 (YUANTAQUOTE.YuantaQuoteCtrl.1)！請以系統管理員身分執行 regsvr32 註冊。");
+                    lblRealtimeStatus.Content = "元件未註冊";
+                    lblRealtimeStatus.Foreground = System.Windows.Media.Brushes.Red;
+                    StopRealtime();
+                    return;
+                }
+
+                string clsid = type.GUID.ToString();
+                _axHost = new AxYuantaQuoteHost(clsid);
+
+                // 將 _axHost 直接掛載到 WPF 內置的 WindowsFormsHost 控制項
+                comHost.Child = _axHost;
+
+                _yuantaQuote = new YuantaQuoteWrapper(_axHost);
+                _yuantaQuote.MktStatusChanged += OnMktStatusChanged;
+                _yuantaQuote.GetMktAllReceived += OnGetMktAll;
+
+                AppendLog($"【行情】原生 32-bit COM 控制項加載成功。正在呼叫 SetMktLogon (伺服器: 203.66.93.84, Port: {port})...");
+
+
+                // 5. 呼叫元大登入
+                int res = _yuantaQuote.SetMktLogon(user, pwd, "203.66.93.84", port.ToString(), 1, 0);
+                AppendLog($"【行情】SetMktLogon 呼叫完成，回傳結果代碼: {res} (0 代表送出登入成功)");
+                
+                if (res != 0)
+                {
+                    AppendLog($"【系統】呼叫元大登入介面失敗，回傳代碼: {res}");
+                    lblRealtimeStatus.Content = "登入呼叫失敗";
+                    lblRealtimeStatus.Foreground = System.Windows.Media.Brushes.Red;
+                    StopRealtime();
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"【行情】連接行情元件出錯: {ex.Message}");
+                StopRealtime();
+            }
+        }
+
+        private void StopRealtime()
+        {
+            if (_yuantaQuote == null && _axHost == null) return;
+
+            AppendLog("\n--- 停止即時行情與釋放 COM 資源 ---");
+            btnRealtime.Content = "連接即時行情";
+            btnRealtime.Background = (System.Windows.Media.Brush)Application.Current.Resources["SciFiActiveBg"];
+            lblRealtimeStatus.Content = "未連線";
+            lblRealtimeStatus.Foreground = System.Windows.Media.Brushes.Red;
+
+            // 安全斬斷事件連接，徹底防範幽靈 Tick 發生
+            try
+            {
+                if (_yuantaQuote != null)
+                {
+                    _yuantaQuote.MktStatusChanged -= OnMktStatusChanged;
+                    _yuantaQuote.GetMktAllReceived -= OnGetMktAll;
+                    _yuantaQuote.DisconnectEvents();
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"【系統】斷開 COM 事件時發生異常: {ex.Message}");
+            }
+            finally
+            {
+                _yuantaQuote = null;
+            }
+
+            // 安全卸載 WinFormsHost 子控制項並銷毀元件
+            try
+            {
+                if (_axHost != null)
+                {
+                    comHost.Child = null; // 卸載
+                    _axHost.Dispose();
+                }
+            }
+            catch (Exception ex)
+            {
+                AppendLog($"【系統】銷毀 AxHost 時發生異常: {ex.Message}");
+            }
+            finally
+            {
+                _axHost = null;
+            }
+        }
+
+        private void ToggleRealtime()
+        {
+            if (_yuantaQuote != null)
+                StopRealtime();
+            else
+                StartRealtime();
+        }
+
+        // ==================== 2. 元大 COM 事件回呼 (由橋樑發送並由主程式分發) ====================
+
+        private void OnMktStatusChanged(int status, string msg, int reqType)
+        {
+            // 回到 UI 執行緒 safe 執行
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                AppendLog($"【行情狀態】: {status} {msg}");
+                
+                if (status == 2)
+                {
+                    // 標註目前連線線路 (日盤443，夜盤442，或其它自選)
+                    lblRealtimeStatus.Content = $"已連線 ({_currentRealtimePort})";
+                    lblRealtimeStatus.Foreground = System.Windows.Media.Brushes.LightGreen;
+                    
+                    // 異步預載今日歷史日誌 (1:1 對齊)
+                    PreloadTodayLog();
+
+                    // 自動註冊訂閱商品
+                    if (_yuantaQuote != null && _symbolsToRegister.Length > 0)
+                    {
+                        foreach (var code in _symbolsToRegister)
+                        {
+                            int res = _yuantaQuote.AddMktReg(code, 4, reqType, 0); // Mode 4 = Snapshot+Update
+                            AppendLog($"【行情】已自動註冊近月合約 {code} (結果代碼: {res})");
+                        }
+                    }
+                }
+                else if (status == 1)
+                {
+                    lblRealtimeStatus.Content = $"連線中 ({_currentRealtimePort})";
+                    lblRealtimeStatus.Foreground = System.Windows.Media.Brushes.Orange;
+                }
+                else if (status < 0)
+                {
+                    lblRealtimeStatus.Content = $"連線異常 ({status})";
+                    lblRealtimeStatus.Foreground = System.Windows.Media.Brushes.Red;
+
+                    if (chkTelegram.IsChecked == true)
+                    {
+                        _tgService.PushMessage($"🚨 台指極值元大行情網路中斷！嘗試重連 ({status})");
+                    }
+
+                    // 延遲 2 秒安全重連 (WPF 原生非同步)
+                    System.Threading.Tasks.Task.Delay(2000).ContinueWith(_ => Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        StopRealtime();
+                        StartRealtime();
+                    })));
+                }
+            }));
+        }
+
+        private void OnGetMktAll(
+            string symbol, string refPri, string openPri, string highPri, string lowPri,
+            string upPri, string dnPri, string matchTime, string matchPri, string matchQty,
+            string tolMatchQty, string bestBuyQty, string bestBuyPri, string bestSellQty, string bestSellPri,
+            string fdbPri, string fdbQty, string fdsPri, string fdsQty, int reqType)
+        {
+            if (_yuantaQuote == null) return;
+            if (tolMatchQty == "-1") return;
+
+            try
+            {
+                int currentQty = int.Parse(tolMatchQty);
+                string baseSymbol = symbol.Contains("TXF") ? "TXF" : (symbol.Contains("MXF") ? "MXF" : "");
+                if (string.IsNullOrEmpty(baseSymbol)) return;
+
+                // 重複/滯後 Tick 行情過濾防線
+                lock (_rtLock)
+                {
+                    if (_rtLastMatchQty.TryGetValue(baseSymbol, out int prevQty))
+                    {
+                        if (currentQty <= prevQty) return;
+                    }
+                    _rtLastMatchQty[baseSymbol] = currentQty;
+                }
+
+                int price = (int)double.Parse(matchPri);
+                
+                // 取得買一賣一最前端值以判定內外盤
+                string bpStr = bestBuyPri.Split(',')[0];
+                string spStr = bestSellPri.Split(',')[0];
+                int bestBp = (!string.IsNullOrEmpty(bpStr) && double.TryParse(bpStr, out double bpVal)) ? (int)bpVal : 0;
+                int bestSp = (!string.IsNullOrEmpty(spStr) && double.TryParse(spStr, out double spVal)) ? (int)spVal : 0;
+
+                if (price <= 0 || bestBp <= 0 || bestSp <= 0) return;
+
+                TradeSide side = TradeSide.Unknown;
+                if (price >= bestSp) side = TradeSide.Outer;
+                else if (price <= bestBp) side = TradeSide.Inner;
+
+                string mt = matchTime.Trim();
+                if (mt.Length < 6) return;
+
+                double tValRaw = TimeParser.ParseTime(mt);
+
+                // 交易空檔時間過濾
+                if ((tValRaw >= 30600 && tValRaw < 31500) || (tValRaw >= 52200 && tValRaw < 54000))
+                    return;
+
+                string session = "";
+                double tVal = tValRaw;
+
+                if (tValRaw >= 30600 && tValRaw <= 49500)
+                {
+                    session = "日盤";
+                }
+                else if (tValRaw >= 52200 || tValRaw <= 18000)
+                {
+                    session = "夜盤";
+                    if (tValRaw <= 18000) tVal += 86400.0; // 跨日秒數加算
+                }
+                else
+                {
+                    return;
+                }
+
+                // 買賣盤方向Fallback處理
+                lock (_rtLock)
+                {
+                    if (side == TradeSide.Unknown)
+                    {
+                        var prevTrades = _liveSymbolTrades[baseSymbol][session];
+                        side = prevTrades.Count > 0 ? prevTrades[^1].Side : TradeSide.Outer;
+                    }
+
+                    var tick = new TradeTick(baseSymbol, mt, tVal, price, side, bestBp, bestSp, session);
+                    _liveSymbolTrades[baseSymbol][session].Add(tick);
+
+                    // O(1) 增量狀態更新
+                    var state = _rtState[baseSymbol][session];
+                    state.Count++;
+                    state.SumPrice += price;
+                    
+                    if (price > state.DayMax)
+                    {
+                        state.DayMax = price;
+                        state.MaxTime = mt;
+                    }
+                    if (price < state.DayMin)
+                    {
+                        state.DayMin = price;
+                        state.MinTime = mt;
+                    }
+
+                    if (side == TradeSide.Outer)
+                    {
+                        state.OuterCount++;
+                        state.FirstOuterTime ??= tVal;
+                        state.LastOuterTime = tVal;
+                    }
+                    else if (side == TradeSide.Inner)
+                    {
+                        state.InnerCount++;
+                        state.FirstInnerTime ??= tVal;
+                        state.LastInnerTime = tVal;
+                    }
+
+                    if (baseSymbol == "MXF")
+                    {
+                        _lastMxfPrice = price;
+                    }
+                }
+
+                // 雙軌隔離：在回放時實時Tick靜默寫入，不在回放時才通知背景分析 UI 重繪
+                if (!_isReplaying)
+                {
+                    _analysisEvent.Set();
+                }
+            }
+            catch { }
+        }
+
+        // ==================== 3. 實時行情背景 Debounce 計算 Task 迴圈 ====================
+
+        private async Task AnalysisWorkerLoopAsync(CancellationToken token)
+        {
+            var waitHandle = new AutoResetEvent(false);
+
+            while (!token.IsCancellationRequested)
+            {
+                // 等待 Tick 行情通知，或 1 秒自動超時
+                bool triggered = await Task.Run(() => _analysisEvent.WaitOne(1000), token);
+                if (token.IsCancellationRequested) break;
+                if (!triggered) continue;
+
+                // 150ms 節流 Debounce (與原版 ANALYSIS_DEBOUNCE_SEC = 0.15 秒一致)
+                await Task.Delay(150, token);
+                _analysisEvent.Reset(); // 清除 Debounce 期間的殘餘訊號
+
+                try
+                {
+                    // 在背景執行緒執行高密度狀態機計算
+                    var result = RunRealtimeAnalysisCompute();
+                    
+                    // 安全分發至主介面更新 UI (WPF RichTextBox, DataGrids, Labels)
+                    _ = Dispatcher.BeginInvoke(new Action(() => ApplyRealtimeAnalysisUI(result)));
+                }
+                catch (Exception ex)
+                {
+                    // 升級：將背景計算例外直接安全輸出至主日誌看板，杜絕 Silent Crash
+                    _ = Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        AppendLog($"🚨【量化計算崩潰】核心計算背景執行緒發生未知錯誤: {ex.Message}\n{ex.StackTrace}");
+                    }));
+                }
+            }
+        }
+
+        private Dictionary<string, object> RunRealtimeAnalysisCompute()
+        {
+            string activeSession;
+            if (_isReplaying)
+                activeSession = _currentReplaySession;
+            else
+                activeSession = _currentRealtimePort == 442 ? "夜盤" : "日盤";
+
+            var tradesSnapshot = new Dictionary<string, List<TradeTick>>();
+            var stateSnapshot = new Dictionary<string, TradingState>();
+
+            lock (_rtLock)
+            {
+                var tradesSource = _isReplaying ? _replaySymbolTrades : _liveSymbolTrades;
+                var stateSource = _isReplaying ? _replayRtState : _rtState;
+
+                foreach (var symbol in new[] { "TXF", "MXF" })
+                {
+                    tradesSnapshot[symbol] = [.. tradesSource[symbol][activeSession]];
+                    stateSnapshot[symbol] = stateSource[symbol][activeSession].Clone();
+                }
+            }
+
+            var currentStatusSnapshot = new List<(string Symbol, string Session, int DayMin, int DayMax, List<SimulationResult> Details)>();
+            var telegramMessages = new List<string>();
+            int nTicks = _engine.AbsNTicks;
+
+            foreach (var symbol in new[] { "TXF", "MXF" })
+            {
+                var trades = tradesSnapshot[symbol];
+                if (trades.Count == 0) continue;
+
+                var state = stateSnapshot[symbol];
+                int dayMax = state.DayMax;
+                int dayMin = state.DayMin;
+
+                var quantParams = _engine.LoadQuantParams(symbol, _currentTargetDays);
+
+                var absDetails = new List<(double TVal, string StatusStr, string ATime, int PriceVal, string TrigTime, int TrigPrice, double? Pre, double? Post, int AmpVal, int BIdx)>();
+                
+                int runningMax = state.RunningMax;
+                int runningMin = state.RunningMin;
+                int? lastPrice = state.LastPrice;
+                double lastCheckTimeH = state.LastCheckTimeH;
+                double lastCheckTimeB = state.LastCheckTimeB;
+                int scanIdx = state.ScanIdx;
+
+                // 增量時序對比運算
+                for (int i = scanIdx; i < trades.Count; i++)
+                {
+                    int price = trades[i].Price;
+                    double tVal = trades[i].TimeVal;
+                    bool isTrigH = false;
+                    bool isTrigB = false;
+
+                    if (price > runningMax)
+                    {
+                        runningMax = price;
+                        isTrigH = true;
+                    }
+                    else if (price == runningMax)
+                    {
+                        if ((lastPrice.HasValue && lastPrice.Value < price) || (tVal - lastCheckTimeH >= 30.0))
+                        {
+                            isTrigH = true;
+                        }
+                    }
+
+                    if (price < runningMin)
+                    {
+                        runningMin = price;
+                        isTrigB = true;
+                    }
+                    else if (price == runningMin)
+                    {
+                        if ((lastPrice.HasValue && lastPrice.Value > price) || (tVal - lastCheckTimeB >= 30.0))
+                        {
+                            isTrigB = true;
+                        }
+                    }
+
+                    if (isTrigH) lastCheckTimeH = tVal;
+                    if (isTrigB) lastCheckTimeB = tVal;
+
+                    // 智慧 N值 durations 快取對焦
+                    if (price == dayMax)
+                    {
+                        var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
+                            _engine.GetDurations(trades, nTicks, i, TradeSide.Outer, TradeSide.Inner);
+                        string status = _engine.GetStatusStr(pre, post, actPre, actPost, nTicks);
+                        int amp = runningMin != 999999 ? (runningMax - runningMin) : 0;
+                        absDetails.Add((tVal, "時段最高" + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
+                    }
+                    else if (isTrigH)
+                    {
+                        var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
+                            _engine.GetDurations(trades, nTicks, i, TradeSide.Outer, TradeSide.Inner);
+                        string status = _engine.GetStatusStr(pre, post, actPre, actPost, nTicks);
+                        if (status.Contains("達標") || status.Contains("未達標"))
+                        {
+                            int amp = runningMin != 999999 ? (runningMax - runningMin) : 0;
+                            string prefix = status.Contains("未達標") ? "曾未達標最高" : "曾達標最高";
+                            absDetails.Add((tVal, prefix + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
+                        }
+                    }
+
+                    if (price == dayMin)
+                    {
+                        var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
+                            _engine.GetDurations(trades, nTicks, i, TradeSide.Inner, TradeSide.Outer);
+                        string status = _engine.GetStatusStr(pre, post, actPre, actPost, nTicks);
+                        int amp = runningMax != -999999 ? (runningMax - runningMin) : 0;
+                        absDetails.Add((tVal, "時段最低" + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
+                    }
+                    else if (isTrigB)
+                    {
+                        var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
+                            _engine.GetDurations(trades, nTicks, i, TradeSide.Inner, TradeSide.Outer);
+                        string status = _engine.GetStatusStr(pre, post, actPre, actPost, nTicks);
+                        if (status.Contains("達標") || status.Contains("未達標"))
+                        {
+                            int amp = runningMax != -999999 ? (runningMax - runningMin) : 0;
+                            string prefix = status.Contains("未達標") ? "曾未達標最低" : "曾達標最低";
+                            absDetails.Add((tVal, prefix + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
+                        }
+                    }
+
+                    lastPrice = price;
+                }
+
+                // 回寫更新快取的 O(1) Scan 游標
+                lock (_rtLock)
+                {
+                    var origState = _isReplaying ? _replayRtState[symbol][activeSession] : _rtState[symbol][activeSession];
+                    origState.RunningMax = runningMax;
+                    origState.RunningMin = runningMin;
+                    origState.LastPrice = lastPrice;
+                    origState.LastCheckTimeH = lastCheckTimeH;
+                    origState.LastCheckTimeB = lastCheckTimeB;
+                    origState.ScanIdx = trades.Count;
+                }
+
+                absDetails.Sort((x, y) => x.TVal.CompareTo(y.TVal));
+                
+                var filteredPre = new List<(double TVal, string StatusStr, string ATime, int PriceVal, string TrigTime, int TrigPrice, double? Pre, double? Post, int AmpVal, int BIdx)>();
+                var seen = new HashSet<(string Type, int Price)>();
+                foreach (var d in absDetails)
+                {
+                    var key = (d.StatusStr.Contains("最高") ? "最高" : "最低", d.PriceVal);
+                    if (seen.Add(key))
+                    {
+                        filteredPre.Add(d);
+                    }
+                }
+
+                // 實時第二階段：Immutable 歷史速差重算
+                var rtLastNetSpeedsTop = new Dictionary<string, double?> { { "TXF", null }, { "MXF", null } };
+                var rtLastNetSpeedsBot = new Dictionary<string, double?> { { "TXF", null }, { "MXF", null } };
+                
+                var otherSym = symbol == "TXF" ? "MXF" : "TXF";
+                if (!tradesSnapshot.TryGetValue(otherSym, out var otherTrades))
+                {
+                    otherTrades = [];
+                }
+
+                var filteredDetails = new List<SimulationResult>();
+                foreach (var (tVal, statusStr, aTime, priceVal, trigTime, trigPrice, pre, post, ampVal, bIdx) in filteredPre)
+                {
+                    if (!post.HasValue)
+                    {
+                        var copy = new SimulationResult
+                        {
+                            Type = statusStr.Contains("最高") ? "最高" : "最低",
+                            DisplayTitle = statusStr,
+                            BestATime = aTime,
+                            BestAPrice = priceVal,
+                            TrigTime = trigTime,
+                            TrigPrice = trigPrice.ToString(),
+                            Pre = pre.HasValue ? $"{pre.Value:F4}s" : "N/A",
+                            Post = "N/A",
+                            StopLossDisplay = "N/A"
+                        };
+                        filteredDetails.Add(copy);
+                        continue;
+                    }
+
+                    bool isTop = statusStr.Contains("最高");
+                    bool isDayExtreme = statusStr.Contains("時段最高") || statusStr.Contains("時段最低");
+                    
+                    bool needSpeed = true;
+                    if (isDayExtreme && !statusStr.Contains("達標"))
+                        needSpeed = false;
+
+                    string speedStr = "";
+                    if (needSpeed)
+                    {
+                        if (isTop)
+                            speedStr = _engine.GetSpeedSnapshotStr(symbol, trades, bIdx, otherTrades, rtLastNetSpeedsTop);
+                        else
+                            speedStr = _engine.GetSpeedSnapshotStr(symbol, trades, bIdx, otherTrades, rtLastNetSpeedsBot);
+                    }
+
+                    var res = new SimulationResult
+                    {
+                        Type = isTop ? "K低" : "K高",
+                        DisplayTitle = statusStr,
+                        BestATime = aTime,
+                        BestAPrice = priceVal,
+                        TrigTime = trigTime,
+                        TrigPrice = trigPrice.ToString(),
+                        Pre = pre.HasValue ? $"{pre.Value:F4}s" : "N/A",
+                        Post = $"{post.Value:F4}s",
+                        AmpVal = ampVal,
+                        BIndex = bIdx,
+                        ObsN = nTicks,
+                        StopLossDisplay = "N/A"
+                    };
+                    res.Tags.Add(speedStr); // 快取速差字串
+                    
+                    filteredDetails.Add(res);
+                }
+
+                // 檢測是否需要觸發 TG 推播與去重防線
+                foreach (var d in filteredDetails)
+                {
+                    if (d.Post == "N/A") continue;
+
+                    string speedInfo = d.Tags.FirstOrDefault() ?? "";
+                    bool isUnmet = d.DisplayTitle.Contains(" [未達標]");
+                    bool isContradiction = false;
+                    
+                    if (isUnmet)
+                    {
+                        if (d.DisplayTitle.Contains("最高") && (speedInfo.Contains("空速增") || speedInfo.Contains("多速減")))
+                            isContradiction = true;
+                        else if (d.DisplayTitle.Contains("最低") && (speedInfo.Contains("多速增") || speedInfo.Contains("空速減")))
+                            isContradiction = true;
+                    }
+
+                    bool isNormal = d.DisplayTitle.Contains("[達標]") && !d.DisplayTitle.Contains('未') && !d.DisplayTitle.Contains("邊界");
+
+                    if (isNormal || isContradiction)
+                    {
+                        var notifyKey = (symbol, activeSession, d.Type, d.BestAPrice, d.BestATime);
+                        if (_rtNotifiedKeys.Add(notifyKey))
+                        {
+                            string zoneStr = "N/A";
+                            try
+                            {
+                                string side = d.Type == "K低" ? "top" : "bottom";
+                                var tDict = (Dictionary<string, (int p50, int p75, int p90)>)quantParams[side == "top" ? "time_top" : "time_bottom"];
+                                string bTimeClean = d.BestATime.Replace(":", "");
+                                int hmVal = bTimeClean.Length >= 4 ? int.Parse(bTimeClean[..4]) : 0;
+                                int h = hmVal / 100, m = hmVal % 100;
+                                int totalM = h * 60 + m;
+                                if (activeSession == "夜盤" && totalM < 900) totalM += 1440;
+
+                                int? p50 = null, p75 = null, p90 = null;
+                                foreach (var kvp in tDict)
+                                {
+                                    if (kvp.Key.Contains(activeSession))
+                                    {
+                                        string timePart = kvp.Key.Split(' ')[1].Trim();
+                                        if (timePart.Contains('-'))
+                                        {
+                                            var sStr = timePart.Split('-')[0];
+                                            var eStr = timePart.Split('-')[1];
+                                            int sMins = int.Parse(sStr.Split(':')[0]) * 60 + int.Parse(sStr.Split(':')[1]);
+                                            int eMins = int.Parse(eStr.Split(':')[0]) * 60 + int.Parse(eStr.Split(':')[1]);
+                                            if (activeSession == "夜盤")
+                                            {
+                                                if (sMins < 900) sMins += 1440;
+                                                if (eMins < 900) eMins += 1440;
+                                            }
+                                            if (sMins <= totalM && totalM <= eMins)
+                                            {
+                                                p50 = kvp.Value.p50;
+                                                p75 = kvp.Value.p75;
+                                                p90 = kvp.Value.p90;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (p50.HasValue && p75.HasValue && p90.HasValue)
+                                {
+                                    if (side == "top")
+                                        zoneStr = $"區:{d.BestAPrice + p50.Value}~{d.BestAPrice + p75.Value} 損:{d.BestAPrice + p90.Value}";
+                                    else
+                                        zoneStr = $"區:{d.BestAPrice - p50.Value}~{d.BestAPrice - p75.Value} 損:{d.BestAPrice - p90.Value}";
+                                }
+                            }
+                            catch { }
+
+                            string dirText = d.Type == "K低" ? $"做空  {d.DisplayTitle}" : $"做多  {d.DisplayTitle}";
+                            string msgTitle = isContradiction ? "【極值矛盾】" : "【極值達標】";
+                            string msg = $"{msgTitle}{symbol} {activeSession}\n" +
+                                         $"方向：{dirText}\n" +
+                                         $"A點時間：{d.BestATime}\n" +
+                                         $"A點價：{d.BestAPrice}\n" +
+                                         $"B點時間：{d.TrigTime}\n" +
+                                         $"觸發價：{d.TrigPrice}\n" +
+                                         $"進場/停損：{zoneStr}\n" +
+                                         $"當下振幅：{d.AmpVal}";
+                            telegramMessages.Add(msg);
+                        }
+                    }
+                }
+
+                currentStatusSnapshot.Add((symbol, activeSession, dayMin, dayMax, filteredDetails));
+            }
+
+            // ═══ 在背景執行緒非同步組裝 UI 快照物件 ═══
+            if (!stateSnapshot.TryGetValue("MXF", out var mxfState))
+            {
+                mxfState = new TradingState();
+            }
+            if (!stateSnapshot.TryGetValue("TXF", out var txfState))
+            {
+                txfState = new TradingState();
+            }
+
+            string extremeInfoStr = mxfState.DayMax != -999999
+                ? $"最高價: {mxfState.DayMax} ({mxfState.MaxTime}) | 最低價: {mxfState.DayMin} ({mxfState.MinTime}) | 振幅: {mxfState.DayMax - mxfState.DayMin}"
+                : "最高價: -- (--) | 最低價: -- (--) | 振幅: --";
+
+            // 計算即時速差文字與顏色
+            var (_, _, dT) = _engine.CalcSideSpeedFromState(txfState);
+            var (_, _, dM) = _engine.CalcSideSpeedFromState(mxfState);
+
+            double? netT = (txfState.OuterCount >= 2 && txfState.LastOuterTime.HasValue && txfState.FirstOuterTime.HasValue &&
+                           txfState.InnerCount >= 2 && txfState.LastInnerTime.HasValue && txfState.FirstInnerTime.HasValue)
+                           ? ((txfState.LastInnerTime.Value - txfState.FirstInnerTime.Value) / (txfState.InnerCount - 1)) -
+                             ((txfState.LastOuterTime.Value - txfState.FirstOuterTime.Value) / (txfState.OuterCount - 1))
+                           : null;
+
+            double? netM = (mxfState.OuterCount >= 2 && mxfState.LastOuterTime.HasValue && mxfState.FirstOuterTime.HasValue &&
+                           mxfState.InnerCount >= 2 && mxfState.LastInnerTime.HasValue && mxfState.FirstInnerTime.HasValue)
+                           ? ((mxfState.LastInnerTime.Value - mxfState.FirstInnerTime.Value) / (mxfState.InnerCount - 1)) -
+                             ((mxfState.LastOuterTime.Value - mxfState.FirstOuterTime.Value) / (mxfState.OuterCount - 1))
+                           : null;
+
+            string netTxfStr = netT.HasValue ? $"| 大臺速差: {netT.Value:+0.0000;-0.0000;+0.0000}s" : "| 大臺速差: --";
+            string netTxfColor = netT.HasValue ? (netT.Value > 0 ? "#EB4B4B" : netT.Value < 0 ? "#28A745" : "Gray") : "Gray";
+
+            string netMxfStr = netM.HasValue ? $"| 小臺速差: {netM.Value:+0.0000;-0.0000;+0.0000}s" : "| 小臺速差: --";
+            string netMxfColor = netM.HasValue ? (netM.Value > 0 ? "#EB4B4B" : netM.Value < 0 ? "#28A745" : "Gray") : "Gray";
+
+            string consensusStr = "| 共識: --";
+            string consensusColor = "Gray";
+            if (dT.Contains("多方") && dM.Contains("多方"))
+            {
+                consensusStr = "| 共識: 多方 📈";
+                consensusColor = "#EB4B4B";
+            }
+            else if (dT.Contains("空方") && dM.Contains("空方"))
+            {
+                consensusStr = "| 共識: 空方 📉";
+                consensusColor = "#28A745";
+            }
+            else if (dT != "資料不足" && dM != "資料不足")
+            {
+                consensusStr = "| 共識: 持平 ⚖️";
+                consensusColor = "Gray";
+            }
+
+            // 產生即時極值詳情報告文字 (與離線日誌完全同構)
+            string rtReport = "";
+            if (!tradesSnapshot.TryGetValue("TXF", out var txfTradesRt))
+            {
+                txfTradesRt = [];
+            }
+            if (!tradesSnapshot.TryGetValue("MXF", out var mxfTradesRt))
+            {
+                mxfTradesRt = [];
+            }
+
+            var txfDetailsRt = currentStatusSnapshot.FirstOrDefault(x => x.Symbol == "TXF").Details ?? [];
+            var mxfDetailsRt = currentStatusSnapshot.FirstOrDefault(x => x.Symbol == "MXF").Details ?? [];
+
+            if (txfTradesRt.Count > 0)
+            {
+                rtReport += "═══ 大臺即時極值行情 ═══" + GenerateRealtimeReportStr("TXF", activeSession, txfTradesRt, txfDetailsRt, _engine.LoadQuantParams("TXF", _currentTargetDays), stateSnapshot);
+            }
+            if (mxfTradesRt.Count > 0)
+            {
+                if (!string.IsNullOrEmpty(rtReport)) rtReport += "\n";
+                rtReport += "═══ 小臺即時極值行情 ═══" + GenerateRealtimeReportStr("MXF", activeSession, mxfTradesRt, mxfDetailsRt, _engine.LoadQuantParams("MXF", _currentTargetDays), stateSnapshot);
+            }
+
+            // 背景分 K 聚合與 K棒 停損狀態機運算 (超大 CPU 負載完全隔離)
+            var (klineData, breakouts) = _engine.CalcKlineData(
+                activeSession, mxfTradesRt,
+                [.. txfDetailsRt.Select(d => ConvertToSimulationResultRaw(d, "TXF"))],
+                [.. mxfDetailsRt.Select(d => ConvertToSimulationResultRaw(d, "MXF"))],
+                _currentKlineInterval
+            );
+
+            var simulationResults = _engine.CalcSimulationResults(activeSession, mxfTradesRt, klineData, _currentObsN);
+
+            return new Dictionary<string, object>
+            {
+                { "current_status_snapshot", currentStatusSnapshot },
+                { "telegram_messages", telegramMessages },
+                { "active_session", activeSession },
+                { "realtime_extreme_report", rtReport },
+                { "kline_data", klineData },
+                { "simulation_results", simulationResults },
+                { "extreme_snapshot", new Dictionary<string, string>
+                    {
+                        { "extreme_info_str", extremeInfoStr },
+                        { "consensus_str", consensusStr },
+                        { "consensus_color", consensusColor },
+                        { "net_txf_str", netTxfStr },
+                        { "net_txf_color", netTxfColor },
+                        { "net_mxf_str", netMxfStr },
+                        { "net_mxf_color", netMxfColor }
+                    }
+                }
+            };
+        }
+
+        private SimulationResult ConvertToSimulationResultRaw(SimulationResult display, string sym)
+        {
+            int prevHigh = display.PrevHigh;
+            int prevLow = display.PrevLow;
+
+            return new SimulationResult
+            {
+                DisplayTitle = display.DisplayTitle,
+                BestATime = display.BestATime,
+                BestAPrice = display.BestAPrice,
+                TrigTime = display.TrigTime,
+                TrigPrice = display.TrigPrice,
+                Pre = display.Pre,
+                Post = display.Post,
+                PrevHigh = prevHigh,
+                PrevLow = prevLow,
+                BIndex = display.BIndex,
+                ObsN = display.ObsN,
+                StopLossPrice = display.DisplayTitle.Contains("最高") ? prevHigh : prevLow
+            };
+        }
+
+        // ==================== 4. 主執行緒 UI 渲染與著色 (ApplyRealtimeAnalysisUI) ====================
+
+        private void ApplyRealtimeAnalysisUI(Dictionary<string, object> result)
+        {
+            if (result.TryGetValue("current_status_snapshot", out var rtSnapObj) && rtSnapObj is List<(string Symbol, string Session, int DayMin, int DayMax, List<SimulationResult> Details)> rtSnapList)
+            {
+                _lastRtStatusSnapshot = rtSnapList;
+            }
+
+            var snap = (Dictionary<string, string>)result["extreme_snapshot"];
+            
+            // 1. 渲染頂部極值、速差及多空共識
+            lblExtremeInfo.Text = snap["extreme_info_str"];
+            lblConsensusDir.Text = snap["consensus_str"];
+            SetWidgetStyleLazy(lblConsensusDir, snap["consensus_color"]);
+            lblTxfNetSpeed.Text = snap["net_txf_str"];
+            SetWidgetStyleLazy(lblTxfNetSpeed, snap["net_txf_color"]);
+            lblMxfNetSpeed.Text = snap["net_mxf_str"];
+            SetWidgetStyleLazy(lblMxfNetSpeed, snap["net_mxf_color"]);
+
+            // 2. 智慧操作感知型降頻節流 (Interaction-Aware Throttle) 著色排版
+            if (result.TryGetValue("realtime_extreme_report", out var reportObj) && reportObj is string rtReport && !string.IsNullOrEmpty(rtReport))
+            {
+                if (!App.Current.Resources.Contains("_system_logs"))
+                {
+                    App.Current.Resources["_system_logs"] = new List<string>();
+                }
+                var systemLogs = (List<string>)App.Current.Resources["_system_logs"];
+
+                // 判斷交易員是否正在高頻滑動十字游標或縮放 (滑動時 Textbox 重繪延遲改為 2000ms，以 GPU 行情為絕對優先)
+                bool isUserInteracting = klineChart.IsMouseOver;
+                double renderInterval = isUserInteracting ? 2000.0 : 250.0;
+                double nowMs = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
+
+                var telegramMessages = (List<string>)result["telegram_messages"];
+
+                string logsStr = string.Join("\n", systemLogs);
+                string fullContent = "═══ 系統即時監控日誌 ═══\n" + logsStr + "\n\n" + rtReport;
+
+                if (fullContent != _lastRenderedContent && (nowMs - _lastTxtRenderTime >= renderInterval || telegramMessages.Count > 0))
+                {
+                    _lastRenderedContent = fullContent;
+                    _lastTxtRenderTime = nowMs;
+
+                    // O(1) 零開銷增量染色插入
+                    LogHighlighter.AppendLog(txtOutput, fullContent, clear: true);
+                }
+            }
+
+            // 3. TG 推播發送
+            var tgMsgs = (List<string>)result["telegram_messages"];
+            foreach (var msg in tgMsgs)
+            {
+                if (chkTelegram.IsChecked == true)
+                {
+                    AppendLog($"\n>>>> 觸發推播: {msg.Replace('\n', ' ')}");
+                    _tgService.PushMessage(msg);
+                }
+                else
+                {
+                    AppendLog($"\n>>>> 觸發 (未啟用TG): {msg.Replace('\n', ' ')}");
+                }
+            }
+
+            // 4. 刷新 K線與圖表 (O(1) / O(N) 零 CPU 聚合開銷)
+            var klineData = (List<KlineBar>)result["kline_data"];
+            UpdateKlineViews(klineData);
+            klineChart.UpdateCandles(klineData);
+
+            // 5. 差量更新 DataGrid 行情與選取反白保留
+            var simulationResults = (List<SimulationResult>)result["simulation_results"];
+            UpdateObserverViews(simulationResults);
+
+            // 6. 更新底部狀態計數面板
+            RefreshInfoPanel();
+        }
+
+        private void UpdateKlineViews(List<KlineBar> klineData)
+        {
+            // 差量合併 K線，保留 DataGrid 的 SelectIndex 反白
+            int oldLen = _klineCollection.Count;
+            int newLen = klineData.Count;
+
+            if (oldLen == 0 && newLen == 0) return;
+
+            if (oldLen == newLen)
+            {
+                for (int i = 0; i < newLen; i++)
+                {
+                    _klineCollection[i].High = klineData[i].High;
+                    _klineCollection[i].Low = klineData[i].Low;
+                    _klineCollection[i].Open = klineData[i].Open;
+                    _klineCollection[i].Close = klineData[i].Close;
+                    _klineCollection[i].Signals = klineData[i].Signals;
+                    _klineCollection[i].BreakHigh = klineData[i].BreakHigh;
+                    _klineCollection[i].BreakLow = klineData[i].BreakLow;
+                    _klineCollection[i].Tag = klineData[i].Tag;
+                }
+                dgKline.Items.Refresh();
+            }
+            else if (newLen > oldLen)
+            {
+                for (int i = 0; i < oldLen; i++)
+                {
+                    _klineCollection[i].High = klineData[i].High;
+                    _klineCollection[i].Low = klineData[i].Low;
+                    _klineCollection[i].Open = klineData[i].Open;
+                    _klineCollection[i].Close = klineData[i].Close;
+                    _klineCollection[i].Signals = klineData[i].Signals;
+                    _klineCollection[i].BreakHigh = klineData[i].BreakHigh;
+                    _klineCollection[i].BreakLow = klineData[i].BreakLow;
+                    _klineCollection[i].Tag = klineData[i].Tag;
+                }
+                for (int i = oldLen; i < newLen; i++)
+                {
+                    _klineCollection.Add(klineData[i]);
+                }
+            }
+            else
+            {
+                _klineCollection.Clear();
+                foreach (var k in klineData) _klineCollection.Add(k);
+            }
+
+            // 若沒有手動反白，自動滾動到最末行
+            if (dgKline.SelectedIndex == -1 && _klineCollection.Count > 0)
+            {
+                dgKline.ScrollIntoView(_klineCollection[^1]);
+            }
+
+            // ═══ K線轉換自帶參數邏輯 ═══
+            if (klineData.Count >= 2)
+            {
+                string currentKlineTime = klineData[^1].TimeLabel;
+                if (_lastAutofillKlineTime != currentKlineTime)
+                {
+                    _lastAutofillKlineTime = currentKlineTime;
+                    
+                    var prevKline = klineData[^2];
+                    int prevHigh = (int)prevKline.High;
+                    int prevLow = (int)prevKline.Low;
+
+                    // 觀察 K 低：自帶前分K最低
+                    txtObsHigh.Text = prevLow.ToString();
+                    _engine._obs_high_entry_price = prevLow;
+
+                    // 觀察 K 高：自帶前分K最高
+                    txtObsLow.Text = prevHigh.ToString();
+                    _engine._obs_low_entry_price = prevHigh;
+                    
+                    AppendLog($"【自動觀察】分 K 轉換！已自動載入前分 K 最高: {prevHigh} / 最低: {prevLow}。");
+                }
+            }
+        }
+
+        private void UpdateObserverViews(List<SimulationResult> simulationResults)
+        {
+            int oldLen = _obsCollection.Count;
+            int newLen = simulationResults.Count;
+
+            if (oldLen == 0 && newLen == 0) return;
+
+            if (oldLen == newLen)
+            {
+                for (int i = 0; i < newLen; i++)
+                {
+                    _obsCollection[i].DisplayTitle = simulationResults[i].DisplayTitle;
+                    _obsCollection[i].BestATime = simulationResults[i].BestATime;
+                    _obsCollection[i].BestAPrice = simulationResults[i].BestAPrice;
+                    _obsCollection[i].TrigTime = simulationResults[i].TrigTime;
+                    _obsCollection[i].TrigPrice = simulationResults[i].TrigPrice;
+                    _obsCollection[i].Pre = simulationResults[i].Pre;
+                    _obsCollection[i].Post = simulationResults[i].Post;
+                    _obsCollection[i].StopLossDisplay = simulationResults[i].StopLossDisplay;
+                    _obsCollection[i].IsBroken = simulationResults[i].IsBroken;
+                    _obsCollection[i].StopLossPrice = simulationResults[i].StopLossPrice;
+                }
+                dgObserver.Items.Refresh();
+            }
+            else if (newLen > oldLen)
+            {
+                for (int i = 0; i < oldLen; i++)
+                {
+                    _obsCollection[i].DisplayTitle = simulationResults[i].DisplayTitle;
+                    _obsCollection[i].BestATime = simulationResults[i].BestATime;
+                    _obsCollection[i].BestAPrice = simulationResults[i].BestAPrice;
+                    _obsCollection[i].TrigTime = simulationResults[i].TrigTime;
+                    _obsCollection[i].TrigPrice = simulationResults[i].TrigPrice;
+                    _obsCollection[i].Pre = simulationResults[i].Pre;
+                    _obsCollection[i].Post = simulationResults[i].Post;
+                    _obsCollection[i].StopLossDisplay = simulationResults[i].StopLossDisplay;
+                    _obsCollection[i].IsBroken = simulationResults[i].IsBroken;
+                    _obsCollection[i].StopLossPrice = simulationResults[i].StopLossPrice;
+                }
+                for (int i = oldLen; i < newLen; i++)
+                {
+                    _obsCollection.Add(simulationResults[i]);
+                }
+            }
+            else
+            {
+                _obsCollection.Clear();
+                foreach (var o in simulationResults) _obsCollection.Add(o);
+            }
+
+            if (dgObserver.SelectedIndex == -1 && _obsCollection.Count > 0)
+            {
+                dgObserver.ScrollIntoView(_obsCollection[^1]);
+            }
+
+            // 更新底部 ComboBox 壓力支撐下拉選項
+            RefreshObserverComboboxes();
+        }
+
+        private void RefreshInfoPanel()
+        {
+            string activeSession = _isReplaying ? _currentReplaySession : (_currentRealtimePort == 442 ? "夜盤" : "日盤");
+            
+            lblLivePrice.Text = _lastMxfPrice.HasValue ? $"| 價: {_lastMxfPrice.Value}" : "| 價: --";
+
+            if (wndUnbrokenK != null && _lastMxfPrice.HasValue)
+            {
+                wndUnbrokenK.CheckInstantUnbrokenBreakout(_lastMxfPrice.Value);
+            }
+
+            var counts = new List<string>();
+            var tradesSource = _isReplaying ? _replaySymbolTrades : _liveSymbolTrades;
+            var statesSource = _isReplaying ? _replayRtState : _rtState;
+
+            foreach (var sym in new[] { "TXF", "MXF" })
+            {
+                int count;
+                lock (_rtLock)
+                {
+                    count = tradesSource[sym][activeSession].Count;
+                }
+                counts.Add($"{sym}({activeSession[0]}:{count})");
+            }
+
+            string statusPrefix = _isReplaying ? "復盤回放" : $"已連線({_currentRealtimePort})";
+            lblRealtimeStatus.Content = $"{statusPrefix} | {string.Join(" | ", counts)}";
+
+            // 大台小台買賣速度顯示
+            var symLabels = new[] { ("TXF", lblSpeedTxf, "大臺"), ("MXF", lblSpeedMxf, "小臺") };
+            foreach (var (sym, lbl, name) in symLabels)
+            {
+                TradingState state;
+                lock (_rtLock)
+                {
+                    state = statesSource[sym][activeSession].Clone();
+                }
+
+                if (state.Count > 0)
+                {
+                    var (oAvg, iAvg, dStr) = _engine.CalcSideSpeedFromState(state);
+                    string oS = oAvg.HasValue ? $"{oAvg.Value:F4}s/{state.OuterCount,5}筆" : "--/筆";
+                    string iS = iAvg.HasValue ? $"{iAvg.Value:F4}s/{state.InnerCount,5}筆" : "--/筆";
+                    int avgPri = (int)Math.Round((double)state.SumPrice / state.Count);
+
+                    lbl.Text = $"{name}: 外盤(買) {oS} | 內盤(賣) {iS} → {dStr} | 均價:{avgPri}";
+                    
+                    var color = dStr.Contains("多方") ? Color.FromRgb(235, 75, 75) : dStr.Contains("空方") ? Color.FromRgb(40, 167, 69) : Color.FromRgb(160, 160, 160);
+                    lbl.Foreground = new SolidColorBrush(color);
+                }
+            }
+        }
+
+        // ==================== 5. 離線 .log 載入與增量解析 (RunAnalysisSync/Async) ====================
+
+        private void BtnOpen_Click(object sender, RoutedEventArgs e)
+        {
+            var openFileDialog = new Microsoft.Win32.OpenFileDialog
+            {
+                Filter = "Log Files (*.log)|*.log|All Files (*.*)|*.*",
+                Title = "開啟日誌檔 (.log)"
+            };
+
+            if (openFileDialog.ShowDialog() == true)
+            {
+                string path = openFileDialog.FileName;
+                _currentReplayDir = null; // 清除回放目錄
+
+                btnOpen.IsEnabled = false;
+                btnUpdate.IsEnabled = false;
+                btnFill.IsEnabled = false;
+                
+                lblStatus.Content = $"正在處理: {Path.GetFileName(path)}...";
+                AppendLog($"\n--- 開始分析 {path} ---");
+
+                klineChart.Reset(); // 載入新檔案強制重算可見視界範圍
+                klineChart.UpdateCandles([], forceAutoRange: true);
+
+                Task.Run(() =>
+                {
+                    try
+                    {
+                        var (success, result, status) = RunAnalysisSync([(path, t => true)], "MXF", _currentTargetDays, ignoreTimeCheck: true);
+                        
+                        Dispatcher.BeginInvoke(new Action(() =>
+                        {
+                            btnOpen.IsEnabled = true;
+                            btnUpdate.IsEnabled = true;
+                            btnFill.IsEnabled = true;
+
+                            if (success && result is Dictionary<string, string> reports)
+                            {
+                                OnAnalysisCompletedSuccess(reports);
+                            }
+                            else
+                            {
+                                AppendLog($"分析失敗: {result}");
+                                lblStatus.Content = "分析出錯";
+                            }
+                        }));
+                    }
+                    catch (Exception ex)
+                    {
+                        Dispatcher.BeginInvoke(new Action(() =>
+                        {
+                            btnOpen.IsEnabled = true;
+                            btnUpdate.IsEnabled = true;
+                            btnFill.IsEnabled = true;
+                            AppendLog($"分析例外失敗: {ex.Message}");
+                            lblStatus.Content = "分析出錯";
+                        }));
+                    }
+                });
+            }
+        }
+
+        private void OnAnalysisCompletedSuccess(Dictionary<string, string> reports)
+        {
+            string finalContent = "";
+            var allOfflineKlineData = new List<KlineBar>();
+            
+            // 處理大台大小台共識推播
+            for (int i = 0; i < 2; i++)
+            {
+                string session = i == 0 ? "日盤" : "夜盤";
+                if (reports.TryGetValue(session, out var repText) && !string.IsNullOrEmpty(repText))
+                {
+                    finalContent += repText + "\n";
+                }
+
+                List<TradeTick>? txfT = null;
+                List<TradeTick>? mxfT = null;
+                var txfSigs = new List<SimulationResult>();
+                var mxfSigs = new List<SimulationResult>();
+
+                lock (_rtLock)
+                {
+                    string keyTxf = $"TXF ({session})";
+                    string keyMxf = $"MXF ({session})";
+                    _liveSymbolTrades["TXF"].TryGetValue(session, out txfT);
+                    _liveSymbolTrades["MXF"].TryGetValue(session, out mxfT);
+                    if (_rtState["TXF"].ContainsKey(session)) txfSigs = GetSimResultsFromSnapshot("TXF", session);
+                    if (_rtState["MXF"].ContainsKey(session)) mxfSigs = GetSimResultsFromSnapshot("MXF", session);
+                }
+
+                if (txfT != null && mxfT != null && txfT.Count > 0 && mxfT.Count > 0)
+                {
+                    var pushes = _engine.SimulateSpeedPushesDual(txfT, mxfT);
+                    if (pushes.Count > 0)
+                    {
+                        finalContent += $"\n    [{session} 大小臺共識推播歷程]\n";
+                        foreach (var p in pushes)
+                        {
+                            finalContent += p + "\n";
+                        }
+                    }
+                }
+
+                if (mxfT != null && mxfT.Count > 0)
+                {
+                    var (klineData, breakouts) = _engine.CalcKlineData(session, mxfT, txfSigs, mxfSigs, _currentKlineInterval);
+                    
+                    // 文字版K線報表
+                    string klineStr = _engine._generate_kline_text(session, [.. klineData.Select(k => (object)k)], [.. breakouts.Select(b => (object)b)], _currentKlineInterval.ToString());
+                    if (!string.IsNullOrEmpty(klineStr))
+                    {
+                        finalContent += "\n" + klineStr + "\n";
+                    }
+
+                    allOfflineKlineData.AddRange(klineData);
+                    
+                    // 預載停損極值對比表
+                    wndUnbrokenK.Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        var results = _engine.CalcSimulationResults(session, mxfT, klineData, _currentObsN);
+                        UpdateObserverViews(results);
+                    }));
+                }
+            }
+
+            AppendLog(finalContent, clear: true);
+
+            if (allOfflineKlineData.Count > 0)
+            {
+                UpdateKlineViews(allOfflineKlineData);
+                klineChart.UpdateCandles(allOfflineKlineData);
+            }
+
+            lblStatus.Content = "更新完成";
+
+            // 更新頂部大臺/小臺極值行情面板
+            UpdateOfflineExtremePanel();
+
+            // 觸發未破停損計算
+            wndUnbrokenK.TriggerUnbrokenCheck(force: true);
+        }
+
+        /// <summary>
+        /// 離線模式下，讀取已載入的 TradingState 快照，更新頂部大臺/小臺極值行情面板。
+        /// 對應 Python 版本中離線分析完成後的面板刷新邏輯。
+        /// </summary>
+        private void UpdateOfflineExtremePanel()
+        {
+            // 優先使用當前啟用 session（離線模式通常日盤與夜盤都可能有資料）
+            // 取最後一個有資料的 session 進行顯示
+            TradingState mxfState = new();
+            TradingState txfState = new();
+
+            foreach (var sess in new[] { "日盤", "夜盤" })
+            {
+                TradingState ms, ts;
+                lock (_rtLock)
+                {
+                    ms = _rtState["MXF"][sess].Clone();
+                    ts = _rtState["TXF"][sess].Clone();
+                }
+                // 以有資料的 session 覆蓋
+                if (ms.Count > 0) mxfState = ms;
+                if (ts.Count > 0) txfState = ts;
+            }
+
+            // 組合極值資訊字串
+            string extremeInfoStr = mxfState.DayMax != -999999
+                ? $"最高價: {mxfState.DayMax} ({mxfState.MaxTime}) | 最低價: {mxfState.DayMin} ({mxfState.MinTime}) | 振幅: {mxfState.DayMax - mxfState.DayMin}"
+                : "最高價: -- (--) | 最低價: -- (--) | 振幅: --";
+
+            // 計算速差方向
+            var (_, _, dT) = _engine.CalcSideSpeedFromState(txfState);
+            var (_, _, dM) = _engine.CalcSideSpeedFromState(mxfState);
+
+            double? netT = (txfState.OuterCount >= 2 && txfState.LastOuterTime.HasValue && txfState.FirstOuterTime.HasValue &&
+                           txfState.InnerCount >= 2 && txfState.LastInnerTime.HasValue && txfState.FirstInnerTime.HasValue)
+                           ? ((txfState.LastInnerTime.Value - txfState.FirstInnerTime.Value) / (txfState.InnerCount - 1)) -
+                             ((txfState.LastOuterTime.Value - txfState.FirstOuterTime.Value) / (txfState.OuterCount - 1))
+                           : null;
+
+            double? netM = (mxfState.OuterCount >= 2 && mxfState.LastOuterTime.HasValue && mxfState.FirstOuterTime.HasValue &&
+                           mxfState.InnerCount >= 2 && mxfState.LastInnerTime.HasValue && mxfState.FirstInnerTime.HasValue)
+                           ? ((mxfState.LastInnerTime.Value - mxfState.FirstInnerTime.Value) / (mxfState.InnerCount - 1)) -
+                             ((mxfState.LastOuterTime.Value - mxfState.FirstOuterTime.Value) / (mxfState.OuterCount - 1))
+                           : null;
+
+            string netTxfStr = netT.HasValue ? $"| 大臺速差: {netT.Value:+0.0000;-0.0000;+0.0000}s" : "| 大臺速差: --";
+            string netTxfColor = netT.HasValue ? (netT.Value > 0 ? "#EB4B4B" : netT.Value < 0 ? "#28A745" : "Gray") : "Gray";
+            string netMxfStr = netM.HasValue ? $"| 小臺速差: {netM.Value:+0.0000;-0.0000;+0.0000}s" : "| 小臺速差: --";
+            string netMxfColor = netM.HasValue ? (netM.Value > 0 ? "#EB4B4B" : netM.Value < 0 ? "#28A745" : "Gray") : "Gray";
+
+            string consensusStr = "| 共識: --";
+            string consensusColor = "Gray";
+            if (dT.Contains("多方") && dM.Contains("多方")) { consensusStr = "| 共識: 多方 📈"; consensusColor = "#EB4B4B"; }
+            else if (dT.Contains("空方") && dM.Contains("空方")) { consensusStr = "| 共識: 空方 📉"; consensusColor = "#28A745"; }
+            else if (dT != "資料不足" && dM != "資料不足") { consensusStr = "| 共識: 持平 ⚖️"; consensusColor = "Gray"; }
+
+            // 套用至頂部標籤
+            lblExtremeInfo.Text = extremeInfoStr;
+            lblConsensusDir.Text = consensusStr;
+            SetWidgetStyleLazy(lblConsensusDir, consensusColor);
+            lblTxfNetSpeed.Text = netTxfStr;
+            SetWidgetStyleLazy(lblTxfNetSpeed, netTxfColor);
+            lblMxfNetSpeed.Text = netMxfStr;
+            SetWidgetStyleLazy(lblMxfNetSpeed, netMxfColor);
+        }
+
+        /// <summary>
+        /// 離線模式下，變更「小臺 K 線分」或「觀察 N」後的全量資料重新聚合與重繪。
+        /// 以現有 _liveSymbolTrades 資料為基礎，重新計算 K 棒、停損觀測表並重繪圖表。
+        /// </summary>
+        private void ReplotOfflineData()
+        {
+            // 非離線模式（有即時行情）則交給正常的 _analysisEvent 處理
+            if (_yuantaQuote != null || _isReplaying) return;
+
+            // 確認確實有離線資料可以使用
+            bool hasData = false;
+            lock (_rtLock)
+            {
+                foreach (var sess in new[] { "日盤", "夜盤" })
+                {
+                    if (_liveSymbolTrades["MXF"][sess].Count > 0) { hasData = true; break; }
+                }
+            }
+            if (!hasData) return;
+
+            // 清除舊的 K棒快取，強制重新聚合
+            _engine.ClearCache();
+
+            var allOfflineKlineData = new List<KlineBar>();
+
+            foreach (var session in new[] { "日盤", "夜盤" })
+            {
+                List<TradeTick> mxfT, txfT;
+                lock (_rtLock)
+                {
+                    mxfT = [.. _liveSymbolTrades["MXF"][session]];
+                    txfT = [.. _liveSymbolTrades["TXF"][session]];
+                }
+
+                if (mxfT.Count == 0) continue;
+
+                var txfSigs = GetSimResultsFromSnapshot("TXF", session);
+                var mxfSigs = GetSimResultsFromSnapshot("MXF", session);
+
+                // 重新聚合 K線
+                var (klineData, _) = _engine.CalcKlineData(session, mxfT, txfSigs, mxfSigs, _currentKlineInterval);
+                allOfflineKlineData.AddRange(klineData);
+
+                // 重新計算停損觀測表
+                var results = _engine.CalcSimulationResults(session, mxfT, klineData, _currentObsN);
+                UpdateObserverViews(results);
+            }
+
+            if (allOfflineKlineData.Count > 0)
+            {
+                UpdateKlineViews(allOfflineKlineData);
+                klineChart.UpdateCandles(allOfflineKlineData);
+            }
+
+            // 觸發未破停損監控重新計算
+            wndUnbrokenK.TriggerUnbrokenCheck(force: true);
+        }
+
+        private List<SimulationResult> GetSimResultsFromSnapshot(string sym, string session)
+        {
+            // 優先由當前實時計算的 snapshot 提取
+            if (_lastRtStatusSnapshot != null)
+            {
+                var match = _lastRtStatusSnapshot.FirstOrDefault(x => x.Symbol == sym && x.Session == session);
+                if (match.Symbol != null)
+                {
+                    return match.Details;
+                }
+            }
+
+            // 由臨時載入的資料庫快取提取
+            if (App.Current.Resources.Contains("_temp_offline_signals"))
+            {
+                var dict = (Dictionary<string, List<SimulationResult>>)App.Current.Resources["_temp_offline_signals"];
+                string key = $"{sym} ({session})";
+                if (dict.TryGetValue(key, out var list))
+                    return list;
+            }
+            return [];
+        }
+
+        /// <summary>
+        /// 100% 移植 _analyze_file_logic 核心離線分析流程。
+        /// </summary>
+        private (bool Success, object Result, string? Status) RunAnalysisSync(
+            (string Path, Func<double, bool> Filter)[] filePaths, string targetSymbol, int targetDays = 60, bool ignoreTimeCheck = true)
+        {
+            var quantParams = _engine.LoadQuantParams(targetSymbol, targetDays);
+
+            var pattern = SymbolRegex();
+            var mattimePat = MatTimeRegex();
+            var matPriPat = MatPriRegex();
+            var tmatqtyPat = TMatQtyRegex();
+            var bestbpPat = BestBpRegex();
+            var bestspPat = BestSpRegex();
+
+            var allSymbolTrades = new Dictionary<string, Dictionary<string, List<TradeTick>>>
+            {
+                { "TXF", new Dictionary<string, List<TradeTick>> { { "日盤", new() }, { "夜盤", new() } } },
+                { "MXF", new Dictionary<string, List<TradeTick>> { { "日盤", new() }, { "夜盤", new() } } }
+            };
+
+            var lastTmatqty = new Dictionary<(string, string, string), int>();
+
+            try
+            {
+                foreach (var (path, timeFilter) in filePaths)
+                {
+                    if (!File.Exists(path)) continue;
+
+                    using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    using var sr = new StreamReader(fs, Encoding.GetEncoding("big5"));
+                    string? line;
+
+                    while ((line = sr.ReadLine()) != null)
+                    {
+                        if (!line.Contains("TXF") && !line.Contains("MXF")) continue;
+
+                        var match = pattern.Match(line);
+                        if (!match.Success) continue;
+                        string symbol = match.Groups[1].Value;
+
+                        string baseSym = symbol.Contains("TXF") ? "TXF" : (symbol.Contains("MXF") ? "MXF" : "");
+                        if (string.IsNullOrEmpty(baseSym)) continue;
+
+                        var mtMatch = mattimePat.Match(line);
+                        var mpMatch = matPriPat.Match(line);
+                        var tqMatch = tmatqtyPat.Match(line);
+                        if (!mtMatch.Success || !mpMatch.Success || !tqMatch.Success) continue;
+
+                        string timeStr = mtMatch.Groups[1].Value;
+                        double tValRaw = TimeParser.ParseTime(timeStr);
+
+                        if (!timeFilter(tValRaw)) continue;
+
+                        string session = "";
+                        double tVal = tValRaw;
+
+                        if (tValRaw >= 31500.0 && tValRaw <= 49500.0)
+                        {
+                            session = "日盤";
+                        }
+                        else if (tValRaw >= 54000.0 || tValRaw <= 18000.0)
+                        {
+                            session = "夜盤";
+                            if (tValRaw <= 18000.0) tVal += 86400.0;
+                        }
+                        else
+                        {
+                            continue;
+                        }
+
+                        int tmatqty = int.Parse(tqMatch.Groups[1].Value);
+                        var qtyKey = (baseSym, session, path);
+                        if (tmatqty < 0 || (lastTmatqty.ContainsKey(qtyKey) && tmatqty <= lastTmatqty[qtyKey]))
+                            continue;
+
+                        lastTmatqty[qtyKey] = tmatqty;
+
+                        var bpM = bestbpPat.Match(line);
+                        var spM = bestspPat.Match(line);
+                        if (!bpM.Success || !spM.Success) continue;
+
+                        int bestBp = 0, bestSp = 0;
+                        try
+                        {
+                            string bPrices = bpM.Groups[1].Value;
+                            string sPrices = spM.Groups[1].Value;
+                            bestBp = !string.IsNullOrEmpty(bPrices) ? (int)double.Parse(bPrices.Split(',')[0]) : 0;
+                            bestSp = !string.IsNullOrEmpty(sPrices) ? (int)double.Parse(sPrices.Split(',')[0]) : 0;
+                            if (bestBp <= 0 || bestSp <= 0) continue;
+                        }
+                        catch { continue; }
+
+                        int price = int.Parse(mpMatch.Groups[1].Value);
+                        TradeSide side = TradeSide.Unknown;
+                        if (price >= bestSp) side = TradeSide.Outer;
+                        else if (price <= bestBp) side = TradeSide.Inner;
+
+                        if (side == TradeSide.Unknown)
+                        {
+                            var prevTrades = allSymbolTrades[baseSym][session];
+                            side = prevTrades.Count > 0 ? prevTrades[^1].Side : TradeSide.Outer;
+                        }
+
+                        allSymbolTrades[baseSym][session].Add(new TradeTick(baseSym, timeStr, tVal, price, side, bestBp, bestSp, session));
+                    }
+                }
+
+                // 複製至全域快取 (執行緒安全)
+                lock (_rtLock)
+                {
+                    foreach (var sym in new[] { "TXF", "MXF" })
+                    {
+                        foreach (var sess in new[] { "日盤", "夜盤" })
+                        {
+                             _liveSymbolTrades[sym][sess] = [.. allSymbolTrades[sym][sess]];
+                            
+                            // 更新 O(1) 狀態
+                            var state = _rtState[sym][sess];
+                            state.Reset();
+                            var list = _liveSymbolTrades[sym][sess];
+                            if (list.Count > 0)
+                            {
+                                state.Count = list.Count;
+                                state.SumPrice = list.Sum(t => (long)t.Price);
+                                state.DayMax = list.Max(t => t.Price);
+                                state.DayMin = list.Min(t => t.Price);
+                                state.MaxTime = list.Last(t => t.Price == state.DayMax).Time;
+                                state.MinTime = list.Last(t => t.Price == state.DayMin).Time;
+                                
+                                var outerList = list.Where(t => t.Side == TradeSide.Outer).ToList();
+                                var innerList = list.Where(t => t.Side == TradeSide.Inner).ToList();
+                                state.OuterCount = outerList.Count;
+                                state.InnerCount = innerList.Count;
+                                if (outerList.Count > 0)
+                                {
+                                    state.FirstOuterTime = outerList[0].TimeVal;
+                                    state.LastOuterTime = outerList[^1].TimeVal;
+                                }
+                                if (innerList.Count > 0)
+                                {
+                                    state.FirstInnerTime = innerList[0].TimeVal;
+                                    state.LastInnerTime = innerList[^1].TimeVal;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                var aggregatedTrades = new Dictionary<string, List<TradeTick>>();
+                foreach (var symbol in new[] { "TXF", "MXF" })
+                {
+                    foreach (var sessionName in new[] { "日盤", "夜盤" })
+                    {
+                        var trades = allSymbolTrades[symbol][sessionName];
+                        if (trades.Count == 0) continue;
+
+                        double startTime = trades[0].TimeVal;
+                        double endTime = trades[^1].TimeVal;
+
+                        if (!ignoreTimeCheck)
+                        {
+                            if (sessionName == "日盤" && (startTime > 32400.0 || endTime < 46800.0)) continue;
+                            if (sessionName == "夜盤" && (startTime > 63000.0 || endTime < 103500.0)) continue;
+                        }
+
+                        aggregatedTrades[$"{symbol} ({sessionName})"] = trades;
+                    }
+                }
+
+                if (aggregatedTrades.Count == 0)
+                    return (false, "未找到有效數據。", null);
+
+                var reportsBySession = new Dictionary<string, string> { { "日盤", "" }, { "夜盤", "" } };
+                var sessionSpeeds = new Dictionary<string, Dictionary<string, string>>
+                {
+                    { "日盤", new() { { "TXF", "--" }, { "MXF", "--" } } },
+                    { "夜盤", new() { { "TXF", "--" }, { "MXF", "--" } } }
+                };
+
+                // 計算日夜速差
+                foreach (var ss in aggregatedTrades)
+                {
+                    string sName = ss.Key.Contains("日盤") ? "日盤" : "夜盤";
+                    string symCode = ss.Key.Contains("TXF") ? "TXF" : "MXF";
+                    var (oa, ia, _) = _engine.CalcSideSpeed(ss.Value);
+                    if (oa.HasValue && ia.HasValue)
+                        sessionSpeeds[sName][symCode] = $"{ia.Value - oa.Value:+0.0000;-0.0000;+0.0000}s";
+                }
+
+                var tempOfflineSignals = new Dictionary<string, List<SimulationResult>>();
+
+                foreach (var entry in aggregatedTrades)
+                {
+                    string symbolSession = entry.Key;
+                    var trades = entry.Value;
+                    string currSymbol = symbolSession.Contains("TXF") ? "TXF" : "MXF";
+                    string currSession = symbolSession.Contains("日盤") ? "日盤" : "夜盤";
+                    string otherSymCode = currSymbol == "TXF" ? "MXF" : "TXF";
+                    var otherTradesAll = allSymbolTrades[otherSymCode][currSession];
+
+                    var qParams = _engine.LoadQuantParams(currSymbol, targetDays);
+
+                    int dayMax = trades.Max(t => t.Price);
+                    int dayMin = trades.Min(t => t.Price);
+                    int finalClose = trades[^1].Price;
+
+                    var absDetails = new List<(double TVal, string StatusStr, string ATime, int PriceVal, string TrigTime, int TrigPrice, double? Pre, double? Post, int AmpVal, int BIdx)>();
+                    int runningMax = -999999;
+                    int runningMin = 999999;
+                    int? lastPrice = null;
+                    double lastCheckTimeH = -999999.0;
+                    double lastCheckTimeB = -999999.0;
+
+                    for (int i = 0; i < trades.Count; i++)
+                    {
+                        int price = trades[i].Price;
+                        double tVal = trades[i].TimeVal;
+                        bool isTrigH = false;
+                        bool isTrigB = false;
+
+                        if (price > runningMax) { runningMax = price; isTrigH = true; }
+                        else if (price == runningMax)
+                        {
+                            if ((lastPrice.HasValue && lastPrice.Value < price) || (tVal - lastCheckTimeH >= 30.0)) isTrigH = true;
+                        }
+
+                        if (price < runningMin) { runningMin = price; isTrigB = true; }
+                        else if (price == runningMin)
+                        {
+                            if ((lastPrice.HasValue && lastPrice.Value > price) || (tVal - lastCheckTimeB >= 30.0)) isTrigB = true;
+                        }
+
+                        if (price == dayMax)
+                        {
+                            var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) = _engine.GetDurations(trades, _engine.AbsNTicks, i, TradeSide.Outer, TradeSide.Inner);
+                            string status = _engine.GetStatusStr(pre, post, actPre, actPost, _engine.AbsNTicks);
+                            int amp = runningMin != 999999 ? (runningMax - runningMin) : 0;
+                            absDetails.Add((tVal, "時段最高" + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
+                        }
+                        else if (isTrigH)
+                        {
+                            var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) = _engine.GetDurations(trades, _engine.AbsNTicks, i, TradeSide.Outer, TradeSide.Inner);
+                            string status = _engine.GetStatusStr(pre, post, actPre, actPost, _engine.AbsNTicks);
+                            if (status.Contains("達標") || status.Contains("未達標"))
+                            {
+                                int amp = runningMin != 999999 ? (runningMax - runningMin) : 0;
+                                string prefix = status.Contains("未達標") ? "曾未達標最高" : "曾達標最高";
+                                absDetails.Add((tVal, prefix + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
+                            }
+                        }
+
+                        if (price == dayMin)
+                        {
+                            var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) = _engine.GetDurations(trades, _engine.AbsNTicks, i, TradeSide.Inner, TradeSide.Outer);
+                            string status = _engine.GetStatusStr(pre, post, actPre, actPost, _engine.AbsNTicks);
+                            int amp = runningMax != -999999 ? (runningMax - runningMin) : 0;
+                            absDetails.Add((tVal, "時段最低" + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
+                        }
+                        else if (isTrigB)
+                        {
+                            var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) = _engine.GetDurations(trades, _engine.AbsNTicks, i, TradeSide.Inner, TradeSide.Outer);
+                            string status = _engine.GetStatusStr(pre, post, actPre, actPost, _engine.AbsNTicks);
+                            if (status.Contains("達標") || status.Contains("未達標"))
+                            {
+                                int amp = runningMax != -999999 ? (runningMax - runningMin) : 0;
+                                string prefix = status.Contains("未達標") ? "曾未達標最低" : "曾達標最低";
+                                absDetails.Add((tVal, prefix + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
+                            }
+                        }
+
+                        if (isTrigH) lastCheckTimeH = tVal;
+                        if (isTrigB) lastCheckTimeB = tVal;
+                        lastPrice = price;
+                    }
+
+                    absDetails.Sort((x, y) => x.TVal.CompareTo(y.TVal));
+                    var filteredPre = new List<(double TVal, string StatusStr, string ATime, int PriceVal, string TrigTime, int TrigPrice, double? Pre, double? Post, int AmpVal, int BIdx)>();
+                    var seenKeys = new HashSet<(string Type, int Price)>();
+                    foreach (var (tVal, statusStr, aTime, priceVal, trigTime, trigPrice, pre, post, ampVal, bIdx) in absDetails)
+                    {
+                        var key = (statusStr.Contains("最高") ? "最高" : "最低", priceVal);
+                        if (seenKeys.Add(key))
+                        {
+                            filteredPre.Add((tVal, statusStr, aTime, priceVal, trigTime, trigPrice, pre, post, ampVal, bIdx));
+                        }
+                    }
+
+                    // 重新做速差 Immutable
+                    var lastNetSpeedsTop = new Dictionary<string, double?> { { "TXF", null }, { "MXF", null } };
+                    var lastNetSpeedsBot = new Dictionary<string, double?> { { "TXF", null }, { "MXF", null } };
+                    var finalAbsWithSpeeds = new List<SimulationResult>();
+
+                    foreach (var (tVal, statusStr, aTime, priceVal, trigTime, trigPrice, pre, post, ampVal, bIdx) in filteredPre)
+                    {
+                        if (!post.HasValue)
+                        {
+                            var copy = new SimulationResult { DisplayTitle = statusStr, BestATime = aTime, BestAPrice = priceVal, StopLossDisplay = "N/A" };
+                            finalAbsWithSpeeds.Add(copy);
+                            continue;
+                        }
+
+                        bool isTop = statusStr.Contains("最高");
+                        bool isDayExtreme = statusStr.Contains("時段最高") || statusStr.Contains("時段最低");
+                        bool needSpeed = !(isDayExtreme && !statusStr.Contains("達標"));
+
+                        string speedStr = "";
+                        if (needSpeed)
+                        {
+                            speedStr = isTop
+                                ? _engine.GetSpeedSnapshotStr(currSymbol, trades, bIdx, otherTradesAll, lastNetSpeedsTop)
+                                : _engine.GetSpeedSnapshotStr(currSymbol, trades, bIdx, otherTradesAll, lastNetSpeedsBot);
+                        }
+
+                        var res = new SimulationResult
+                        {
+                            Type = isTop ? "K低" : "K高",
+                            DisplayTitle = statusStr,
+                            BestATime = aTime,
+                            BestAPrice = priceVal,
+                            TrigTime = trigTime,
+                            TrigPrice = trigPrice.ToString(),
+                            Pre = pre.HasValue ? $"{pre.Value:F4}s" : "N/A",
+                            Post = $"{post.Value:F4}s",
+                            AmpVal = ampVal,
+                            BIndex = bIdx,
+                            ObsN = _engine.AbsNTicks
+                        };
+                        res.Tags.Add(speedStr);
+                        finalAbsWithSpeeds.Add(res);
+                    }
+
+                    tempOfflineSignals[symbolSession] = finalAbsWithSpeeds;
+
+                    // 組裝輸出文字 (對齊 Python 格式)
+                    var stateSnapshot = new Dictionary<string, TradingState>
+                    {
+                        { "TXF", _rtState["TXF"][currSession] },
+                        { "MXF", _rtState["MXF"][currSession] }
+                    };
+                    string report = GenerateRealtimeReportStr(currSymbol, currSession, trades, finalAbsWithSpeeds, qParams, stateSnapshot);
+                    reportsBySession[currSession] += report + "\n";
+                }
+
+                // 緩存以供 UI 讀取
+                App.Current.Resources["_temp_offline_trades"] = _liveSymbolTrades.ToDictionary(k => k.Key, v => v.Value.ToDictionary(kk => kk.Key, vv => new List<TradeTick>(vv.Value)));
+                App.Current.Resources["_temp_offline_signals"] = tempOfflineSignals;
+
+                return (true, reportsBySession, "OK");
+            }
+            catch (Exception ex)
+            {
+                return (false, ex.Message, null);
+            }
+        }
+
+        private string GenerateRealtimeReportStr(
+            string symbol, string session, List<TradeTick> trades, List<SimulationResult> filteredDetails, 
+            Dictionary<string, object> quantParams, Dictionary<string, TradingState> stateSnapshot)
+        {
+            if (trades.Count == 0) return "";
+            int finalClose = trades[^1].Price;
+
+            var (oAvg, iAvg, dStr) = _engine.CalcSideSpeed(trades);
+            int oCnt = trades.Count(t => t.Side == TradeSide.Outer);
+            int iCnt = trades.Count(t => t.Side == TradeSide.Inner);
+            string outerS = oAvg.HasValue ? $"{oAvg.Value:F4}s/{oCnt}筆" : "資料不足";
+            string innerS = iAvg.HasValue ? $"{iAvg.Value:F4}s/{iCnt}筆" : "資料不足";
+            int avgPri = (int)Math.Round(trades.Sum(t => (double)t.Price) / trades.Count);
+
+            string txfN = "--", mxfN = "--";
+            if (stateSnapshot.TryGetValue("TXF", out var stT) && stateSnapshot.TryGetValue("MXF", out var stM))
+            {
+                var (_, _, dT) = _engine.CalcSideSpeedFromState(stT);
+                var (_, _, dM) = _engine.CalcSideSpeedFromState(stM);
+                
+                double? netT = (stT.OuterCount >= 2 && stT.LastOuterTime.HasValue && stT.FirstOuterTime.HasValue &&
+                               stT.InnerCount >= 2 && stT.LastInnerTime.HasValue && stT.FirstInnerTime.HasValue)
+                               ? ((stT.LastInnerTime.Value - stT.FirstInnerTime.Value) / (stT.InnerCount - 1)) -
+                                 ((stT.LastOuterTime.Value - stT.FirstOuterTime.Value) / (stT.OuterCount - 1))
+                               : null;
+                
+                double? netM = (stM.OuterCount >= 2 && stM.LastOuterTime.HasValue && stM.FirstOuterTime.HasValue &&
+                               stM.InnerCount >= 2 && stM.LastInnerTime.HasValue && stM.FirstInnerTime.HasValue)
+                               ? ((stM.LastInnerTime.Value - stM.FirstInnerTime.Value) / (stM.InnerCount - 1)) -
+                                 ((stM.LastOuterTime.Value - stM.FirstOuterTime.Value) / (stM.OuterCount - 1))
+                               : null;
+
+                txfN = netT.HasValue ? $"{netT.Value:+0.0000;-0.0000;+0.0000}s" : "--";
+                mxfN = netM.HasValue ? $"{netM.Value:+0.0000;-0.0000;+0.0000}s" : "--";
+            }
+
+            static string FmtPad(string text, int width)
+            {
+                int actualW = text.Sum(c => c > 127 ? 2 : 1);
+                return text + new string(' ', Math.Max(0, width - actualW));
+            }
+
+            string hType = FmtPad("類型", 22);
+            string hZone = FmtPad("進場區/停損", 23);
+            string hATime = FmtPad("A點時間", 15);
+            string hAPri = FmtPad("A點價", 8);
+            string hBTime = FmtPad("B點時間", 15);
+            string hTrig = FmtPad("觸發價", 8);
+            string hPre = FmtPad("前向平均", 12);
+            string hPost = FmtPad("後向平均", 12);
+            string hAmp = FmtPad("當時振幅", 8);
+
+            string header = $"{hType} | {hZone} | {hATime} | {hAPri} | {hBTime} | {hTrig} | {hPre} | {hPost} | {hAmp}";
+            string sep = "    " + new string('-', 142);
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"\n    [{symbol} 即時極值詳情 (平均每筆間隔)]  最新價: {finalClose}");
+            sb.AppendLine($"    ● 成交速度: 外盤(買) {outerS} | 內盤(賣) {innerS} → {dStr} | 大台速差: {txfN,-15} 小台速差: {mxfN,-15} | 均價:{avgPri}");
+            sb.AppendLine($"    {header}");
+            sb.AppendLine(sep);
+
+            string? lastAbsType = null;
+            foreach (var d in filteredDetails)
+            {
+                if (d.Post == "N/A") continue;
+
+                string currentType = d.DisplayTitle.Contains("最高") ? "最高" : "最低";
+                if (lastAbsType != null && currentType != lastAbsType)
+                {
+                    sb.AppendLine(sep);
+                }
+                lastAbsType = currentType;
+
+                string bTimeVal = d.TrigTime;
+                string bPriVal = d.TrigPrice;
+                string preS = d.Pre.PadLeft(12);
+                string postS = d.Post.PadLeft(12);
+
+                string side = currentType == "最高" ? "top" : "bottom";
+                string speedInfo = d.Tags.FirstOrDefault() ?? "";
+
+                bool isUnmet = d.DisplayTitle.Contains(" [未達標]");
+                bool forceShowUnmet = false;
+                string displayTypeStr = d.DisplayTitle;
+                
+                if (isUnmet)
+                {
+                    if (d.DisplayTitle.Contains("最高") && (speedInfo.Contains("空速增") || speedInfo.Contains("多速減")))
+                        forceShowUnmet = true;
+                    else if (d.DisplayTitle.Contains("最低") && (speedInfo.Contains("多速增") || speedInfo.Contains("空速減")))
+                        forceShowUnmet = true;
+
+                    if (forceShowUnmet)
+                        displayTypeStr = displayTypeStr.Replace("未達標", "矛盾");
+                }
+
+                string zoneStr = "";
+                if (d.DisplayTitle.Contains(" [達標]") || (isUnmet && forceShowUnmet))
+                {
+                    try
+                    {
+                        var tDict = (Dictionary<string, (int p50, int p75, int p90)>)quantParams[side == "top" ? "time_top" : "time_bottom"];
+                        string bTimeClean = d.BestATime.Replace(":", "");
+                        int hmVal = bTimeClean.Length >= 4 ? int.Parse(bTimeClean[..4]) : 0;
+                        int h = hmVal / 100, m = hmVal % 100;
+                        int totalM = h * 60 + m;
+                        if (session == "夜盤" && totalM < 900) totalM += 1440;
+
+                        int? p50 = null, p75 = null, p90 = null;
+                        foreach (var kvp in tDict)
+                        {
+                            if (kvp.Key.Contains(session))
+                            {
+                                string timePart = kvp.Key.Split(' ')[1].Trim();
+                                if (timePart.Contains('-'))
+                                {
+                                    var sStr = timePart.Split('-')[0];
+                                    var eStr = timePart.Split('-')[1];
+                                    int sMins = int.Parse(sStr.Split(':')[0]) * 60 + int.Parse(sStr.Split(':')[1]);
+                                    int eMins = int.Parse(eStr.Split(':')[0]) * 60 + int.Parse(eStr.Split(':')[1]);
+                                    if (session == "夜盤")
+                                    {
+                                        if (sMins < 900) sMins += 1440;
+                                        if (eMins < 900) eMins += 1440;
+                                    }
+                                    if (sMins <= totalM && totalM <= eMins)
+                                    {
+                                        p50 = kvp.Value.p50;
+                                        p75 = kvp.Value.p75;
+                                        p90 = kvp.Value.p90;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (p50.HasValue && p75.HasValue && p90.HasValue)
+                        {
+                            if (side == "top")
+                                zoneStr = $"區:{d.BestAPrice + p50.Value}~{d.BestAPrice + p75.Value} 損:{d.BestAPrice + p90.Value}";
+                            else
+                                zoneStr = $"區:{d.BestAPrice - p50.Value}~{d.BestAPrice - p75.Value} 損:{d.BestAPrice - p90.Value}";
+                        }
+                    }
+                    catch { }
+                }
+
+                sb.AppendLine($"    {FmtPad(displayTypeStr, 22)} | {FmtPad(zoneStr, 23)} | {FmtPad(d.BestATime, 15)} | {FmtPad(d.BestAPrice.ToString(), 8)} | {FmtPad(bTimeVal, 15)} | {FmtPad(bPriVal, 8)} | {preS} | {postS} | {d.AmpVal,8}");
+                if (!string.IsNullOrEmpty(speedInfo))
+                {
+                    sb.AppendLine($"    {speedInfo.Trim()}");
+                }
+            }
+
+            return sb.ToString() + sep + "\n";
+        }
+
+        private void PreloadTodayLog()
+        {
+            string todayStr = DateTime.Now.ToString("yyyyMMdd");
+            string todayLog = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Logs", todayStr, "event.log");
+
+            if (!File.Exists(todayLog))
+            {
+                AppendLog($"【預載】未找到今日歷史日誌: {todayLog}，將直接由即時 Tick 開始。");
+                return;
+            }
+
+            AppendLog($"【預載】偵測到今日歷史日誌，開始背景非同步載入: {Path.GetFileName(todayLog)}...");
+            btnRealtime.IsEnabled = false; // 預載時先鎖定按鈕，防止二次進入
+
+            string activeSession = _currentRealtimePort == 442 ? "夜盤" : "日盤";
+
+            Task.Run(() =>
+            {
+                try
+                {
+                    var filePaths = new[] { (todayLog, (Func<double, bool>)(t => true)) };
+                    var (success, result, status) = RunAnalysisSync(filePaths, "MXF", _currentTargetDays, ignoreTimeCheck: true);
+
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        btnRealtime.IsEnabled = true;
+                        klineChart.plot_widget.getViewBox().enableAutoRange(); // 預載成功強制 autoRange 重對焦
+
+                        if (success && result is Dictionary<string, string> reports)
+                        {
+                            int txfCount = 0, mxfCount = 0;
+                            lock (_rtLock)
+                            {
+                                txfCount = _liveSymbolTrades["TXF"][activeSession].Count;
+                                mxfCount = _liveSymbolTrades["MXF"][activeSession].Count;
+                                
+                                // 強置 scan 進度歸零以從頭開始計算極值演變軌跡
+                                _rtState["TXF"][activeSession].ScanIdx = 0;
+                                _rtState["MXF"][activeSession].ScanIdx = 0;
+                                _rtState["TXF"][activeSession].RunningMax = -999999;
+                                _rtState["TXF"][activeSession].RunningMin = 999999;
+                                _rtState["MXF"][activeSession].RunningMax = -999999;
+                                _rtState["MXF"][activeSession].RunningMin = 999999;
+                            }
+
+                            AppendLog($"【預載】今日日誌預載成功！大臺: {txfCount} 筆, 小臺: {mxfCount} 筆。即時分析已啟動！");
+                            
+                            // 觸發重新分析計算
+                            _analysisEvent.Set();
+                        }
+                        else
+                        {
+                            AppendLog("【預載】今日日誌預載失敗，將直接由即時 Tick 行情開始。");
+                            _analysisEvent.Set();
+                        }
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        btnRealtime.IsEnabled = true;
+                        AppendLog($"【預載】今日日誌預載例外失敗: {ex.Message}，直接由即時 Tick 開始。");
+                        _analysisEvent.Set();
+                    }));
+                }
+            });
+        }
+
+        // ==================== 6. 復盤播放與進度控制 (ReplayThread 轉化) ====================
+
+        private void BtnSelectReplayDir_Click(object sender, RoutedEventArgs e)
+        {
+            var dialog = new System.Windows.Forms.FolderBrowserDialog
+            {
+                Description = "選擇 event.log 所在的日期資料夾",
+                ShowNewFolderButton = false
+            };
+
+            string defaultPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Logs");
+            if (Directory.Exists(defaultPath))
+            {
+                dialog.SelectedPath = defaultPath;
+            }
+
+            if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK)
+            {
+                string path = dialog.SelectedPath;
+                string logFile = Path.Combine(path, "event.log");
+                
+                if (File.Exists(logFile))
+                {
+                    _currentReplayDir = path;
+                    txtReplayPath.Text = Path.GetFileName(path);
+                    lblStatus.Content = $"已選定復盤目錄: {Path.GetFileName(path)}";
+                }
+                else
+                {
+                    MessageBox.Show("所選資料夾中沒有找到 event.log 檔案！", "警告", MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+            }
+        }
+
+        private void BtnLoadReplay_Click(object sender, RoutedEventArgs e)
+        {
+            if (string.IsNullOrEmpty(_currentReplayDir))
+            {
+                lblStatus.Content = "請先點選選擇資料夾";
+                return;
+            }
+
+            string logFile = Path.Combine(_currentReplayDir, "event.log");
+            if (!File.Exists(logFile))
+            {
+                lblStatus.Content = $"找不到檔案: {Path.GetFileName(logFile)}";
+                return;
+            }
+
+            // 1. 徹底停止上一日期的播放執行緒
+            StopReplay();
+
+            lblStatus.Content = "載入復盤檔案中...";
+            btnLoadReplay.IsEnabled = false;
+            btnPlayPause.IsEnabled = false;
+            
+            // 修正 WPF ComboBox.Text 抓取空值 Bug，改以 SelectedItem 安全取得
+            string activeSession = (cboReplaySession.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "日盤";
+
+            // 2. 背景非同步解析 log 檔案成 Ticks 陣列 ( parser_worker 轉 C#背景 Task)
+            Task.Run(() =>
+            {
+                try
+                {
+                    var pattern = SymbolRegex();
+                    var mattimePat = MatTimeRegex();
+                    var matPriPat = MatPriRegex();
+                    var tmatqtyPat = TMatQtyRegex();
+                    var bestbpPat = BestBpRegex();
+                    var bestspPat = BestSpRegex();
+
+                    var parsedTicks = new List<TradeTick>();
+                    var lastTmatqty = new Dictionary<(string, string), int>();
+
+                    using var fs = new FileStream(logFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    using var sr = new StreamReader(fs, Encoding.GetEncoding("big5"));
+                    string? line;
+
+                    while ((line = sr.ReadLine()) != null)
+                    {
+                        if (!line.Contains("TXF") && !line.Contains("MXF")) continue;
+
+                        var match = pattern.Match(line);
+                        if (!match.Success) continue;
+                        string symbol = match.Groups[1].Value;
+
+                        string baseSym = symbol.Contains("TXF") ? "TXF" : (symbol.Contains("MXF") ? "MXF" : "");
+                        if (string.IsNullOrEmpty(baseSym)) continue;
+
+                        var mtMatch = mattimePat.Match(line);
+                        var mpMatch = matPriPat.Match(line);
+                        var tqMatch = tmatqtyPat.Match(line);
+                        if (!mtMatch.Success || !mpMatch.Success || !tqMatch.Success) continue;
+
+                        string timeStr = mtMatch.Groups[1].Value;
+                        double tValRaw = TimeParser.ParseTime(timeStr);
+
+                        string session = "";
+                        double tVal = tValRaw;
+
+                        if (tValRaw >= 31500.0 && tValRaw <= 49500.0)
+                        {
+                            session = "日盤";
+                        }
+                        else if (tValRaw >= 54000.0 || tValRaw <= 18000.0)
+                        {
+                            session = "夜盤";
+                            if (tValRaw <= 18000.0) tVal += 86400.0;
+                        }
+                        else
+                        {
+                            continue;
+                        }
+
+                        if (session != activeSession) continue;
+
+                        int tmatqty = int.Parse(tqMatch.Groups[1].Value);
+                        var qtyKey = (baseSym, session);
+                        if (tmatqty < 0 || (lastTmatqty.ContainsKey(qtyKey) && tmatqty <= lastTmatqty[qtyKey]))
+                            continue;
+
+                        lastTmatqty[qtyKey] = tmatqty;
+
+                        var bpM = bestbpPat.Match(line);
+                        var spM = bestspPat.Match(line);
+                        if (!bpM.Success || !spM.Success) continue;
+
+                        int bestBp = 0, bestSp = 0;
+                        try
+                        {
+                            string bPrices = bpM.Groups[1].Value;
+                            string sPrices = spM.Groups[1].Value;
+                            bestBp = !string.IsNullOrEmpty(bPrices) ? (int)double.Parse(bPrices.Split(',')[0]) : 0;
+                            bestSp = !string.IsNullOrEmpty(sPrices) ? (int)double.Parse(sPrices.Split(',')[0]) : 0;
+                            if (bestBp <= 0 || bestSp <= 0) continue;
+                        }
+                        catch { continue; }
+
+                        int price = int.Parse(mpMatch.Groups[1].Value);
+                        TradeSide side = TradeSide.Unknown;
+                        if (price >= bestSp) side = TradeSide.Outer;
+                        else if (price <= bestBp) side = TradeSide.Inner;
+
+                        parsedTicks.Add(new TradeTick(baseSym, timeStr, tVal, price, side, bestBp, bestSp, session));
+                    }
+
+                    parsedTicks.Sort((x, y) => x.TimeVal.CompareTo(y.TimeVal));
+
+                    // 安全回到 UI 執行緒
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        btnLoadReplay.IsEnabled = true;
+                        _allParsedTicks = parsedTicks;
+                        _currentReplaySession = activeSession;
+
+                        if (_allParsedTicks.Count == 0)
+                        {
+                            lblStatus.Content = $"無 [{activeSession}] Tick 資料！";
+                            btnPlayPause.IsEnabled = false;
+                            sldProgress.IsEnabled = false;
+                        }
+                        else
+                        {
+                            lblStatus.Content = $"載入 {parsedTicks.Count} 筆 Tick。";
+                            btnPlayPause.IsEnabled = true;
+                            btnStopReplay.IsEnabled = true;
+                            sldProgress.IsEnabled = true;
+                            
+                            sldProgress.Minimum = 0;
+                            sldProgress.Maximum = _allParsedTicks.Count - 1;
+                            sldProgress.Value = 0;
+
+                            // 進入復盤模式
+                            _isReplaying = true;
+
+                            ResetReplayTrack();
+                            ReconstructReplayUpTo(0);
+                        }
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        btnLoadReplay.IsEnabled = true;
+                        lblStatus.Content = $"載入出錯: {ex.Message}";
+                    }));
+                }
+            });
+        }
+
+        private void ResetReplayTrack()
+        {
+            lock (_rtLock)
+            {
+                _replaySymbolTrades["TXF"]["日盤"].Clear();
+                _replaySymbolTrades["TXF"]["夜盤"].Clear();
+                _replaySymbolTrades["MXF"]["日盤"].Clear();
+                _replaySymbolTrades["MXF"]["夜盤"].Clear();
+
+                _replayRtState["TXF"]["日盤"].Reset();
+                _replayRtState["TXF"]["夜盤"].Reset();
+                _replayRtState["MXF"]["日盤"].Reset();
+                _replayRtState["MXF"]["夜盤"].Reset();
+
+                _rtNotifiedKeys.Clear();
+                _rtLastNetSpeedsTop["TXF"] = null;
+                _rtLastNetSpeedsTop["MXF"] = null;
+                _rtLastNetSpeedsBot["TXF"] = null;
+                _rtLastNetSpeedsBot["MXF"] = null;
+                _rtLastMatchQty.Clear();
+                
+                _engine.ClearCache();
+            }
+        }
+
+        /// <summary>
+        /// 瞬間 O(1) 反射重組 0 到給定索引的歷史狀態與 UI ( Slider 拖曳核心)。
+        /// </summary>
+        private void ReconstructReplayUpTo(int index)
+        {
+            if (_allParsedTicks.Count == 0 || index < 0 || index >= _allParsedTicks.Count)
+                return;
+
+            string activeSession = _currentReplaySession;
+            ResetReplayTrack();
+
+            var subset = _allParsedTicks.Take(index + 1).ToList();
+            if (subset.Count == 0) return;
+
+            lock (_rtLock)
+            {
+                foreach (var tick in subset)
+                {
+                    string baseSym = tick.Symbol;
+                    int price = tick.Price;
+                    string mt = tick.Time;
+                    double tVal = tick.TimeVal;
+                    TradeSide side = tick.Side;
+
+                    if (side == TradeSide.Unknown)
+                    {
+                        var prevTrades = _replaySymbolTrades[baseSym][activeSession];
+                        side = prevTrades.Count > 0 ? prevTrades[^1].Side : TradeSide.Outer;
+                    }
+
+                    _replaySymbolTrades[baseSym][activeSession].Add(new TradeTick(baseSym, mt, tVal, price, side, tick.BestBp, tick.BestSp, activeSession));
+
+                    var state = _replayRtState[baseSym][activeSession];
+                    state.Count++;
+                    state.SumPrice += price;
+                    
+                    if (price > state.DayMax)
+                    {
+                        state.DayMax = price;
+                        state.MaxTime = mt;
+                    }
+                    if (price < state.DayMin)
+                    {
+                        state.DayMin = price;
+                        state.MinTime = mt;
+                    }
+
+                    if (side == TradeSide.Outer)
+                    {
+                        state.OuterCount++;
+                        state.FirstOuterTime ??= tVal;
+                        state.LastOuterTime = tVal;
+                    }
+                    else if (side == TradeSide.Inner)
+                    {
+                        state.InnerCount++;
+                        state.FirstInnerTime ??= tVal;
+                        state.LastInnerTime = tVal;
+                    }
+
+                    if (baseSym == "MXF")
+                    {
+                        _lastMxfPrice = price;
+                    }
+                }
+            }
+
+            lblVirtualTime.Content = $"復盤時間: {subset[^1].Time}";
+            
+            // 觸發非同步重繪與分析
+            _analysisEvent.Set();
+        }
+
+        private void BtnPlayPause_Click(object sender, RoutedEventArgs e)
+        {
+            if (_allParsedTicks.Count == 0) return;
+
+            if (_replayTask != null && !_replayCts!.IsCancellationRequested)
+            {
+                // 目前正在播放，執行暫停
+                StopReplayTaskOnly();
+                btnPlayPause.Content = "▶ 播放";
+                lblStatus.Content = "復盤暫停";
+            }
+            else
+            {
+                // 目前是暫停/停止，執行播放
+                _isReplaying = true;
+                btnPlayPause.Content = "⏸ 暫停";
+                lblStatus.Content = "復盤回放中...";
+
+                _replayCts = new CancellationTokenSource();
+                int startIdx = (int)sldProgress.Value;
+                if (startIdx >= _allParsedTicks.Count - 1)
+                {
+                    startIdx = 0;
+                    sldProgress.Value = 0;
+                }
+
+                _replayTask = Task.Run(() => ReplayLoopAsync(startIdx, _replayCts.Token));
+            }
+        }
+
+        private void StopReplayTaskOnly()
+        {
+            if (_replayCts != null)
+            {
+                _replayCts.Cancel();
+                try
+                {
+                    _replayTask?.Wait(500);
+                }
+                catch { }
+                _replayCts.Dispose();
+                _replayCts = null;
+                _replayTask = null;
+            }
+        }
+
+        private void BtnStopReplay_Click(object sender, RoutedEventArgs e)
+        {
+            StopReplay();
+            lblStatus.Content = "已無縫切回盤中實時行情";
+        }
+
+        private void StopReplay()
+        {
+            _isReplaying = false;
+            StopReplayTaskOnly();
+
+            // ── UI 控制項狀態全面還原 ──
+            btnPlayPause.IsEnabled = false;
+            btnPlayPause.Content = "▶ 播放";
+            btnStopReplay.IsEnabled = false;
+            sldProgress.IsEnabled = false;
+
+            // 復盤日期清空
+            txtReplayPath.Text = "";
+            _currentReplayDir = null;
+
+            // 速度歸回一倍速
+            cboReplaySpeed.SelectedIndex = 0;
+
+            // 進度橫桿拉回原點
+            sldProgress.Value = 0;
+            sldProgress.Maximum = 100;
+            sldProgress.Minimum = 0;
+
+            // 復盤時間清空
+            lblVirtualTime.Content = "復盤時間: --:--:--";
+
+            // 觀察 K 高 / 觀察 K 低 欄位清空
+            txtObsHigh.Text = "";
+            txtObsLow.Text = "";
+            _engine._obs_high_entry_price = null;
+            _engine._obs_low_entry_price = null;
+
+            // 最高觀察 / 最低觀察 ComboBox 清空
+            cboObsHigh.Text = "";
+            cboObsHigh.Items.Clear();
+            cboObsLow.Text = "";
+            cboObsLow.Items.Clear();
+            _engine._obs_high_price = null;
+            _engine._obs_low_price = null;
+
+            // 觀察狀態文字重設
+            lblObsStatus.Text = "觀察: 待設定";
+
+            // 重設 K線自動填入的快取時間戳，讓下次重新觸發自動填入
+            _lastAutofillKlineTime = null;
+
+            // 未破分 K 停損監控表單清空（不停止 Timer，保持監控待命）
+            wndUnbrokenK.Clear();
+
+            // 回放 Tick 陣列也清空
+            _allParsedTicks = [];
+
+            ResetReplayTrack();
+
+            // 觸發重新分析，切回實時行情
+            _analysisEvent.Set();
+        }
+
+        /// <summary>
+        /// 背景回放高精播放 Task。
+        /// 100% 還原「超過 60 秒的空檔自動瞬間跳過」、「20ms微型chunk非同步 sleep 響應」。
+        /// </summary>
+        private async Task ReplayLoopAsync(int startIndex, CancellationToken token)
+        {
+            try
+            {
+                int idx = startIndex;
+
+            while (idx < _allParsedTicks.Count && !token.IsCancellationRequested)
+            {
+                var tick = _allParsedTicks[idx];
+                string activeSession = _currentReplaySession;
+
+                // 餵入回放 Tick
+                lock (_rtLock)
+                {
+                    string baseSym = tick.Symbol;
+                    int price = tick.Price;
+                    string mt = tick.Time;
+                    double tVal = tick.TimeVal;
+                    TradeSide side = tick.Side;
+
+                    if (side == TradeSide.Unknown)
+                    {
+                        var prevTrades = _replaySymbolTrades[baseSym][activeSession];
+                        side = prevTrades.Count > 0 ? prevTrades[^1].Side : TradeSide.Outer;
+                    }
+
+                    _replaySymbolTrades[baseSym][activeSession].Add(new TradeTick(baseSym, mt, tVal, price, side, tick.BestBp, tick.BestSp, activeSession));
+
+                    var state = _replayRtState[baseSym][activeSession];
+                    state.Count++;
+                    state.SumPrice += price;
+                    
+                    if (price > state.DayMax)
+                    {
+                        state.DayMax = price;
+                        state.MaxTime = mt;
+                    }
+                    if (price < state.DayMin)
+                    {
+                        state.DayMin = price;
+                        state.MinTime = mt;
+                    }
+
+                    if (side == TradeSide.Outer)
+                    {
+                        state.OuterCount++;
+                        state.FirstOuterTime ??= tVal;
+                        state.LastOuterTime = tVal;
+                    }
+                    else if (side == TradeSide.Inner)
+                    {
+                        state.InnerCount++;
+                        state.FirstInnerTime ??= tVal;
+                        state.LastInnerTime = tVal;
+                    }
+
+                    if (baseSym == "MXF")
+                    {
+                        _lastMxfPrice = price;
+                    }
+                }
+
+                // 批次計數器節流 (Batching)，高頻行情下合併重繪
+                double speed = GetCurrentReplaySpeed();
+                int batchLimit = speed >= 10.0 ? 30 : 5;
+                _replayThrottleCounter++;
+                if (_replayThrottleCounter >= batchLimit)
+                {
+                    _replayThrottleCounter = 0;
+                    _analysisEvent.Set(); // 觸發背景分析重繪
+                }
+
+                // 異步安全分發更新進度與時間 label
+                _ = Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    lblVirtualTime.Content = $"復盤時間: {tick.Time}";
+                    
+                    // 暫停 Slide 觸發 ValueChanged 事件以防迴鎖
+                    sldProgress.ValueChanged -= SldProgress_ValueChanged;
+                    sldProgress.Value = idx;
+                    sldProgress.ValueChanged += SldProgress_ValueChanged;
+                }));
+
+                // 計算延遲間隔
+                if (idx + 1 < _allParsedTicks.Count)
+                {
+                    var nextTick = _allParsedTicks[idx + 1];
+                    double timeDiff = nextTick.TimeVal - tick.TimeVal;
+
+                    // 實作：超過 60 秒的空檔自動縮短至 3 秒等待
+                    if (timeDiff > 60.0)
+                    {
+                        timeDiff = 3.0;
+                    }
+
+                    double delay = timeDiff / speed;
+
+                    // 採用 20ms 微型 chunk 分段 await，確保暫停拖曳時瞬間回應
+                    double elapsed = 0.0;
+                    while (elapsed < delay && !token.IsCancellationRequested)
+                    {
+                        double sleepLen = Math.Min(0.02, delay - elapsed);
+                        await Task.Delay((int)(sleepLen * 1000), token);
+                        elapsed += sleepLen;
+                        
+                        // 支援播放中動態調整速度
+                        speed = GetCurrentReplaySpeed();
+                        delay = timeDiff / speed;
+                    }
+                }
+
+                idx++;
+            }
+
+            // 播畢處理
+            if (!token.IsCancellationRequested)
+            {
+                _ = Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    _isReplaying = false;
+                    btnPlayPause.Content = "▶ 播放";
+                    lblStatus.Content = "復盤播畢";
+                    _analysisEvent.Set();
+                }));
+            }
+            }
+            catch (OperationCanceledException)
+            {
+                // 暫停或停止播放時 Task 被取消是預期行為，靜默處理，完美避免報錯
+            }
+            catch (Exception ex)
+            {
+                // 升級：回放執行緒異常崩潰時，直接將詳細 Call Stack 輸出至監控日誌看板
+                _ = Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    AppendLog($"🚨【回放播放崩潰】播放背景執行緒發生未知錯誤: {ex.Message}\n{ex.StackTrace}");
+                }));
+            }
+        }
+
+        private double GetCurrentReplaySpeed()
+        {
+            return Dispatcher.Invoke(() =>
+            {
+                if (cboReplaySpeed.SelectedItem is not ComboBoxItem item) return 1.0;
+                string text = item.Content.ToString() ?? "1x";
+
+            if (text == "自訂")
+            {
+                if (double.TryParse(txtMaxSpeed.Text, out double val)) return val;
+                return 100.0;
+            }
+
+            return text switch
+            {
+                "1x" => 1.0,
+                "2x" => 2.0,
+                "5x" => 5.0,
+                "10x" => 10.0,
+                "20x" => 20.0,
+                "50x" => 50.0,
+                _ => 1.0
+            };
+            });
+        }
+
+        // ==================== 7. Slider 拖曳與 ValueChanged 互動事件 ====================
+
+        private void SldProgress_PreviewMouseDown(object sender, MouseButtonEventArgs e)
+        {
+            if (_replayTask != null && !_replayCts!.IsCancellationRequested)
+            {
+                _wasPlayingBeforeDrag = true;
+                StopReplayTaskOnly();
+            }
+            else
+            {
+                _wasPlayingBeforeDrag = false;
+            }
+        }
+
+        private void SldProgress_PreviewMouseUp(object sender, MouseButtonEventArgs e)
+        {
+            int val = (int)sldProgress.Value;
+            ReconstructReplayUpTo(val);
+
+            if (_wasPlayingBeforeDrag)
+            {
+                btnPlayPause.Content = "⏸ 暫停";
+                lblStatus.Content = "復盤回放中...";
+
+                _replayCts = new CancellationTokenSource();
+                _replayTask = Task.Run(() => ReplayLoopAsync(val, _replayCts.Token));
+            }
+        }
+
+        private void SldProgress_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            // 只有在非自動播放（拖曳中）時才執行實體狀態重構
+            if (_replayTask == null)
+            {
+                ReconstructReplayUpTo((int)e.NewValue);
+            }
+        }
+
+        // ==================== 8. UI 連動與表格選取交互事件 ====================
+
+        private void DgObserver_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (dgObserver.SelectedItem is not SimulationResult selected || selected.BestATime == "N/A" || string.IsNullOrEmpty(selected.BestATime))
+                return;
+
+            double aTVal = TimeParser.ParseTime(selected.BestATime);
+            if (aTVal <= 0) return;
+
+            int targetRowIdx = -1;
+
+            // 尋找 K線 繫結資料中對應時間範圍的 K棒 索引
+            for (int i = 0; i < _klineCollection.Count; i++)
+            {
+                string label = _klineCollection[i].TimeLabel;
+                try
+                {
+                    var times = label.Split('~');
+                    var startParts = times[0].Split(':');
+                    var endParts = times[1].Split(':');
+                    
+                    int sh = int.Parse(startParts[0]);
+                    int sm = int.Parse(startParts[1]);
+                    int eh = int.Parse(endParts[0]);
+                    int em = int.Parse(endParts[1]);
+
+                    double kStart = (sh * 60 + sm) * 60.0;
+                    double kEnd = (eh * 60 + em) * 60.0;
+
+                    if (_currentSessionName == "夜盤")
+                    {
+                        if (kStart <= 18000.0) kStart += 86400.0;
+                        if (kEnd <= 18000.0) kEnd += 86400.0;
+                    }
+
+                    if (kStart <= aTVal && aTVal < kEnd)
+                    {
+                        targetRowIdx = i;
+                        break;
+                    }
+                }
+                catch { }
+            }
+
+            if (targetRowIdx >= 1)
+            {
+                // 對焦點為該行的前一根 (原版 target_k_row = target_row - 1 完美對焦連動)
+                int targetKlineRow = targetRowIdx - 1;
+                
+                dgKline.SelectedIndex = targetKlineRow;
+                dgKline.ScrollIntoView(_klineCollection[targetKlineRow]);
+            }
+        }
+
+        private void DgKline_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (dgKline.SelectedIndex == -1 || _klineCollection.Count == 0) return;
+            int idx = dgKline.SelectedIndex;
+            if (idx >= 0 && idx < _klineCollection.Count)
+            {
+                klineChart.FocusCandle(idx);
+            }
+        }
+
+        /// <summary>
+        /// 點選已被選取的行時手動取消反白選取，防護點點點狀態異常。
+        /// </summary>
+        private void DataGrid_CancelSelection(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is not DataGrid dg) return;
+
+            // 獲取滑鼠點擊下的資料行物件
+            DependencyObject dep = (DependencyObject)e.OriginalSource;
+            while (dep != null && dep is not DataGridRow)
+            {
+                dep = VisualTreeHelper.GetParent(dep);
+            }
+
+            if (dep is DataGridRow row)
+            {
+                if (row.IsSelected)
+                {
+                    dg.SelectedIndex = -1; // 清空選取 (取消反白)
+                    e.Handled = true;     // 攔截事件，防護原生再次將其自動選取
+                }
+            }
+        }
+
+        private void TxtOutput_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            // 清空文字反白
+            txtOutput.Selection.Select(txtOutput.Document.ContentStart, txtOutput.Document.ContentStart);
+        }
+
+        // ==================== 9. 底部參數更改同步槽 ====================
+
+        private void CboObsN_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_isInitialized) return;
+            if (cboObsN.SelectedItem is ComboBoxItem item && int.TryParse(item.Content.ToString(), out int val))
+            {
+                _currentObsN = val;
+                _analysisEvent.Set();
+
+                // 離線模式下（無即時行情、無復盤）直接重繪，因為 _analysisEvent 沒有 Tick 驅動
+                ReplotOfflineData();
+            }
+        }
+
+        private void CboKlineInterval_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_isInitialized) return;
+            if (cboKlineInterval.SelectedItem is ComboBoxItem item && int.TryParse(item.Content.ToString(), out int val))
+            {
+                _currentKlineInterval = val;
+                klineChart.plot_widget.getViewBox().enableAutoRange(); // K棒間隔變更強制 autoRange 重對焦
+                _analysisEvent.Set();
+
+                // 離線模式下直接重繪
+                ReplotOfflineData();
+            }
+        }
+
+        private void CboBacktestDays_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            if (!_isInitialized) return;
+            // 動態調整天數後重新進行回測
+            if (cboBacktestDays?.SelectedItem is ComboBoxItem item)
+            {
+                string text = item.Content.ToString() ?? "60";
+                _currentTargetDays = text == "全部" ? 0 : int.Parse(text);
+                
+                klineChart?.plot_widget?.getViewBox()?.enableAutoRange();
+                _analysisEvent.Set();
+            }
+        }
+
+        private void CboReplaySpeed_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            // 即時反應速度變更，不需要重啟
+        }
+
+        private void TxtMaxSpeed_LostFocus(object sender, RoutedEventArgs e)
+        {
+            if (!double.TryParse(txtMaxSpeed.Text, out _))
+            {
+                txtMaxSpeed.Text = "100";
+            }
+        }
+
+        private void CboObsHigh_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (!_isInitialized) return;
+            if (int.TryParse(cboObsHigh.Text, out int val))
+            {
+                _engine._obs_high_price = val;
+                lblObsStatus.Text = $"觀察: 最高觀察 {val}";
+            }
+        }
+
+        private void CboObsLow_TextChanged(object sender, TextChangedEventArgs e)
+        {
+            if (!_isInitialized) return;
+            if (int.TryParse(cboObsLow.Text, out int val))
+            {
+                _engine._obs_low_price = val;
+                lblObsStatus.Text = $"觀察: 最低觀察 {val}";
+            }
+        }
+
+        private void TxtObsHigh_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter && int.TryParse(txtObsHigh.Text, out int val))
+            {
+                _engine._obs_high_entry_price = val;
+                AppendLog($"【觀察】觀察 K 低手動設定為: {val}");
+            }
+        }
+
+        private void TxtObsLow_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter && int.TryParse(txtObsLow.Text, out int val))
+            {
+                _engine._obs_low_entry_price = val;
+                AppendLog($"【觀察】觀察 K 高手動設定為: {val}");
+            }
+        }
+
+        private void BtnUpdate_Click(object sender, RoutedEventArgs e)
+        {
+            TriggerReanalyze();
+        }
+
+        private void BtnRealtime_Click(object sender, RoutedEventArgs e)
+        {
+            ToggleRealtime();
+        }
+
+        private void BtnFill_Click(object sender, RoutedEventArgs e)
+        {
+            // 空實作
+        }
+
+        private void TriggerReanalyze()
+        {
+            lblStatus.Content = "處理中，請稍候...";
+            btnUpdate.IsEnabled = false;
+            klineChart.plot_widget.getViewBox().enableAutoRange();
+
+            string todayStr = DateTime.Now.ToString("yyyyMMdd");
+            string todayLog = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Logs", todayStr, "event.log");
+
+            if (File.Exists(todayLog))
+            {
+                Task.Run(() =>
+                {
+                    var filePaths = new[] { (todayLog, (Func<double, bool>)(t => true)) };
+                    var (success, result, status) = RunAnalysisSync(filePaths, "MXF", _currentTargetDays, ignoreTimeCheck: true);
+
+                    Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        btnUpdate.IsEnabled = true;
+                        if (success && result is Dictionary<string, string> reports)
+                        {
+                            OnAnalysisCompletedSuccess(reports);
+                        }
+                        else
+                        {
+                            lblStatus.Content = "今天無相關日誌可分析";
+                        }
+                    }));
+                });
+            }
+            else
+            {
+                lblStatus.Content = "今天無相關日誌可分析";
+                btnUpdate.IsEnabled = true;
+            }
+        }
+
+        // ==================== 10. 輔助公用方法 ====================
+
+        public int GetObsN() => _currentObsN;
+
+        public List<string> GetKlineIntervals()
+        {
+            var intervals = new List<string>();
+            foreach (ComboBoxItem item in cboKlineInterval.Items)
+            {
+                intervals.Add(item.Content.ToString() ?? "30");
+            }
+            return intervals;
+        }
+
+        public List<(string SessionName, List<TradeTick> Trades, List<SimulationResult> TxfSigs, List<SimulationResult> MxfSigs)> GatherSessionDataSnapshot()
+        {
+            var list = new List<(string SessionName, List<TradeTick> Trades, List<SimulationResult> TxfSigs, List<SimulationResult> MxfSigs)>();
+            
+            if (_isReplaying)
+            {
+                string session = _currentReplaySession;
+                List<TradeTick> trades;
+                lock (_rtLock)
+                {
+                    trades = [.. _replaySymbolTrades["MXF"][session]];
+                }
+                var txfSigs = GetSimResultsFromSnapshot("TXF", session);
+                var mxfSigs = GetSimResultsFromSnapshot("MXF", session);
+                list.Add((session, trades, txfSigs, mxfSigs));
+            }
+            else if (_yuantaQuote != null)
+            {
+                string session = _currentRealtimePort == 442 ? "夜盤" : "日盤";
+                List<TradeTick> trades;
+                lock (_rtLock)
+                {
+                    trades = [.. _liveSymbolTrades["MXF"][session]];
+                }
+                var txfSigs = GetSimResultsFromSnapshot("TXF", session);
+                var mxfSigs = GetSimResultsFromSnapshot("MXF", session);
+                list.Add((session, trades, txfSigs, mxfSigs));
+            }
+            else if (App.Current.Resources.Contains("_temp_offline_trades"))
+            {
+                var dict = (Dictionary<string, List<TradeTick>>)App.Current.Resources["_temp_offline_trades"];
+                foreach (var session in new[] { "日盤", "夜盤" })
+                {
+                    string key = $"MXF ({session})";
+                    if (dict.TryGetValue(key, out var trades))
+                    {
+                        var txfSigs = GetSimResultsFromSnapshot("TXF", session);
+                        var mxfSigs = GetSimResultsFromSnapshot("MXF", session);
+                        list.Add((session, trades, txfSigs, mxfSigs));
+                    }
+                }
+            }
+
+            return list;
+        }
+
+        private void RefreshObserverComboboxes()
+        {
+            var sessionData = GatherSessionDataSnapshot();
+            if (sessionData == null || sessionData.Count == 0) return;
+
+            var highZonePrices = new HashSet<int>();
+            var lowZonePrices = new HashSet<int>();
+
+            foreach (var (sessionName, trades, txfSigs, mxfSigs) in sessionData)
+            {
+                var groups = new[] { ("TXF", txfSigs), ("MXF", mxfSigs) };
+                foreach (var (sym, sigs) in groups)
+                {
+                    var qParams = _engine.LoadQuantParams(sym, _currentTargetDays);
+                    foreach (var d in sigs)
+                    {
+                        if (d.Post == "N/A") continue;
+
+                        string speedInfo = d.Tags.FirstOrDefault() ?? "";
+                        bool isUnmet = d.DisplayTitle.Contains(" [未達標]");
+                        bool isContradiction = false;
+
+                        if (isUnmet)
+                        {
+                            if (d.DisplayTitle.Contains("最高") && (speedInfo.Contains("空速增") || speedInfo.Contains("多速減")))
+                                isContradiction = true;
+                            else if (d.DisplayTitle.Contains("最低") && (speedInfo.Contains("多速增") || speedInfo.Contains("空速減")))
+                                isContradiction = true;
+                        }
+
+                        bool isNormal = d.DisplayTitle.Contains("[達標]") && !d.DisplayTitle.Contains('未') && !d.DisplayTitle.Contains("邊界");
+
+                        if (!(isNormal || isContradiction)) continue;
+
+                        string currentType = d.DisplayTitle.Contains("最高") ? "最高" : "最低";
+                        string side = currentType == "最高" ? "top" : "bottom";
+
+                        try
+                        {
+                            var tDict = (Dictionary<string, (int p50, int p75, int p90)>)qParams[side == "top" ? "time_top" : "time_bottom"];
+                            string bTimeClean = d.BestATime.Replace(":", "");
+                            int hmVal = bTimeClean.Length >= 4 ? int.Parse(bTimeClean[..4]) : 0;
+                            int h = hmVal / 100, m = hmVal % 100;
+                            int totalM = h * 60 + m;
+                            if (sessionName == "夜盤" && totalM < 900) totalM += 1440;
+
+                            int? p50 = null, p75 = null;
+                            foreach (var kvp in tDict)
+                            {
+                                if (kvp.Key.Contains(sessionName))
+                                {
+                                    string timePart = kvp.Key.Split(' ')[1].Trim();
+                                    if (timePart.Contains('-'))
+                                    {
+                                        var sStr = timePart.Split('-')[0];
+                                        var eStr = timePart.Split('-')[1];
+                                        int sMins = int.Parse(sStr.Split(':')[0]) * 60 + int.Parse(sStr.Split(':')[1]);
+                                        int eMins = int.Parse(eStr.Split(':')[0]) * 60 + int.Parse(eStr.Split(':')[1]);
+                                        if (sessionName == "夜盤")
+                                        {
+                                            if (sMins < 900) sMins += 1440;
+                                            if (eMins < 900) eMins += 1440;
+                                        }
+                                        if (sMins <= totalM && totalM <= eMins)
+                                        {
+                                            p50 = kvp.Value.p50;
+                                            p75 = kvp.Value.p75;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (p50.HasValue && p75.HasValue)
+                            {
+                                int priceVal = d.BestAPrice;
+                                if (side == "top")
+                                {
+                                    highZonePrices.Add(priceVal + p50.Value);
+                                    highZonePrices.Add(priceVal + p75.Value);
+                                }
+                                else
+                                {
+                                    lowZonePrices.Add(priceVal - p50.Value);
+                                    lowZonePrices.Add(priceVal - p75.Value);
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+
+            var sortedHigh = highZonePrices.ToList();
+            sortedHigh.Sort();
+
+            var sortedLow = lowZonePrices.ToList();
+            sortedLow.Sort();
+            sortedLow.Reverse();
+
+            // 更新 ComboBox
+            string currHigh = cboObsHigh.Text;
+            string currLow = cboObsLow.Text;
+
+            cboObsHigh.Items.Clear();
+            foreach (var p in sortedHigh) cboObsHigh.Items.Add(p.ToString());
+
+            cboObsLow.Items.Clear();
+            foreach (var p in sortedLow) cboObsLow.Items.Add(p.ToString());
+
+            if (string.IsNullOrEmpty(currHigh) && sortedHigh.Count > 0)
+            {
+                cboObsHigh.Text = sortedHigh[0].ToString();
+                _engine._obs_high_price = sortedHigh[0];
+            }
+            else cboObsHigh.Text = currHigh;
+
+            if (string.IsNullOrEmpty(currLow) && sortedLow.Count > 0)
+            {
+                cboObsLow.Text = sortedLow[0].ToString();
+                _engine._obs_low_price = sortedLow[0];
+            }
+            else cboObsLow.Text = currLow;
+        }
+
+        private static void SetWidgetStyleLazy(TextBlock widget, string colorHex)
+        {
+            try
+            {
+                var brush = new SolidColorBrush((Color)ColorConverter.ConvertFromString(colorHex));
+                brush.Freeze();
+                widget.Foreground = brush;
+            }
+            catch { }
+        }
+
+        private void AppendLog(string text, bool clear = false)
+        {
+            LogHighlighter.AppendLog(txtOutput, text, clear);
+        }
+
+        private static CheckSessionPortResult CheckSessionPort()
+        {
+            DateTime now = DateTime.UtcNow.AddHours(8); // 台北時間
+            int timeVal = now.Hour * 3600 + now.Minute * 60 + now.Second;
+            int weekday = (int)now.DayOfWeek; // Sunday=0, Monday=1, ... Saturday=6
+
+            // 週一至週五 08:30 ~ 13:45 為日盤 (1 <= weekday <= 5)
+            bool isDay = (1 <= weekday && weekday <= 5) && (timeVal >= 8 * 3600 + 30 * 60 && timeVal <= 13 * 3600 + 45 * 60);
+            
+            // 週一至週五 14:50 之後，或者週二至週六 05:00 之前為夜盤
+            bool isNight1 = (1 <= weekday && weekday <= 5) && (timeVal >= 14 * 3600 + 50 * 60);
+            bool isNight2 = (2 <= weekday && weekday <= 6) && (timeVal <= 5 * 3600);
+
+            if (isDay) return new CheckSessionPortResult(443, "日盤");
+            if (isNight1 || isNight2) return new CheckSessionPortResult(442, "夜盤");
+
+            return new CheckSessionPortResult(443, "非交易時間 (預設用 443 待命)");
+        }
+
+        private readonly struct CheckSessionPortResult(int port, string session)
+        {
+            public int Port { get; } = port;
+            public string Session { get; } = session;
+            public void Deconstruct(out int port, out string session) { port = Port; session = Session; }
+        }
+    }
+
+    /// <summary>
+    /// DispatcherTimer 輔助擴充方法，簡化 Timer 撰寫。
+    /// </summary>
+    public static class DispatcherTimerExtensions
+    {
+        public static void RunOnce(Action action, TimeSpan delay)
+        {
+            var timer = new DispatcherTimer(DispatcherPriority.Normal)
+            {
+                Interval = delay
+            };
+            timer.Tick += (s, e) =>
+            {
+                timer.Stop();
+                action();
+            };
+            timer.Start();
+        }
+    }
+}
