@@ -1,0 +1,10 @@
+
+# C# projects
+bin/
+obj/
+*.log
+reports/
+Logs/
+scratch/
+config.json
+code.json
