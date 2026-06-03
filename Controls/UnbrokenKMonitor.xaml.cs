@@ -31,6 +31,7 @@ namespace ExtremeSignalAppCS.Controls
 
         // 快取當前未破停損價格 (Key: (Type[high/low], PriceStr) -> Value: 分K分鐘數集合)
         private Dictionary<(string Type, string Price), HashSet<int>> _currentUnbrokenMap = new();
+        private Dictionary<(string Type, string Price), string> _currentUnbrokenTimeMap = new();
 
         public UnbrokenKMonitor()
         {
@@ -78,7 +79,6 @@ namespace ExtremeSignalAppCS.Controls
 
             if (sessionDataSnapshot == null || sessionDataSnapshot.Count == 0 || !sessionDataSnapshot.Any(x => x.Trades.Count > 0))
             {
-                lblStatus.Text = "無可用數據進行未破停損分析。";
                 _bgCheckInProgress = false;
                 return;
             }
@@ -89,6 +89,7 @@ namespace ExtremeSignalAppCS.Controls
                 try
                 {
                     var tempUnbrokenMap = new Dictionary<(string Type, string Price), HashSet<int>>();
+                    var tempTimeMap = new Dictionary<(string Type, string Price), string>();
 
                     foreach (var intervalStr in intervalsStr)
                     {
@@ -123,6 +124,7 @@ namespace ExtremeSignalAppCS.Controls
                                     if (type != null)
                                     {
                                         var key = (type, stopLossVal);
+                                        string timeStr = item.BestATimeDisplay;
                                         lock (_lock)
                                         {
                                             if (!tempUnbrokenMap.ContainsKey(key))
@@ -130,6 +132,11 @@ namespace ExtremeSignalAppCS.Controls
                                                 tempUnbrokenMap[key] = new HashSet<int>();
                                             }
                                             tempUnbrokenMap[key].Add(intMins);
+
+                                            if (!tempTimeMap.ContainsKey(key) || string.Compare(timeStr, tempTimeMap[key]) > 0)
+                                            {
+                                                tempTimeMap[key] = timeStr;
+                                            }
                                         }
                                     }
                                 }
@@ -156,15 +163,13 @@ namespace ExtremeSignalAppCS.Controls
                     Dispatcher.BeginInvoke(new Action(() =>
                     {
                         _currentUnbrokenMap = tempUnbrokenMap;
+                        _currentUnbrokenTimeMap = tempTimeMap;
                         UpdateUI(currentPrice);
                     }));
                 }
                 catch (Exception ex)
                 {
-                    Dispatcher.BeginInvoke(new Action(() =>
-                    {
-                        lblStatus.Text = $"分析背景出錯: {ex.Message}";
-                    }));
+                    // Ignore or log internally
                 }
                 finally
                 {
@@ -228,12 +233,12 @@ namespace ExtremeSignalAppCS.Controls
             }
 
             string nowStr = DateTime.Now.ToString("HH:mm:ss");
-            lblTitle.Text = $"🛡️ 未破分 K 停損監控 (價位: {(displayPrice > 0 ? displayPrice.ToString() : currentPrice)})";
+            lblTitle.Text = $"🛡️ 未破分 K 停損監控 | 目前時間：{nowStr} | 價位: {(displayPrice > 0 ? displayPrice.ToString() : currentPrice)}";
 
             txtDisplay.Document.Blocks.Clear();
 
-            var shortEntries = new List<(int count, string price, string intervalsStr)>();
-            var longEntries = new List<(int count, string price, string intervalsStr)>();
+            var shortEntries = new List<(int count, string price, string intervalsStr, string timeStr)>();
+            var longEntries = new List<(int count, string price, string intervalsStr, string timeStr)>();
 
             lock (_lock)
             {
@@ -243,14 +248,15 @@ namespace ExtremeSignalAppCS.Controls
                     var sortedIntervals = kvp.Value.ToList();
                     sortedIntervals.Sort();
                     string intervalsStr = string.Join("、", sortedIntervals);
+                    string timeStr = _currentUnbrokenTimeMap.TryGetValue(kvp.Key, out var t) ? t : "";
 
                     if (sigType == "low")
                     {
-                        shortEntries.Add((kvp.Value.Count, priceVal, intervalsStr));
+                        shortEntries.Add((kvp.Value.Count, priceVal, intervalsStr, timeStr));
                     }
                     else if (sigType == "high")
                     {
-                        longEntries.Add((kvp.Value.Count, priceVal, intervalsStr));
+                        longEntries.Add((kvp.Value.Count, priceVal, intervalsStr, timeStr));
                     }
                 }
             }
@@ -283,7 +289,7 @@ namespace ExtremeSignalAppCS.Controls
 
                 foreach (var item in shortEntries)
                 {
-                    pHeader.Inlines.Add(new Run($"  停損價: {item.price}  未破: {item.intervalsStr} 分K\n"));
+                    pHeader.Inlines.Add(new Run($"  停損價: {item.price}  未破: {item.intervalsStr} 分K  ({item.timeStr})\n"));
                 }
                 txtDisplay.Document.Blocks.Add(pHeader);
             }
@@ -304,7 +310,7 @@ namespace ExtremeSignalAppCS.Controls
 
                 foreach (var item in longEntries)
                 {
-                    pHeader.Inlines.Add(new Run($"  停損價: {item.price}  未破: {item.intervalsStr} 分K\n"));
+                    pHeader.Inlines.Add(new Run($"  停損價: {item.price}  未破: {item.intervalsStr} 分K  ({item.timeStr})\n"));
                 }
                 txtDisplay.Document.Blocks.Add(pHeader);
             }
@@ -313,8 +319,6 @@ namespace ExtremeSignalAppCS.Controls
             {
                 txtDisplay.Document.Blocks.Add(new Paragraph(new Run("所有分 K 的停損價均已顯示「已破」或目前無觀察訊號。") { Foreground = Brushes.Gray }));
             }
-
-            lblStatus.Text = $"最後更新: {nowStr} | 雙軌毫秒級 Tick 即時監控";
 
             // 2. 還原滾動條位置
             txtDisplay.ScrollToVerticalOffset(vOffset);
@@ -334,7 +338,6 @@ namespace ExtremeSignalAppCS.Controls
             }
             txtDisplay.Document.Blocks.Clear();
             lblTitle.Text = "🛡️ 未破分 K 停損監控";
-            lblStatus.Text = "";
         }
 
         /// <summary>
@@ -351,7 +354,6 @@ namespace ExtremeSignalAppCS.Controls
             _lastTriggerTime = 0;
             txtDisplay.Document.Blocks.Clear();
             lblTitle.Text = "🛡️ 未破分 K 停損監控";
-            lblStatus.Text = "";
         }
     }
 }

@@ -19,12 +19,35 @@ namespace ExtremeSignalAppCS.Helper
         private static readonly SolidColorBrush SystemBrush = new(Color.FromRgb(0, 162, 237));  // 亮青
         private static readonly SolidColorBrush DefaultBrush = new(Color.FromRgb(220, 220, 220)); // 灰白
 
+        private static ScrollViewer? GetScrollViewer(System.Windows.DependencyObject depObj)
+        {
+            if (depObj is ScrollViewer sv) return sv;
+            for (int i = 0; i < System.Windows.Media.VisualTreeHelper.GetChildrenCount(depObj); i++)
+            {
+                var child = System.Windows.Media.VisualTreeHelper.GetChild(depObj, i);
+                var result = GetScrollViewer(child);
+                if (result != null) return result;
+            }
+            return null;
+        }
+
         /// <summary>
         /// 執行緒安全地向 RichTextBox 增量添加一行已被著色的日誌。
         /// </summary>
-        public static void AppendLog(System.Windows.Controls.RichTextBox rtb, string text, bool clear = false)
+        public static void AppendLog(System.Windows.Controls.RichTextBox rtb, string text, bool clear = false, bool forceScrollToEnd = false)
         {
             if (rtb == null) return;
+
+            var scrollViewer = GetScrollViewer(rtb);
+            bool isAtBottom = true;
+            double currentOffset = 0;
+
+            if (scrollViewer != null)
+            {
+                // 判斷目前是否在最底部 (容許 5px 誤差)
+                isAtBottom = scrollViewer.VerticalOffset >= (scrollViewer.ScrollableHeight - 5.0);
+                currentOffset = scrollViewer.VerticalOffset;
+            }
 
             var document = rtb.Document;
 
@@ -49,42 +72,71 @@ namespace ExtremeSignalAppCS.Helper
             string cleanText = text.TrimEnd('\r', '\n');
             if (string.IsNullOrEmpty(cleanText)) return;
 
-            // 建立新的段落 (Paragraph)
-            var p = new Paragraph { Margin = new System.Windows.Thickness(0, 2, 0, 2) };
-            var run = new Run(cleanText);
+            string[] lines = cleanText.Replace("\r", "").Split('\n');
 
-            // 💡 100% 遵守規則：若包含 "未達標" 則保持白/預設色，不染任何色
-            if (cleanText.Contains("未達標"))
+            foreach (var line in lines)
             {
-                run.Foreground = DefaultBrush;
-            }
-            else if (cleanText.Contains("最高") || cleanText.Contains("K低"))
-            {
-                run.Foreground = DownBrush; // Python 做空/綠色高亮 (買賣相反：最高/K低為做空->綠)
-                run.FontWeight = System.Windows.FontWeights.Bold;
-            }
-            else if (cleanText.Contains("最低") || cleanText.Contains("K高"))
-            {
-                run.Foreground = UpBrush;   // Python 做多/紅色高亮 (最低/K高為做多->紅)
-                run.FontWeight = System.Windows.FontWeights.Bold;
-            }
-            else if (cleanText.Contains("共識推播") || cleanText.Contains("觸發推播") || 
-                     cleanText.Contains("行情狀態") || cleanText.Contains("預載") ||
-                     cleanText.Contains("系統"))
-            {
-                run.Foreground = SystemBrush; // 青色高亮
-                run.FontWeight = System.Windows.FontWeights.Bold;
-            }
-            else
-            {
-                run.Foreground = DefaultBrush;
+                var p = new Paragraph { Margin = new System.Windows.Thickness(0, 2, 0, 2) };
+                
+                // 如果是空行，只要加入空字串即可
+                if (string.IsNullOrEmpty(line))
+                {
+                    p.Inlines.Add(new Run(""));
+                    document.Blocks.Add(p);
+                    continue;
+                }
+
+                var run = new Run(line);
+
+                // 💡 100% 遵守規則：若包含 "未達標" 則保持白/預設色，不染任何色
+                if (line.Contains("未達標"))
+                {
+                    run.Foreground = DefaultBrush;
+                }
+                else if (line.Contains("最高") || line.Contains("K低"))
+                {
+                    run.Foreground = DownBrush; // Python 做空/綠色高亮 (買賣相反：最高/K低為做空->綠)
+                    run.FontWeight = System.Windows.FontWeights.Bold;
+                }
+                else if (line.Contains("最低") || line.Contains("K高"))
+                {
+                    run.Foreground = UpBrush;   // Python 做多/紅色高亮 (最低/K高為做多->紅)
+                    run.FontWeight = System.Windows.FontWeights.Bold;
+                }
+                else if (line.Contains("共識推播") || line.Contains("觸發推播") || 
+                         line.Contains("行情狀態") || line.Contains("預載") ||
+                         line.Contains("系統"))
+                {
+                    run.Foreground = SystemBrush; // 青色高亮
+                    run.FontWeight = System.Windows.FontWeights.Bold;
+                }
+                else
+                {
+                    run.Foreground = DefaultBrush;
+                }
+
+                p.Inlines.Add(run);
+                document.Blocks.Add(p);
             }
 
-            p.Inlines.Add(run);
-            document.Blocks.Add(p);
-
-            // 自動滾動到底部
-            rtb.ScrollToEnd();
+            // 智慧捲動：只有在原本已經在最底部時，或強制指定時，才跟著往下捲動
+            // 💡 必須使用 DispatcherPriority.Loaded 確保 WPF 已經重新計算好 ScrollableHeight
+            if (isAtBottom || forceScrollToEnd)
+            {
+                rtb.Dispatcher.InvokeAsync(() =>
+                {
+                    rtb.ScrollToEnd();
+                    rtb.CaretPosition = rtb.Document.ContentEnd;
+                }, System.Windows.Threading.DispatcherPriority.Loaded);
+            }
+            else if (scrollViewer != null)
+            {
+                // 若使用者正在往上捲動查看歷史，則保持原本的捲動位置
+                rtb.Dispatcher.InvokeAsync(() =>
+                {
+                    scrollViewer.ScrollToVerticalOffset(currentOffset);
+                }, System.Windows.Threading.DispatcherPriority.Loaded);
+            }
         }
     }
 }

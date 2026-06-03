@@ -11,8 +11,6 @@
             <RowDefinition Height="Auto"/>
             <!-- 1: 監控顯示區 -->
             <RowDefinition Height="*"/>
-            <!-- 2: 狀態欄 -->
-            <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
         <!-- 標題 -->
@@ -25,9 +23,5 @@
                      FontFamily="Consolas" FontSize="13" BorderThickness="0" Margin="4"
                      VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"/>
 
-        <!-- 狀態欄 -->
-        <Border Grid.Row="2" BorderBrush="{StaticResource WidgetBorderBrush}" BorderThickness="0,1,0,0" Padding="6,4">
-            <TextBlock x:Name="lblStatus" Text="雙軌毫秒級 Tick 即時監控中..." Foreground="{StaticResource TextMuted}" FontSize="11"/>
-        </Border>
     </Grid>
 </UserControl>

@@ -32,6 +32,18 @@ namespace ExtremeSignalAppCS.Models
         /// </summary>
         public string TrigTime { get; set; } = "N/A";
 
+        public string BestATimeDisplay => FormatTimeStr(BestATime);
+        public string TrigTimeDisplay => FormatTimeStr(TrigTime);
+
+        private string FormatTimeStr(string raw)
+        {
+            if (string.IsNullOrEmpty(raw) || raw == "N/A" || raw.Contains(":")) return raw;
+            string padded = raw.PadLeft(12, '0');
+            if (padded.Length >= 6)
+                return $"{padded.Substring(0, 2)}:{padded.Substring(2, 2)}:{padded.Substring(4, 2)}";
+            return raw;
+        }
+
         /// <summary>
         /// B 點訊號確立觸發價位 (即進場價)
         /// </summary>
@@ -128,9 +140,9 @@ namespace ExtremeSignalAppCS.Models
             return new string[]
             {
                 DisplayTitle,
-                BestATime,
+                BestATimeDisplay,
                 BestAPrice.ToString(),
-                TrigTime,
+                TrigTimeDisplay,
                 TrigPrice,
                 Pre,
                 Post,

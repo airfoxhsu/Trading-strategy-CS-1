@@ -34,11 +34,17 @@ namespace ExtremeSignalAppCS.Controls
 
         // 畫筆與畫刷快取 (優化記憶體分配)
         private readonly Pen _upPen = new(new SolidColorBrush(Color.FromRgb(235, 75, 75)), 1.5);
-        private readonly Brush _upBrush = new SolidColorBrush(Color.FromArgb(120, 235, 75, 75));
+        private readonly Brush _upBrush = new SolidColorBrush(Color.FromRgb(235, 75, 75));
         private readonly Pen _downPen = new(new SolidColorBrush(Color.FromRgb(40, 167, 69)), 1.5);
-        private readonly Brush _downBrush = new SolidColorBrush(Color.FromArgb(120, 40, 167, 69));
+        private readonly Brush _downBrush = new SolidColorBrush(Color.FromRgb(40, 167, 69));
         private readonly Pen _flatPen = new(new SolidColorBrush(Color.FromRgb(200, 200, 200)), 1.5);
         private readonly Pen _gridPen = new(new SolidColorBrush(Color.FromArgb(35, 255, 255, 255)), 0.8);
+
+        // 文字繪製快取
+        private readonly Typeface _typeface = new Typeface(new FontFamily("Consolas, Microsoft JhengHei"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+        private readonly Brush _textBrush = new SolidColorBrush(Color.FromArgb(200, 220, 220, 220));
+        private readonly Brush _highTextBrush = new SolidColorBrush(Color.FromRgb(235, 75, 75));
+        private readonly Brush _lowTextBrush = new SolidColorBrush(Color.FromRgb(40, 167, 69));
 
         public KLinePainter()
         {
@@ -49,6 +55,9 @@ namespace ExtremeSignalAppCS.Controls
             _downBrush.Freeze();
             _flatPen.Freeze();
             _gridPen.Freeze();
+            _textBrush.Freeze();
+            _highTextBrush.Freeze();
+            _lowTextBrush.Freeze();
         }
 
         public void SetData(List<KlineBar> candles, double minX, double maxX, double minY, double maxY)
@@ -137,10 +146,14 @@ namespace ExtremeSignalAppCS.Controls
             drawingContext.PushClip(new RectangleGeometry(new Rect(0, 0, w, h)));
             try
             {
-                // 1. 繪製背景暗黑网格線 (10% 透明度)
+                // 1. 繪製背景暗黑网格線 (10% 透明度) 與左側 Y 軸刻度
                 DrawGridLines(drawingContext, w, h);
 
-                // 2. 檢測歷史 K 棒數量是否改變，若新分 K 收盤則重建 GPU 預繪快取
+                // 為 K 線繪製建立第二層剪裁，保護左側 Y 軸刻度不被 K 棒疊加
+                drawingContext.PushClip(new RectangleGeometry(new Rect(LeftMargin, 0, Math.Max(1.0, w - LeftMargin), h)));
+                try
+                {
+                    // 2. 檢測歷史 K 棒數量是否改變，若新分 K 收盤則重建 GPU 預繪快取
                 int historyCount = Math.Max(0, _candles.Count - 1);
                 if (historyCount != _cachedHistoryCount || _historyDrawingCache == null)
                 {
@@ -183,6 +196,14 @@ namespace ExtremeSignalAppCS.Controls
                 double lrectH = Math.Abs(lcloseY - lopenY);
                 if (lrectH < 1.0) lrectH = 1.0;
                 drawingContext.DrawRectangle(lbrush, lpen, new Rect(lx - barW / 2, Math.Min(lopenY, lcloseY), barW, lrectH));
+
+                // 5. 動態繪製可見範圍內的最高與最低價標示
+                DrawVisibleHighLow(drawingContext, w, h);
+                }
+                finally
+                {
+                    drawingContext.Pop(); // 釋放 K 線專屬剪裁
+                }
             }
             finally
             {
@@ -200,21 +221,108 @@ namespace ExtremeSignalAppCS.Controls
                 dc.DrawLine(_gridPen, new Point(gx, 0), new Point(gx, h));
             }
 
-            // 繪製 Y 軸格線
+            // 繪製 Y 軸格線與左側價位文字
             int gridRows = 6;
+            double pixelsPerDip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
             for (int i = 1; i < gridRows; i++)
             {
                 double gy = (h / gridRows) * i;
                 dc.DrawLine(_gridPen, new Point(0, gy), new Point(w, gy));
+
+                // 根據 Y 座標反推價格
+                double rangeY = _maxY - _minY;
+                double price = _maxY - (gy / h) * rangeY;
+
+                var formattedText = new FormattedText(
+                    price.ToString("F0"),
+                    CultureInfo.GetCultureInfo("en-us"),
+                    System.Windows.FlowDirection.LeftToRight,
+                    _typeface,
+                    11,
+                    _textBrush,
+                    pixelsPerDip);
+
+                dc.DrawText(formattedText, new Point(5, gy - formattedText.Height - 2));
             }
         }
 
-        // 坐標對應映射方法 (與 PyQtGraph 映射概念等價)
+        private void DrawVisibleHighLow(DrawingContext dc, double w, double h)
+        {
+            if (_candles == null || _candles.Count == 0) return;
+
+            int startIdx = (int)Math.Max(0, _minX);
+            int endIdx = (int)Math.Min(_candles.Count - 1, _maxX);
+            if (startIdx > endIdx) return;
+
+            double highest = -999999;
+            double lowest = 999999;
+            int highIdx = -1;
+            int lowIdx = -1;
+
+            for (int i = startIdx; i <= endIdx; i++)
+            {
+                if (_candles[i].High > highest)
+                {
+                    highest = _candles[i].High;
+                    highIdx = i;
+                }
+                if (_candles[i].Low < lowest)
+                {
+                    lowest = _candles[i].Low;
+                    lowIdx = i;
+                }
+            }
+
+            double pixelsPerDip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+
+            if (highIdx != -1)
+            {
+                double hx = GetCanvasX(highIdx, w);
+                double hy = GetCanvasY(highest, h);
+                var text = new FormattedText(
+                    "← " + highest.ToString("F0"),
+                    CultureInfo.GetCultureInfo("en-us"),
+                    System.Windows.FlowDirection.LeftToRight,
+                    _typeface,
+                    12,
+                    _highTextBrush,
+                    pixelsPerDip);
+                
+                // 如果文字會超出右邊界，則改畫在左邊
+                if (hx + 5 + text.Width > w)
+                    dc.DrawText(text, new Point(hx - text.Width - 5, hy - text.Height / 2));
+                else
+                    dc.DrawText(text, new Point(hx + 5, hy - text.Height / 2));
+            }
+
+            if (lowIdx != -1)
+            {
+                double lx = GetCanvasX(lowIdx, w);
+                double ly = GetCanvasY(lowest, h);
+                var text = new FormattedText(
+                    "← " + lowest.ToString("F0"),
+                    CultureInfo.GetCultureInfo("en-us"),
+                    System.Windows.FlowDirection.LeftToRight,
+                    _typeface,
+                    12,
+                    _lowTextBrush,
+                    pixelsPerDip);
+
+                if (lx + 5 + text.Width > w)
+                    dc.DrawText(text, new Point(lx - text.Width - 5, ly - text.Height / 2));
+                else
+                    dc.DrawText(text, new Point(lx + 5, ly - text.Height / 2));
+            }
+        }
+
+        public const double LeftMargin = 55.0;
+
         public double GetCanvasX(double index, double width)
         {
             double rangeX = _maxX - _minX;
             if (rangeX <= 0) rangeX = 1.0;
-            return ((index - _minX) / rangeX) * width;
+            double drawWidth = Math.Max(1.0, width - LeftMargin);
+            return LeftMargin + ((index - _minX) / rangeX) * drawWidth;
         }
 
         public double GetCanvasY(double price, double height)
@@ -253,10 +361,13 @@ namespace ExtremeSignalAppCS.Controls
         // 智慧操作鎖：偵測使用者是否手動 zoom/pan 過，防止行情跳動時強制 autoRange 重對焦
         private bool _isZoomedOrPanned;
         
-        // 拖曳狀態
         private bool _isDragging;
         private Point _dragStartPoint;
         private double _dragStartMinX, _dragStartMaxX;
+
+        // 狀態快取，防止 UpdateCandles 時強制蓋掉十字游標所指的 K 棒
+        private bool _isMouseInChart;
+        private int _lastHoverIndex = -1;
 
         public KLineChartControl()
         {
@@ -277,7 +388,7 @@ namespace ExtremeSignalAppCS.Controls
             {
                 Foreground = new SolidColorBrush(Color.FromRgb(220, 220, 220)),
                 FontFamily = new FontFamily("Consolas, Microsoft JhengHei"),
-                FontSize = 11,
+                FontSize = 14,
                 LineHeight = 16,
                 TextWrapping = TextWrapping.Wrap
             };
@@ -289,14 +400,69 @@ namespace ExtremeSignalAppCS.Controls
                 BorderThickness = new Thickness(2),
                 CornerRadius = new CornerRadius(5),
                 Padding = new Thickness(6),
-                Width = 160,
-                Height = 120,
+                Width = 145,
+                Height = 105,
                 HorizontalAlignment = System.Windows.HorizontalAlignment.Right,
                 VerticalAlignment = System.Windows.VerticalAlignment.Top,
                 Margin = new Thickness(0, 10, 10, 0),
                 Child = _infoText,
-                Visibility = Visibility.Collapsed
+                Visibility = Visibility.Collapsed,
+                Cursor = System.Windows.Input.Cursors.SizeAll // 提示可拖曳
             };
+
+            var infoTransform = new TranslateTransform();
+            _infoPanel.RenderTransform = infoTransform;
+
+            bool isDraggingInfo = false;
+            Point infoDragStartMouse = new Point();
+            double infoDragStartX = 0;
+            double infoDragStartY = 0;
+
+            _infoPanel.MouseLeftButtonDown += (s, e) =>
+            {
+                isDraggingInfo = true;
+                infoDragStartMouse = e.GetPosition(this);
+                infoDragStartX = infoTransform.X;
+                infoDragStartY = infoTransform.Y;
+                _infoPanel.CaptureMouse();
+                e.Handled = true; // 防止觸發底層的圖表平移
+            };
+
+            _infoPanel.MouseMove += (s, e) =>
+            {
+                if (isDraggingInfo)
+                {
+                    Point currentMouse = e.GetPosition(this);
+                    double newX = infoDragStartX + (currentMouse.X - infoDragStartMouse.X);
+                    double newY = infoDragStartY + (currentMouse.Y - infoDragStartMouse.Y);
+
+                    double chartW = ActualWidth;
+                    double chartH = ActualHeight;
+                    double panelW = _infoPanel.ActualWidth > 0 ? _infoPanel.ActualWidth : 145;
+                    double panelH = _infoPanel.ActualHeight > 0 ? _infoPanel.ActualHeight : 105;
+
+                    // 限制只能在圖表範圍內移動，並且避開左側 Y 軸的刻度區 (LeftMargin)
+                    double minX = KLinePainter.LeftMargin + 20 - chartW + panelW;
+                    double maxX = 10;
+                    double minY = -10;
+                    double maxY = chartH - panelH - 10;
+
+                    infoTransform.X = Math.Max(minX, Math.Min(newX, maxX));
+                    infoTransform.Y = Math.Max(minY, Math.Min(newY, maxY));
+                    e.Handled = true;
+                }
+            };
+
+            _infoPanel.MouseLeftButtonUp += (s, e) =>
+            {
+                if (isDraggingInfo)
+                {
+                    isDraggingInfo = false;
+                    _infoPanel.ReleaseMouseCapture();
+                    e.Handled = true;
+                }
+            };
+
             Children.Add(_infoPanel);
 
             // 5. 註冊滑鼠事件 (Zoom 與 Pan)
@@ -333,12 +499,35 @@ namespace ExtremeSignalAppCS.Controls
             }
             else
             {
-                // 手動狀態下，僅重繪
+                // 動態調節功能：當手動縮放時，如果新 K 棒超過右邊界，則跟隨平移 (X 軸保持比例平移)
+                int lastIdx = _candles.Count - 1;
+                // 只有當原本的右邊界已經包含或是非常接近最新的 K 棒時，才進行自動跟隨平移
+                // 這樣如果使用者往左平移去查詢歷史，_maxX 會遠小於 lastIdx，就不會被強制拉回右邊。
+                if (_maxX >= lastIdx - 0.5)
+                {
+                    if (lastIdx >= _maxX - 1.0)
+                    {
+                        double shift = (lastIdx + 1.5) - _maxX;
+                        _minX += shift;
+                        _maxX += shift;
+                    }
+                }
+
+                // 動態調節功能：選項 A - 確保當前可見範圍內的 K 棒最高/最低價不會超出上下邊界 (Y 軸動態彈簧伸縮)
+                AutoRangeYForVisibleX();
+
                 _painter.SetData(_candles, _minX, _maxX, _minY, _maxY);
             }
 
-            // 右上角預設更新顯示最新的一根 K棒
-            ShowKlineInfo(_candles.Count - 1);
+            // 若滑鼠正停留在畫面上觀察，則保持顯示游標所指的 K 棒資訊，否則更新顯示最新的一根
+            if (_isMouseInChart && _lastHoverIndex >= 0 && _lastHoverIndex < _candles.Count)
+            {
+                ShowKlineInfo(_lastHoverIndex);
+            }
+            else
+            {
+                ShowKlineInfo(_candles.Count - 1);
+            }
         }
 
         /// <summary>
@@ -363,6 +552,18 @@ namespace ExtremeSignalAppCS.Controls
             _maxY = highest + height * 0.05;
 
             _painter.SetData(_candles, _minX, _maxX, _minY, _maxY);
+        }
+
+        /// <summary>
+        /// 解除手動鎖定並強制執行 AutoRange
+        /// </summary>
+        public void EnableAutoRange()
+        {
+            _isZoomedOrPanned = false;
+            if (_candles != null && _candles.Count > 0)
+            {
+                AutoRange();
+            }
         }
 
         /// <summary>
@@ -472,7 +673,7 @@ namespace ExtremeSignalAppCS.Controls
             if (_isDragging)
             {
                 double deltaX = mousePoint.X - _dragStartPoint.X;
-                double colW = w / (_dragStartMaxX - _dragStartMinX);
+                double colW = Math.Max(1.0, w - KLinePainter.LeftMargin) / (_dragStartMaxX - _dragStartMinX);
                 double indexShift = deltaX / colW;
 
                 _minX = _dragStartMinX - indexShift;
@@ -486,15 +687,26 @@ namespace ExtremeSignalAppCS.Controls
 
             // 2. 十字游標物理移動
             _crosshair.SetMousePos(mousePoint);
+            _isMouseInChart = true;
 
             // 3. 計算滑鼠所在的 K棒 index
             double rangeX = _maxX - _minX;
-            double relativeX = mousePoint.X / w;
-            int hoverIndex = (int)(relativeX * rangeX + _minX);
+            double drawWidth = Math.Max(1.0, w - KLinePainter.LeftMargin);
+            double relativeX = (mousePoint.X - KLinePainter.LeftMargin) / drawWidth;
+            double floatIndex = relativeX * rangeX + _minX;
 
-            if (hoverIndex >= 0 && hoverIndex < _candles.Count)
+            int nearestIndex = (int)Math.Round(floatIndex);
+            double distanceFromCenter = Math.Abs(floatIndex - nearestIndex);
+
+            // K 線實體寬度比例為 0.6 (即半徑 0.3)。當游標觸碰到 K 線實體邊緣時，才切換對焦的 K 棒。
+            if (distanceFromCenter <= 0.3)
             {
-                ShowKlineInfo(hoverIndex);
+                _lastHoverIndex = nearestIndex;
+            }
+
+            if (_lastHoverIndex >= 0 && _lastHoverIndex < _candles.Count)
+            {
+                ShowKlineInfo(_lastHoverIndex);
             }
             else
             {
@@ -504,6 +716,7 @@ namespace ExtremeSignalAppCS.Controls
 
         private void KLineChartControl_MouseLeave(object sender, MouseEventArgs e)
         {
+            _isMouseInChart = false;
             // 清空十字游標，資訊面板回歸最新一根 K棒
             _crosshair.SetMousePos(null);
             if (_candles != null && _candles.Count > 0)
@@ -521,9 +734,10 @@ namespace ExtremeSignalAppCS.Controls
             double mouseX = e.GetPosition(this).X;
             double w = ActualWidth;
             double rangeX = _maxX - _minX;
+            double drawWidth = Math.Max(1.0, w - KLinePainter.LeftMargin);
             
             // 找出滑鼠對焦在圖表上的 K 棒索引位置 (作為縮放中心點)
-            double mouseIndex = (mouseX / w) * rangeX + _minX;
+            double mouseIndex = ((mouseX - KLinePainter.LeftMargin) / drawWidth) * rangeX + _minX;
 
             // 縮放乘數
             double zoomFactor = e.Delta > 0 ? 0.85 : 1.15; // 滾輪往前放大，往後縮小
@@ -556,7 +770,7 @@ namespace ExtremeSignalAppCS.Controls
         }
 
         /// <summary>
-        /// 將圖表視界中心平移對焦到指定 K 線，並更新右上角面板。
+        /// 將圖表視界中心平移對焦到指定 K 線，並更新右上角面板與十字游標。
         /// </summary>
         public void FocusCandle(int index)
         {
@@ -571,6 +785,30 @@ namespace ExtremeSignalAppCS.Controls
             
             AutoRangeYForVisibleX();
             _painter.SetData(_candles, _minX, _maxX, _minY, _maxY);
+
+            // 同步十字游標到該 K 棒中心
+            double x = _painter.GetCanvasX(index, ActualWidth);
+            double y = _painter.GetCanvasY((_candles[index].Open + _candles[index].Close) / 2.0, ActualHeight);
+            _crosshair.SetMousePos(new Point(x, y));
+            _lastHoverIndex = index;
+            _isMouseInChart = true;
+        }
+
+        /// <summary>
+        /// 清除十字游標與重置資訊面板
+        /// </summary>
+        public void ClearCrosshair()
+        {
+            _crosshair.SetMousePos(null);
+            _isMouseInChart = false;
+            if (_candles != null && _candles.Count > 0)
+            {
+                ShowKlineInfo(_candles.Count - 1);
+            }
+            else
+            {
+                _infoPanel.Visibility = Visibility.Collapsed;
+            }
         }
 
         /// <summary>

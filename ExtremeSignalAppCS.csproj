@@ -23,4 +23,13 @@
     </None>
   </ItemGroup>
 
+  <ItemGroup>
+    <Reference Include="AxInterop.YuantaQuoteLib">
+      <HintPath>lib\AxInterop.YuantaQuoteLib.dll</HintPath>
+    </Reference>
+    <Reference Include="Interop.YuantaQuoteLib">
+      <HintPath>lib\Interop.YuantaQuoteLib.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
 </Project>
