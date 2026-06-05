@@ -54,6 +54,16 @@ namespace ExtremeSignalAppCS.Models
         public string Tag { get; set; } = "flat";
 
         /// <summary>
+        /// 是否為當前觀察的 K低 (綠底白字)
+        /// </summary>
+        public bool IsObsKLowHighlight { get; set; }
+
+        /// <summary>
+        /// 是否為當前觀察的 K高 (紅底白字)
+        /// </summary>
+        public bool IsObsKHighHighlight { get; set; }
+
+        /// <summary>
         /// 建立預設 K棒。
         /// </summary>
         public KlineBar() { }
@@ -79,7 +89,11 @@ namespace ExtremeSignalAppCS.Models
         /// </summary>
         public KlineBar Clone()
         {
-            return new KlineBar(TimeLabel, High, Low, Open, Close, Signals, BreakHigh, BreakLow, Tag);
+            return new KlineBar(TimeLabel, High, Low, Open, Close, Signals, BreakHigh, BreakLow, Tag)
+            {
+                IsObsKLowHighlight = this.IsObsKLowHighlight,
+                IsObsKHighHighlight = this.IsObsKHighHighlight
+            };
         }
     }
 }

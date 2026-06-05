@@ -766,7 +766,8 @@ namespace ExtremeSignalAppCS.Services
                 if (closeP > openP) tag = "up";
                 else if (closeP < openP) tag = "down";
 
-                klineData.Add(new KlineBar(timeLabel, highP, lowP, openP, closeP, signalsStr, breakHighText, breakLowText, tag));
+                var klineBar = new KlineBar(timeLabel, highP, lowP, openP, closeP, signalsStr, breakHighText, breakLowText, tag);
+                klineData.Add(klineBar);
             }
 
             return (klineData, breakouts);
@@ -1126,17 +1127,32 @@ namespace ExtremeSignalAppCS.Services
                 bool isBrokenChrono = false;
                 bool isBrokenGreedy = false;
 
+                string? breakTime = null;
                 if (lockedSL.HasValue)
                 {
                     if (sigType == "K低")
                     {
-                        isBrokenChrono = checkTradesChrono.Any(t => t.Price > lockedSL.Value);
-                        isBrokenGreedy = checkTradesGreedy.Any(t => t.Price > lockedSL.Value);
+                        int bkIdx = checkTradesChrono.FindIndex(t => t.Price > lockedSL.Value);
+                        if (bkIdx >= 0) isBrokenChrono = true;
+
+                        int bkgIdx = checkTradesGreedy.FindIndex(t => t.Price > lockedSL.Value);
+                        if (bkgIdx >= 0)
+                        {
+                            isBrokenGreedy = true;
+                            breakTime = checkTradesGreedy[bkgIdx].Time;
+                        }
                     }
                     else if (sigType == "K高")
                     {
-                        isBrokenChrono = checkTradesChrono.Any(t => t.Price < lockedSL.Value);
-                        isBrokenGreedy = checkTradesGreedy.Any(t => t.Price < lockedSL.Value);
+                        int bkIdx = checkTradesChrono.FindIndex(t => t.Price < lockedSL.Value);
+                        if (bkIdx >= 0) isBrokenChrono = true;
+
+                        int bkgIdx = checkTradesGreedy.FindIndex(t => t.Price < lockedSL.Value);
+                        if (bkgIdx >= 0)
+                        {
+                            isBrokenGreedy = true;
+                            breakTime = checkTradesGreedy[bkgIdx].Time;
+                        }
                     }
                 }
 
@@ -1168,7 +1184,8 @@ namespace ExtremeSignalAppCS.Services
                     BIndex = bIdx,
                     ObsN = raw.ObsN,
                     StopLossPrice = lockedSL ?? 0,
-                    IsBroken = isBrokenGreedy
+                    IsBroken = isBrokenGreedy,
+                    BreakTime = breakTime
                 };
 
                 results.Add(finalResult);

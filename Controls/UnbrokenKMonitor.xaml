@@ -10,7 +10,11 @@
             <!-- 0: 標題 -->
             <RowDefinition Height="Auto"/>
             <!-- 1: 監控顯示區 -->
-            <RowDefinition Height="*"/>
+            <RowDefinition Height="2*"/>
+            <!-- 2: 分隔線 -->
+            <RowDefinition Height="Auto"/>
+            <!-- 3: 趨勢方向表單 -->
+            <RowDefinition Height="1*"/>
         </Grid.RowDefinitions>
 
         <!-- 標題 -->
@@ -22,6 +26,14 @@
         <RichTextBox Grid.Row="1" x:Name="txtDisplay" IsReadOnly="True" Background="#1A1A1A" Foreground="#DCDCDC" 
                      FontFamily="Consolas" FontSize="13" BorderThickness="0" Margin="4"
                      VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"/>
+
+        <GridSplitter Grid.Row="2" Height="3" HorizontalAlignment="Stretch" Background="#333333" Margin="0,2"/>
+
+        <Border Grid.Row="3" Background="#1A1A1A" BorderBrush="{StaticResource WidgetBorderBrush}" BorderThickness="0,1,0,0" Padding="4">
+            <RichTextBox x:Name="txtTrendHistory" IsReadOnly="True" Background="Transparent" Foreground="#DCDCDC" 
+                         FontFamily="Consolas" FontSize="13" BorderThickness="0" Margin="0"
+                         VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"/>
+        </Border>
 
     </Grid>
 </UserControl>

@@ -118,6 +118,11 @@ namespace ExtremeSignalAppCS.Models
         public bool IsBroken { get; set; }
 
         /// <summary>
+        /// 停損被觸發的精確時間 (若未被破則為 null)
+        /// </summary>
+        public string? BreakTime { get; set; }
+
+        /// <summary>
         /// 原始防守停損價
         /// </summary>
         public int StopLossPrice { get; set; }

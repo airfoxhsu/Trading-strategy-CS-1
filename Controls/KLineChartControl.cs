@@ -24,7 +24,7 @@ namespace ExtremeSignalAppCS.Controls
     /// </summary>
     public class KLinePainter : FrameworkElement
     {
-        private List<KlineBar> _candles = new();
+        private List<KlineBar> _candles = [];
         private double _minX, _maxX; // 當前 X 軸索引可見範圍
         private double _minY, _maxY; // 當前 Y 軸價格可見範圍
 
@@ -41,7 +41,7 @@ namespace ExtremeSignalAppCS.Controls
         private readonly Pen _gridPen = new(new SolidColorBrush(Color.FromArgb(35, 255, 255, 255)), 0.8);
 
         // 文字繪製快取
-        private readonly Typeface _typeface = new Typeface(new FontFamily("Consolas, Microsoft JhengHei"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+        private readonly Typeface _typeface = new(new FontFamily("Consolas, Microsoft JhengHei"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
         private readonly Brush _textBrush = new SolidColorBrush(Color.FromArgb(200, 220, 220, 220));
         private readonly Brush _highTextBrush = new SolidColorBrush(Color.FromRgb(235, 75, 75));
         private readonly Brush _lowTextBrush = new SolidColorBrush(Color.FromRgb(40, 167, 69));
@@ -354,7 +354,7 @@ namespace ExtremeSignalAppCS.Controls
         private readonly Border _infoPanel;
         private readonly TextBlock _infoText;
 
-        private List<KlineBar> _candles = new();
+        private List<KlineBar> _candles = [];
         private double _minX, _maxX;
         private double _minY, _maxY;
 
@@ -414,7 +414,7 @@ namespace ExtremeSignalAppCS.Controls
             _infoPanel.RenderTransform = infoTransform;
 
             bool isDraggingInfo = false;
-            Point infoDragStartMouse = new Point();
+            Point infoDragStartMouse = new();
             double infoDragStartX = 0;
             double infoDragStartY = 0;
 
@@ -465,6 +465,25 @@ namespace ExtremeSignalAppCS.Controls
 
             Children.Add(_infoPanel);
 
+            // 當圖表尺寸改變時 (如視窗最大化/還原)，確保資訊面板不會跑出邊界而消失
+            this.SizeChanged += (s, e) =>
+            {
+                double chartW = ActualWidth;
+                double chartH = ActualHeight;
+                if (chartW <= 0 || chartH <= 0) return;
+
+                double panelW = _infoPanel.ActualWidth > 0 ? _infoPanel.ActualWidth : 145;
+                double panelH = _infoPanel.ActualHeight > 0 ? _infoPanel.ActualHeight : 105;
+
+                double minX = KLinePainter.LeftMargin + 20 - chartW + panelW;
+                double maxX = 10;
+                double minY = -10;
+                double maxY = chartH - panelH - 10;
+
+                infoTransform.X = Math.Max(minX, Math.Min(infoTransform.X, maxX));
+                infoTransform.Y = Math.Max(minY, Math.Min(infoTransform.Y, maxY));
+            };
+
             // 5. 註冊滑鼠事件 (Zoom 與 Pan)
             MouseMove += KLineChartControl_MouseMove;
             MouseLeave += KLineChartControl_MouseLeave;
@@ -488,7 +507,7 @@ namespace ExtremeSignalAppCS.Controls
             if (_candles == null || _candles.Count == 0)
             {
                 _infoPanel.Visibility = Visibility.Collapsed;
-                _painter.SetData(new List<KlineBar>(), 0, 0, 0, 0);
+                _painter.SetData([], 0, 0, 0, 0);
                 return;
             }
 
@@ -631,8 +650,14 @@ namespace ExtremeSignalAppCS.Controls
             _infoText.Inlines.Add(new Run($"{c.Low}\n") { FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(40, 167, 69)) });
             
             // 收盤
+            Brush closeBrush = Brushes.White;
+            if (c.Close > c.Open)
+                closeBrush = new SolidColorBrush(Color.FromRgb(235, 75, 75));
+            else if (c.Close < c.Open)
+                closeBrush = new SolidColorBrush(Color.FromRgb(40, 167, 69));
+
             _infoText.Inlines.Add(new Run("收："));
-            _infoText.Inlines.Add(new Run($"{c.Close}") { FontWeight = FontWeights.Bold, Foreground = Brushes.White });
+            _infoText.Inlines.Add(new Run($"{c.Close}") { FontWeight = FontWeights.Bold, Foreground = closeBrush });
 
             _infoPanel.Visibility = Visibility.Visible;
         }
@@ -780,8 +805,19 @@ namespace ExtremeSignalAppCS.Controls
             ShowKlineInfo(index);
             
             double colRange = _maxX - _minX;
-            _minX = index - colRange / 2.0;
-            _maxX = index + colRange / 2.0;
+            if (colRange <= 0) colRange = 100; // 防呆
+
+            // 計算比例 R，讓目標 K 棒精準出現在畫面的「物理正中心」(ActualWidth / 2)
+            // 而非單純「繪圖區」的中心 (會偏移 LeftMargin / 2)
+            double R = 0.5;
+            if (ActualWidth > KLinePainter.LeftMargin * 2)
+            {
+                double drawWidth = ActualWidth - KLinePainter.LeftMargin;
+                R = (ActualWidth / 2.0 - KLinePainter.LeftMargin) / drawWidth;
+            }
+
+            _minX = index - colRange * R;
+            _maxX = index + colRange * (1.0 - R);
             
             AutoRangeYForVisibleX();
             _painter.SetData(_candles, _minX, _maxX, _minY, _maxY);
@@ -814,7 +850,7 @@ namespace ExtremeSignalAppCS.Controls
         /// <summary>
         /// 為了對應 PyQtGraph 屬性式呼叫的 Dummy ViewBox 屬性。
         /// </summary>
-        public DummyViewBox plot_widget => new();
+        public static DummyViewBox PlotWidget => new();
     }
 
     /// <summary>
@@ -822,9 +858,9 @@ namespace ExtremeSignalAppCS.Controls
     /// </summary>
     public class DummyViewBox
     {
-        public DummyViewBox plotItem => new();
-        public DummyViewBox vb => new();
-        public DummyViewBox getViewBox() => this;
-        public void enableAutoRange() { }
+        public static DummyViewBox PlotItem => new();
+        public static DummyViewBox Vb => new();
+        public DummyViewBox GetViewBox() => this;
+        public static void EnableAutoRange() { }
     }
 }

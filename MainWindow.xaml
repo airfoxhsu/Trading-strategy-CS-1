@@ -234,6 +234,24 @@
                                 <MenuItem Command="Copy" Header="複製 (Copy)"/>
                             </ContextMenu>
                         </DataGrid.ContextMenu>
+                        <DataGrid.Resources>
+                            <Style x:Key="ObsHighlightCellStyle" TargetType="DataGridCell">
+                                <Setter Property="BorderThickness" Value="0"/>
+                                <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsObsKLowHighlight}" Value="True">
+                                        <Setter Property="Background" Value="#28A745"/>
+                                        <Setter Property="Foreground" Value="White"/>
+                                        <Setter Property="FontWeight" Value="Bold"/>
+                                    </DataTrigger>
+                                    <DataTrigger Binding="{Binding IsObsKHighHighlight}" Value="True">
+                                        <Setter Property="Background" Value="#EB4B4B"/>
+                                        <Setter Property="Foreground" Value="White"/>
+                                        <Setter Property="FontWeight" Value="Bold"/>
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </DataGrid.Resources>
                         <DataGrid.RowStyle>
                             <Style TargetType="DataGridRow">
                                 <Setter Property="BorderThickness" Value="0"/>
@@ -249,11 +267,11 @@
                             </Style>
                         </DataGrid.RowStyle>
                         <DataGrid.Columns>
-                            <DataGridTextColumn Header="時間" Binding="{Binding TimeLabel}" Width="Auto"/>
-                            <DataGridTextColumn Header="高" Binding="{Binding High}" Width="Auto"/>
-                            <DataGridTextColumn Header="低" Binding="{Binding Low}" Width="Auto"/>
-                            <DataGridTextColumn Header="開" Binding="{Binding Open}" Width="Auto"/>
-                            <DataGridTextColumn Header="收" Binding="{Binding Close}" Width="Auto"/>
+                            <DataGridTextColumn Header="時間" Binding="{Binding TimeLabel}" Width="Auto" CellStyle="{StaticResource ObsHighlightCellStyle}"/>
+                            <DataGridTextColumn Header="高" Binding="{Binding High}" Width="Auto" CellStyle="{StaticResource ObsHighlightCellStyle}"/>
+                            <DataGridTextColumn Header="低" Binding="{Binding Low}" Width="Auto" CellStyle="{StaticResource ObsHighlightCellStyle}"/>
+                            <DataGridTextColumn Header="開" Binding="{Binding Open}" Width="Auto" CellStyle="{StaticResource ObsHighlightCellStyle}"/>
+                            <DataGridTextColumn Header="收" Binding="{Binding Close}" Width="Auto" CellStyle="{StaticResource ObsHighlightCellStyle}"/>
                             <DataGridTextColumn Header="訊號標記" Binding="{Binding Signals}" Width="*"/>
                             <DataGridTextColumn Header="突破上高" Binding="{Binding BreakHigh}" Width="Auto"/>
                             <DataGridTextColumn Header="跌破上低" Binding="{Binding BreakLow}" Width="Auto"/>

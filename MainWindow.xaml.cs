@@ -108,6 +108,7 @@ namespace ExtremeSignalAppCS
         private int _currentKlineInterval = 30;
         private int _currentObsN = 25;
         private int? _lastMxfPrice;
+        private string _lastMxfTime = "";
         private string? _currentReplayDir;
         private string? _lastSelectedReplayDir;
         private string _currentReplaySession = "日盤";
@@ -636,6 +637,7 @@ namespace ExtremeSignalAppCS
                     if (baseSymbol == "MXF")
                     {
                         _lastMxfPrice = price;
+                        _lastMxfTime = mt;
                     }
                 }
 
@@ -684,10 +686,10 @@ namespace ExtremeSignalAppCS
             }
         }
 
-        private string FormatExtremeTime(string t)
+        private static string FormatExtremeTime(string t)
         {
             if (string.IsNullOrEmpty(t) || t.Length < 6) return t;
-            return $"{t.Substring(0, 2)}:{t.Substring(2, 2)}:{t.Substring(4, 2)}";
+            return $"{t[..2]}:{t[2..4]}:{t[4..6]}";
         }
 
         private Dictionary<string, object> RunRealtimeAnalysisCompute()
@@ -805,7 +807,7 @@ namespace ExtremeSignalAppCS
                 List<(int Index, int Price, bool IsTrigH, bool IsTrigB, int RunningMax, int RunningMin)> currentTriggers;
                 lock (_rtLock)
                 {
-                    currentTriggers = new List<(int, int, bool, bool, int, int)>(_rtTriggers[symbol][activeSession]);
+                    currentTriggers = [.. _rtTriggers[symbol][activeSession]];
                 }
 
                 foreach (var item in currentTriggers)
@@ -1098,8 +1100,8 @@ namespace ExtremeSignalAppCS
             // 背景分 K 聚合與 K棒 停損狀態機運算 (超大 CPU 負載完全隔離)
             var (klineData, breakouts) = _engine.CalcKlineData(
                 activeSession, mxfTradesRt,
-                [.. txfDetailsRt.Select(d => ConvertToSimulationResultRaw(d, "TXF"))],
-                [.. mxfDetailsRt.Select(d => ConvertToSimulationResultRaw(d, "MXF"))],
+                [.. txfDetailsRt.Select(d => ConvertToSimulationResultRaw(d))],
+                [.. mxfDetailsRt.Select(d => ConvertToSimulationResultRaw(d))],
                 _currentKlineInterval
             );
 
@@ -1129,7 +1131,7 @@ namespace ExtremeSignalAppCS
             };
         }
 
-        private SimulationResult ConvertToSimulationResultRaw(SimulationResult display, string sym)
+        private static SimulationResult ConvertToSimulationResultRaw(SimulationResult display)
         {
             int prevHigh = display.PrevHigh;
             int prevLow = display.PrevLow;
@@ -1148,7 +1150,7 @@ namespace ExtremeSignalAppCS
                 BIndex = display.BIndex,
                 ObsN = display.ObsN,
                 StopLossPrice = display.DisplayTitle.Contains("最高") ? prevHigh : prevLow,
-                Tags = display.Tags != null ? new List<string>(display.Tags) : new List<string>()
+                Tags = display.Tags != null ? [.. display.Tags] : []
             };
         }
 
@@ -1231,6 +1233,49 @@ namespace ExtremeSignalAppCS
             RefreshInfoPanel();
         }
 
+        public void ClearChartCrosshair()
+        {
+            klineChart.ClearCrosshair();
+        }
+
+        public void FocusChartOnTime(string timeStr)
+        {
+            if (_klineCollection == null || _klineCollection.Count == 0 || string.IsNullOrEmpty(timeStr)) return;
+
+            string cleanTime = timeStr.Replace(":", "");
+            if (cleanTime.Length >= 4 && int.TryParse(cleanTime[..4], out int hmVal))
+            {
+                int targetMins = (hmVal / 100) * 60 + (hmVal % 100);
+
+                for (int i = 0; i < _klineCollection.Count; i++)
+                {
+                    var parts = _klineCollection[i].TimeLabel.Split('~');
+                    if (parts.Length == 2)
+                    {
+                        var p0 = parts[0].Split(':');
+                        var p1 = parts[1].Split(':');
+                        if (p0.Length == 2 && p1.Length == 2 && 
+                            int.TryParse(p0[0], out int sH) && int.TryParse(p0[1], out int sM) &&
+                            int.TryParse(p1[0], out int eH) && int.TryParse(p1[1], out int eM))
+                        {
+                            int startMins = sH * 60 + sM;
+                            int endMins = eH * 60 + eM;
+                            
+                            bool inRange = (startMins <= endMins) 
+                                ? (targetMins >= startMins && targetMins < endMins)
+                                : (targetMins >= startMins || targetMins < endMins);
+                            
+                            if (inRange)
+                            {
+                                klineChart.FocusCandle(i);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         private void UpdateKlineViews(List<KlineBar> klineData)
         {
             // 差量合併 K線，保留 DataGrid 的 SelectIndex 反白
@@ -1243,6 +1288,7 @@ namespace ExtremeSignalAppCS
             {
                 for (int i = 0; i < newLen; i++)
                 {
+                    _klineCollection[i].TimeLabel = klineData[i].TimeLabel;
                     _klineCollection[i].High = klineData[i].High;
                     _klineCollection[i].Low = klineData[i].Low;
                     _klineCollection[i].Open = klineData[i].Open;
@@ -1258,6 +1304,7 @@ namespace ExtremeSignalAppCS
             {
                 for (int i = 0; i < oldLen; i++)
                 {
+                    _klineCollection[i].TimeLabel = klineData[i].TimeLabel;
                     _klineCollection[i].High = klineData[i].High;
                     _klineCollection[i].Low = klineData[i].Low;
                     _klineCollection[i].Open = klineData[i].Open;
@@ -1271,6 +1318,7 @@ namespace ExtremeSignalAppCS
                 {
                     _klineCollection.Add(klineData[i]);
                 }
+                dgKline.Items.Refresh();
             }
             else
             {
@@ -1364,8 +1412,89 @@ namespace ExtremeSignalAppCS
                 dgObserver.ScrollIntoView(_obsCollection[^1]);
             }
 
+            ApplyObserverHighlightsToKline();
+
             // 更新底部 ComboBox 壓力支撐下拉選項
             RefreshObserverComboboxes();
+        }
+
+        private void ApplyObserverHighlightsToKline()
+        {
+            if (_klineCollection.Count == 0) return;
+
+            foreach (var k in _klineCollection)
+            {
+                k.IsObsKLowHighlight = false;
+                k.IsObsKHighHighlight = false;
+            }
+
+            foreach (var obs in _obsCollection)
+            {
+                bool isKLow = obs.Type != null && obs.Type.Contains("K低");
+                bool isKHigh = obs.Type != null && obs.Type.Contains("K高");
+                if (!isKLow && !isKHigh)
+                {
+                    isKLow = obs.DisplayTitle != null && obs.DisplayTitle.Contains("K低");
+                    isKHigh = obs.DisplayTitle != null && obs.DisplayTitle.Contains("K高");
+                }
+                
+                if (!isKLow && !isKHigh) continue;
+
+                string aTimeStr = obs.BestATime;
+                if (string.IsNullOrEmpty(aTimeStr) || aTimeStr.Length < 6) continue;
+
+                if (!int.TryParse(aTimeStr.AsSpan(0, 2), out int ah) ||
+                    !int.TryParse(aTimeStr.AsSpan(2, 2), out int am) ||
+                    !int.TryParse(aTimeStr.AsSpan(4, 2), out int aSec))
+                {
+                    continue;
+                }
+
+                double aTimeVal = (ah * 60 + am) * 60 + aSec;
+                if (_currentSessionName == "夜盤" && (ah * 60 + am) < 900)
+                {
+                    aTimeVal += 86400; // 夜盤跨日
+                }
+
+                int targetIdx = -1;
+                for (int i = 0; i < _klineCollection.Count; i++)
+                {
+                    string timeLabel = _klineCollection[i].TimeLabel;
+                    try
+                    {
+                        var times = timeLabel.Split('~');
+                        var startParts = times[0].Split(':');
+                        int sh = int.Parse(startParts[0]);
+                        int sm = int.Parse(startParts[1]);
+                        double startT = (sh * 60 + sm) * 60.0;
+                        if (_currentSessionName == "夜盤" && (sh * 60 + sm) < 900) startT += 86400.0;
+
+                        var endParts = times[1].Split(':');
+                        int eh = int.Parse(endParts[0]);
+                        int em = int.Parse(endParts[1]);
+                        double endT = (eh * 60 + em) * 60.0;
+                        if (_currentSessionName == "夜盤" && (eh * 60 + em) < 900) endT += 86400.0;
+
+                        if (aTimeVal >= startT && aTimeVal < endT)
+                        {
+                            targetIdx = i;
+                            break;
+                        }
+                    }
+                    catch { }
+                }
+
+                if (targetIdx > 0)
+                {
+                    int prevIdx = targetIdx - 1;
+                    if (isKLow)
+                        _klineCollection[prevIdx].IsObsKLowHighlight = true;
+                    else if (isKHigh)
+                        _klineCollection[prevIdx].IsObsKHighHighlight = true;
+                }
+            }
+
+            dgKline.Items.Refresh();
         }
 
         private void RefreshInfoPanel()
@@ -1376,7 +1505,7 @@ namespace ExtremeSignalAppCS
 
             if (wndUnbrokenK != null && _lastMxfPrice.HasValue)
             {
-                wndUnbrokenK.CheckInstantUnbrokenBreakout(_lastMxfPrice.Value);
+                wndUnbrokenK.CheckInstantUnbrokenBreakout(_lastMxfPrice.Value, _lastMxfTime);
             }
 
             var counts = new List<string>();
@@ -1660,11 +1789,10 @@ namespace ExtremeSignalAppCS
 
             foreach (var session in new[] { "日盤", "夜盤" })
             {
-                List<TradeTick> mxfT, txfT;
+                List<TradeTick> mxfT;
                 lock (_rtLock)
                 {
                     mxfT = [.. _liveSymbolTrades["MXF"][session]];
-                    txfT = [.. _liveSymbolTrades["TXF"][session]];
                 }
 
                 if (mxfT.Count == 0) continue;
@@ -1696,10 +1824,10 @@ namespace ExtremeSignalAppCS
             // 優先由當前實時計算的 snapshot 提取
             if (_lastRtStatusSnapshot != null)
             {
-                var match = _lastRtStatusSnapshot.FirstOrDefault(x => x.Symbol == sym && x.Session == session);
-                if (match.Symbol != null)
+                var (s, sess, _, _, details) = _lastRtStatusSnapshot.FirstOrDefault(x => x.Symbol == sym && x.Session == session);
+                if (s != null)
                 {
-                    return match.Details;
+                    return details;
                 }
             }
 
@@ -2272,7 +2400,7 @@ namespace ExtremeSignalAppCS
         /// <summary>
         /// 智慧型自動探測並獲取今日歷史日誌 (Logs) 之專案根目錄或執行目錄路徑。
         /// </summary>
-        private string GetLogsDirectory([System.Runtime.CompilerServices.CallerFilePath] string sourceFilePath = "")
+        private static string GetLogsDirectory([System.Runtime.CompilerServices.CallerFilePath] string sourceFilePath = "")
         {
             // 1. 優先探測當前執行程式目錄下的 Logs (適用於部署發布環境)
             string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Logs");
@@ -2664,6 +2792,7 @@ namespace ExtremeSignalAppCS
                     if (baseSym == "MXF")
                     {
                         _lastMxfPrice = price;
+                        _lastMxfTime = mt;
                     }
                 }
             }
@@ -2857,6 +2986,7 @@ namespace ExtremeSignalAppCS
                     if (baseSym == "MXF")
                     {
                         _lastMxfPrice = price;
+                        _lastMxfTime = mt;
                     }
                 }
 
@@ -3225,7 +3355,7 @@ namespace ExtremeSignalAppCS
             try
             {
                 var qParams = _engine.LoadQuantParams("TXF", _currentTargetDays);
-                string sourceStr = (qParams.ContainsKey("source") && qParams["source"] != null) ? qParams["source"].ToString()! : "未知來源";
+                string sourceStr = qParams.TryGetValue("source", out var val) && val != null ? val.ToString()! : "未知來源";
 
                 if (sourceStr.Contains("動態載入"))
                 {

@@ -32,6 +32,22 @@ namespace ExtremeSignalAppCS.Controls
         // 快取當前未破停損價格 (Key: (Type[high/low], PriceStr) -> Value: 分K分鐘數集合)
         private Dictionary<(string Type, string Price), HashSet<int>> _currentUnbrokenMap = new();
         private Dictionary<(string Type, string Price), string> _currentUnbrokenTimeMap = new();
+        
+        private class TrendEvent
+        {
+            public int Direction { get; set; }
+            public int LongCount { get; set; }
+            public int ShortCount { get; set; }
+            public string EstablishedTime { get; set; } = "";
+            public int? EstablishedPrice { get; set; }
+        }
+        
+        // 趨勢方向表單狀態: 1 = 多方, -1 = 空方, 0 = 無資料
+        private int _trendDirection = 0;
+        private readonly List<TrendEvent> _trendHistory = new();
+        
+        // 記錄目前在趨勢表單中被選取反白的時間點
+        private string? _selectedTrendTime = null;
 
         public UnbrokenKMonitor()
         {
@@ -90,6 +106,7 @@ namespace ExtremeSignalAppCS.Controls
                 {
                     var tempUnbrokenMap = new Dictionary<(string Type, string Price), HashSet<int>>();
                     var tempTimeMap = new Dictionary<(string Type, string Price), string>();
+                    var stopLossLifespans = new Dictionary<(string Type, string StopLossVal), List<(double TrigTVal, string TrigTimeStr, double? BreakTVal, string BreakTimeStr, int? TrigPrice)>>();
 
                     foreach (var intervalStr in intervalsStr)
                     {
@@ -114,6 +131,32 @@ namespace ExtremeSignalAppCS.Controls
 
                                 string sigLabel = item.DisplayTitle;
                                 string stopLossVal = item.StopLossDisplay;
+                                
+                                string? typeObj = null;
+                                if (sigLabel.Contains("K高")) typeObj = "K高";
+                                else if (sigLabel.Contains("K低")) typeObj = "K低";
+                                
+                                if (typeObj != null)
+                                {
+                                    double trigTVal = ParseTimeStr(item.TrigTime);
+                                    double? breakTVal = null;
+                                    string breakTimeStr = "";
+                                    if (item.IsBroken && !string.IsNullOrEmpty(item.BreakTime))
+                                    {
+                                        breakTVal = ParseTimeStr(item.BreakTime);
+                                        breakTimeStr = item.BreakTime;
+                                    }
+                                    
+                                    string slKeyStr = item.StopLossPrice.ToString();
+                                    var lifeKey = (typeObj, slKeyStr);
+                                    
+                                    if (!stopLossLifespans.ContainsKey(lifeKey))
+                                    {
+                                        stopLossLifespans[lifeKey] = new List<(double TrigTVal, string TrigTimeStr, double? BreakTVal, string BreakTimeStr, int? TrigPrice)>();
+                                    }
+                                    int? tp = int.TryParse(item.TrigPrice, out int tpVal) ? tpVal : (int?)null;
+                                    stopLossLifespans[lifeKey].Add((trigTVal, item.TrigTime, breakTVal, breakTimeStr, tp));
+                                }
 
                                 if (!string.IsNullOrEmpty(stopLossVal) && stopLossVal != "N/A" && !stopLossVal.Contains("已破"))
                                 {
@@ -144,8 +187,90 @@ namespace ExtremeSignalAppCS.Controls
                         }
                     }
 
+                    // 根據 stopLossLifespans 建立歷史時間軸
+                    var timeline = new List<(double TVal, string TimeStr, string Type, int Delta, int? Price)>();
+                    foreach (var kvp in stopLossLifespans)
+                    {
+                        var spans = kvp.Value;
+                        spans.Sort((a, b) => a.TrigTVal.CompareTo(b.TrigTVal));
+                        
+                        var merged = new List<(double Trig, string TrigStr, double Break, string BreakStr, int? Price)>();
+                        foreach (var span in spans)
+                        {
+                            double spanBreak = span.BreakTVal ?? 999999;
+                            if (merged.Count == 0)
+                            {
+                                merged.Add((span.TrigTVal, span.TrigTimeStr, spanBreak, span.BreakTimeStr, span.TrigPrice));
+                            }
+                            else
+                            {
+                                var last = merged[^1];
+                                if (span.TrigTVal <= last.Break)
+                                {
+                                    if (spanBreak > last.Break)
+                                    {
+                                        merged[^1] = (last.Trig, last.TrigStr, spanBreak, spanBreak == 999999 ? "" : span.BreakTimeStr, last.Price);
+                                    }
+                                }
+                                else
+                                {
+                                    merged.Add((span.TrigTVal, span.TrigTimeStr, spanBreak, span.BreakTimeStr, span.TrigPrice));
+                                }
+                            }
+                        }
+                        
+                        foreach (var m in merged)
+                        {
+                            if (m.Trig < 999999)
+                                timeline.Add((m.Trig, m.TrigStr, kvp.Key.Type, 1, m.Price));
+                            
+                            if (m.Break < 999999)
+                            {
+                                int.TryParse(kvp.Key.StopLossVal, out int sl);
+                                timeline.Add((m.Break, m.BreakStr, kvp.Key.Type, -1, sl));
+                            }
+                        }
+                    }
+                    
+                    timeline.Sort((a, b) => a.TVal.CompareTo(b.TVal));
+                    
+                    int computedLongCount = 0;
+                    int computedShortCount = 0;
+                    int computedDir = 0;
+                    var computedHistory = new List<TrendEvent>();
+                    
+                    foreach (var ev in timeline)
+                    {
+                        if (ev.Type == "K高") computedLongCount += ev.Delta;
+                        if (ev.Type == "K低") computedShortCount += ev.Delta;
+                        
+                        int newDir = computedDir;
+                        if (computedLongCount > computedShortCount) newDir = 1;
+                        else if (computedShortCount > computedLongCount) newDir = -1;
+                        else if (computedLongCount == 0 && computedShortCount == 0) newDir = 0;
+                        
+                        if (newDir != computedDir)
+                        {
+                            computedDir = newDir;
+                            if (computedDir != 0)
+                            {
+                                computedHistory.Add(new TrendEvent
+                                {
+                                    Direction = computedDir,
+                                    LongCount = computedLongCount,
+                                    ShortCount = computedShortCount,
+                                    EstablishedTime = FormatTimeStr(ev.TimeStr),
+                                    EstablishedPrice = ev.Price
+                                });
+                                // Keep memory bounded if there are insane amounts of flips
+                                if (computedHistory.Count > 1000) computedHistory.RemoveAt(0);
+                            }
+                        }
+                    }
+
                     // 取得目前最新小台價格
                     string currentPrice = "N/A";
+                    string tradeTimeStr = "N/A";
                     if (sessionDataSnapshot.Count > 0)
                     {
                         for (int i = sessionDataSnapshot.Count - 1; i >= 0; i--)
@@ -154,6 +279,7 @@ namespace ExtremeSignalAppCS.Controls
                             if (trades.Count > 0)
                             {
                                 currentPrice = trades[^1].Price.ToString();
+                                tradeTimeStr = trades[^1].Time;
                                 break;
                             }
                         }
@@ -164,10 +290,10 @@ namespace ExtremeSignalAppCS.Controls
                     {
                         _currentUnbrokenMap = tempUnbrokenMap;
                         _currentUnbrokenTimeMap = tempTimeMap;
-                        UpdateUI(currentPrice);
+                        UpdateUI(currentPrice, tradeTimeStr, computedHistory, computedDir);
                     }));
                 }
-                catch (Exception ex)
+                catch (Exception)
                 {
                     // Ignore or log internally
                 }
@@ -181,7 +307,7 @@ namespace ExtremeSignalAppCS.Controls
         /// <summary>
         /// Tick 行情跳動時 O(1) 穿價破位即時剔除。
         /// </summary>
-        public void CheckInstantUnbrokenBreakout(double price)
+        public void CheckInstantUnbrokenBreakout(double price, string tradeTimeStr = "")
         {
             if (_currentUnbrokenMap.Count == 0) return;
 
@@ -211,20 +337,49 @@ namespace ExtremeSignalAppCS.Controls
                     {
                         _currentUnbrokenMap.Remove(k);
                     }
-                    UpdateUI(price.ToString());
+                    UpdateUI(price.ToString(), tradeTimeStr);
                 }
             }
+        }
+
+        private string FormatTimeStr(string t)
+        {
+            if (string.IsNullOrEmpty(t) || t.Length < 6) return t;
+            if (t.Contains(':')) return t;
+            return $"{t[..2]}:{t[2..4]}:{t[4..6]}";
+        }
+
+        private double ParseTimeStr(string raw)
+        {
+            if (string.IsNullOrEmpty(raw) || raw == "N/A") return 999999;
+            string digits = new string(raw.Where(char.IsDigit).ToArray());
+            if (digits.Length < 6) return 999999;
+            string hStr = digits.Substring(0, 2);
+            string mStr = digits.Substring(2, 2);
+            string sStr = digits.Substring(4, 2);
+            if (int.TryParse(hStr, out int h) && int.TryParse(mStr, out int m) && int.TryParse(sStr, out int s))
+            {
+                double t = h * 3600 + m * 60 + s;
+                if (t <= 18000) t += 86400;
+                return t;
+            }
+            return 999999;
         }
 
         /// <summary>
         /// 主執行緒 UI 著色與排版更新。
         /// 智慧快取滾動條位置，防止更新文字時畫面抖動跳躍。
         /// </summary>
-        private void UpdateUI(string currentPrice)
+        private void UpdateUI(string currentPrice, string tradeTimeStr = "", List<TrendEvent>? newHistory = null, int? newDir = null)
         {
             // 1. 快取滾動條位置
             double vOffset = txtDisplay.VerticalOffset;
             double hOffset = txtDisplay.HorizontalOffset;
+
+            // 趨勢歷史表單智慧捲動偵測
+            double trendVOffset = txtTrendHistory.VerticalOffset;
+            double trendHOffset = txtTrendHistory.HorizontalOffset;
+            bool isTrendAtBottom = (txtTrendHistory.VerticalOffset + txtTrendHistory.ViewportHeight >= txtTrendHistory.ExtentHeight - 5.0) || txtTrendHistory.ExtentHeight < 1.0;
 
             int displayPrice = 0;
             if (double.TryParse(currentPrice, out double p))
@@ -232,8 +387,11 @@ namespace ExtremeSignalAppCS.Controls
                 displayPrice = (int)Math.Round(p);
             }
 
-            string nowStr = DateTime.Now.ToString("HH:mm:ss");
-            lblTitle.Text = $"🛡️ 未破分 K 停損監控 | 目前時間：{nowStr} | 價位: {(displayPrice > 0 ? displayPrice.ToString() : currentPrice)}";
+            string displayTimeStr = string.IsNullOrEmpty(tradeTimeStr) || tradeTimeStr == "N/A" 
+                ? DateTime.Now.ToString("HH:mm:ss") 
+                : FormatTimeStr(tradeTimeStr);
+
+            lblTitle.Text = $"🛡️ 未破分 K 停損監控 | 目前時間：{displayTimeStr} | 價位: {(displayPrice > 0 ? displayPrice.ToString() : currentPrice)}";
 
             txtDisplay.Document.Blocks.Clear();
 
@@ -320,9 +478,133 @@ namespace ExtremeSignalAppCS.Controls
                 txtDisplay.Document.Blocks.Add(new Paragraph(new Run("所有分 K 的停損價均已顯示「已破」或目前無觀察訊號。") { Foreground = Brushes.Gray }));
             }
 
+            // --- 趨勢方向表單邏輯 ---
+            if (newHistory != null && newDir != null)
+            {
+                _trendDirection = newDir.Value;
+                _trendHistory.Clear();
+                _trendHistory.AddRange(newHistory);
+            }
+            else
+            {
+                int shortCount = shortEntries.Count; // 做空
+                int longCount = longEntries.Count;   // 做多
+    
+                int newDirection = _trendDirection;
+                if (longCount > shortCount)
+                {
+                    newDirection = 1;
+                }
+                else if (shortCount > longCount)
+                {
+                    newDirection = -1;
+                }
+                else if (longCount == 0 && shortCount == 0)
+                {
+                    newDirection = 0;
+                }
+    
+                if (newDirection != _trendDirection)
+                {
+                    _trendDirection = newDirection;
+                    if (_trendDirection != 0)
+                    {
+                        int? currentP = int.TryParse(currentPrice, out int cp) ? cp : (int?)null;
+                        _trendHistory.Add(new TrendEvent 
+                        { 
+                            Direction = _trendDirection, 
+                            EstablishedTime = FormatTimeStr(tradeTimeStr),
+                            EstablishedPrice = currentP,
+                            LongCount = longCount,
+                            ShortCount = shortCount
+                        });
+                        if (_trendHistory.Count > 1000) _trendHistory.RemoveAt(0);
+                    }
+                }
+            }
+
+            // 渲染趨勢歷史
+            txtTrendHistory.Document.Blocks.Clear();
+            if (_trendHistory.Count == 0)
+            {
+                txtTrendHistory.Document.Blocks.Add(new Paragraph(new Run("-- 無資料 --") { Foreground = Brushes.Gray }));
+            }
+            else
+            {
+                foreach (var evt in _trendHistory)
+                {
+                    var para = new Paragraph { Margin = new Thickness(0, 0, 0, 4) };
+                    
+                    // 若這筆剛好是目前被選取的，給予高亮背景
+                    if (_selectedTrendTime == evt.EstablishedTime)
+                    {
+                        para.Background = new SolidColorBrush(Color.FromArgb(80, 255, 255, 255));
+                    }
+                    else
+                    {
+                        para.Background = Brushes.Transparent;
+                    }
+
+                    // 新增點擊跳轉 K 線圖表事件
+                    para.Cursor = System.Windows.Input.Cursors.Hand;
+                    para.PreviewMouseLeftButtonDown += (s, e) =>
+                    {
+                        if (_selectedTrendTime == evt.EstablishedTime)
+                        {
+                            // 已經選取，執行取消選取
+                            _selectedTrendTime = null;
+                            para.Background = Brushes.Transparent;
+                            _parentApp?.ClearChartCrosshair();
+                        }
+                        else
+                        {
+                            // 尚未選取，設定為選取並切換背景
+                            _selectedTrendTime = evt.EstablishedTime;
+                            foreach (var block in txtTrendHistory.Document.Blocks)
+                            {
+                                if (block is Paragraph p) p.Background = Brushes.Transparent;
+                            }
+                            para.Background = new SolidColorBrush(Color.FromArgb(80, 255, 255, 255));
+                            _parentApp?.FocusChartOnTime(evt.EstablishedTime);
+                        }
+                        e.Handled = true;
+                    };
+
+                    if (evt.Direction == 1)
+                    {
+                        string op = evt.LongCount > evt.ShortCount ? ">" : "=";
+                        string pStr = evt.EstablishedPrice.HasValue ? $" {evt.EstablishedPrice.Value}" : "";
+                        para.Inlines.Add(new Run($"多方 做多 {evt.LongCount} 項 {op} 做空 {evt.ShortCount} 項 {evt.EstablishedTime}{pStr}")
+                        {
+                            Foreground = new SolidColorBrush(Color.FromRgb(235, 75, 75))
+                        });
+                    }
+                    else if (evt.Direction == -1)
+                    {
+                        string op = evt.ShortCount > evt.LongCount ? ">" : "=";
+                        string pStr = evt.EstablishedPrice.HasValue ? $" {evt.EstablishedPrice.Value}" : "";
+                        para.Inlines.Add(new Run($"空方 做空 {evt.ShortCount} 項 {op} 做多 {evt.LongCount} 項 {evt.EstablishedTime}{pStr}")
+                        {
+                            Foreground = new SolidColorBrush(Color.FromRgb(40, 167, 69))
+                        });
+                    }
+                    txtTrendHistory.Document.Blocks.Add(para);
+                }
+            }
+
             // 2. 還原滾動條位置
             txtDisplay.ScrollToVerticalOffset(vOffset);
             txtDisplay.ScrollToHorizontalOffset(hOffset);
+
+            if (isTrendAtBottom)
+            {
+                txtTrendHistory.ScrollToEnd();
+            }
+            else
+            {
+                txtTrendHistory.ScrollToVerticalOffset(trendVOffset);
+                txtTrendHistory.ScrollToHorizontalOffset(trendHOffset);
+            }
         }
 
         /// <summary>
@@ -338,6 +620,12 @@ namespace ExtremeSignalAppCS.Controls
             }
             txtDisplay.Document.Blocks.Clear();
             lblTitle.Text = "🛡️ 未破分 K 停損監控";
+            
+            _trendDirection = 0;
+            _selectedTrendTime = null;
+            _trendHistory.Clear();
+            if (txtTrendHistory != null)
+                txtTrendHistory.Document.Blocks.Clear();
         }
 
         /// <summary>
@@ -354,6 +642,12 @@ namespace ExtremeSignalAppCS.Controls
             _lastTriggerTime = 0;
             txtDisplay.Document.Blocks.Clear();
             lblTitle.Text = "🛡️ 未破分 K 停損監控";
+            
+            _trendDirection = 0;
+            _selectedTrendTime = null;
+            _trendHistory.Clear();
+            if (txtTrendHistory != null)
+                txtTrendHistory.Document.Blocks.Clear();
         }
     }
 }
