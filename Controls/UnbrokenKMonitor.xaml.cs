@@ -434,49 +434,54 @@ namespace ExtremeSignalAppCS.Controls
                 return py.CompareTo(px);
             });
 
+            // 更新統計顯示條
+            lblSummaryShort.Text = $"做空共有 {shortEntries.Count} 項";
+            lblSummaryLong.Text = $"做多共有 {longEntries.Count} 項";
+
             // 增量填入 Paragraph，並且對多/空標題進行發光著色
+            // 使用單一 Paragraph 且設定 Margin=0 以精準控制換行距離
+            var pContent = new Paragraph { Margin = new Thickness(0) };
+
             if (shortEntries.Count > 0)
             {
-                var pHeader = new Paragraph();
                 var run = new Run($"═══ 做空（觀察 K 低） 共 {shortEntries.Count} 項 ═══\n")
                 {
                     Foreground = new SolidColorBrush(Color.FromRgb(40, 167, 69)), // 亮綠
                     FontWeight = FontWeights.Bold
                 };
-                pHeader.Inlines.Add(run);
+                pContent.Inlines.Add(run);
 
                 foreach (var item in shortEntries)
                 {
-                    pHeader.Inlines.Add(new Run($"  停損價: {item.price}  未破: {item.intervalsStr} 分K  ({item.timeStr})\n"));
+                    pContent.Inlines.Add(new Run($"  停損價: {item.price}  未破: {item.intervalsStr} 分K  ({item.timeStr})\n"));
                 }
-                txtDisplay.Document.Blocks.Add(pHeader);
             }
 
             if (longEntries.Count > 0)
             {
-                var pHeader = new Paragraph();
                 if (shortEntries.Count > 0)
                 {
-                    pHeader.Inlines.Add(new Run("\n")); // 空行分隔
+                    pContent.Inlines.Add(new Run("\n")); // 做空與做多之間空一行
                 }
                 var run = new Run($"═══ 做多（觀察 K 高） 共 {longEntries.Count} 項 ═══\n")
                 {
                     Foreground = new SolidColorBrush(Color.FromRgb(235, 75, 75)), // 亮紅
                     FontWeight = FontWeights.Bold
                 };
-                pHeader.Inlines.Add(run);
+                pContent.Inlines.Add(run);
 
                 foreach (var item in longEntries)
                 {
-                    pHeader.Inlines.Add(new Run($"  停損價: {item.price}  未破: {item.intervalsStr} 分K  ({item.timeStr})\n"));
+                    pContent.Inlines.Add(new Run($"  停損價: {item.price}  未破: {item.intervalsStr} 分K  ({item.timeStr})\n"));
                 }
-                txtDisplay.Document.Blocks.Add(pHeader);
             }
 
             if (shortEntries.Count == 0 && longEntries.Count == 0)
             {
-                txtDisplay.Document.Blocks.Add(new Paragraph(new Run("所有分 K 的停損價均已顯示「已破」或目前無觀察訊號。") { Foreground = Brushes.Gray }));
+                pContent.Inlines.Add(new Run("所有分 K 的停損價均已顯示「已破」或目前無觀察訊號。") { Foreground = Brushes.Gray });
             }
+
+            txtDisplay.Document.Blocks.Add(pContent);
 
             // --- 趨勢方向表單邏輯 ---
             if (newHistory != null && newDir != null)
@@ -620,6 +625,8 @@ namespace ExtremeSignalAppCS.Controls
             }
             txtDisplay.Document.Blocks.Clear();
             lblTitle.Text = "🛡️ 未破分 K 停損監控";
+            lblSummaryShort.Text = "做空共有 0 項";
+            lblSummaryLong.Text = "做多共有 0 項";
             
             _trendDirection = 0;
             _selectedTrendTime = null;
@@ -642,6 +649,8 @@ namespace ExtremeSignalAppCS.Controls
             _lastTriggerTime = 0;
             txtDisplay.Document.Blocks.Clear();
             lblTitle.Text = "🛡️ 未破分 K 停損監控";
+            lblSummaryShort.Text = "做空共有 0 項";
+            lblSummaryLong.Text = "做多共有 0 項";
             
             _trendDirection = 0;
             _selectedTrendTime = null;
