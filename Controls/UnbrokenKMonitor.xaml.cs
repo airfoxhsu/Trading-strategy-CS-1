@@ -27,6 +27,7 @@ namespace ExtremeSignalAppCS.Controls
         private readonly DispatcherTimer _timer;
         private bool _bgCheckInProgress;
         private double _lastTriggerTime;
+        private volatile bool _isDirty; // 髒標記：只有行情資料真正變動時才標記為 true
         private readonly object _lock = new();
 
         // 快取當前未破停損價格 (Key: (Type[high/low], PriceStr) -> Value: 分K分鐘數集合)
@@ -53,12 +54,20 @@ namespace ExtremeSignalAppCS.Controls
         {
             InitializeComponent();
 
-            // 1.5 秒更新一次 (防抖節流背景計算)
+            // 3 秒輪詢檢查髒標記 (實際計算僅在行情變動時觸發，閒置時零 CPU)
             _timer = new DispatcherTimer(DispatcherPriority.Background)
             {
-                Interval = TimeSpan.FromMilliseconds(1500)
+                Interval = TimeSpan.FromMilliseconds(3000)
             };
-            _timer.Tick += (s, e) => TriggerUnbrokenCheck(false);
+            _timer.Tick += (s, e) =>
+            {
+                // 只有當 MainWindow 呼叫 MarkDirty() 標記有新資料時，才真正執行背景計算
+                if (_isDirty)
+                {
+                    _isDirty = false;
+                    TriggerUnbrokenCheck(false);
+                }
+            };
         }
 
         public void Initialize(TradingEngine engine, MainWindow parentApp)
@@ -67,6 +76,15 @@ namespace ExtremeSignalAppCS.Controls
             _parentApp = parentApp;
             
             _timer.Start();
+        }
+
+        /// <summary>
+        /// 標記有新行情資料需要重新計算。
+        /// 由 MainWindow 在實時分析完成後呼叫，取代原本的無條件輪詢。
+        /// </summary>
+        public void MarkDirty()
+        {
+            _isDirty = true;
         }
 
         /// <summary>
@@ -515,15 +533,27 @@ namespace ExtremeSignalAppCS.Controls
                     if (_trendDirection != 0)
                     {
                         int? currentP = int.TryParse(currentPrice, out int cp) ? cp : (int?)null;
-                        _trendHistory.Add(new TrendEvent 
+                        var evt = new TrendEvent 
                         { 
                             Direction = _trendDirection, 
                             EstablishedTime = FormatTimeStr(tradeTimeStr),
                             EstablishedPrice = currentP,
                             LongCount = longCount,
                             ShortCount = shortCount
-                        });
+                        };
+                        _trendHistory.Add(evt);
                         if (_trendHistory.Count > 1000) _trendHistory.RemoveAt(0);
+
+                        // Trigger Telegram push
+                        string dirStr = _trendDirection == 1 ? "多方 📈" : "空方 📉";
+                        string op = _trendDirection == 1 ? (longCount > shortCount ? ">" : "=") : (shortCount > longCount ? ">" : "=");
+                        string cpStr = currentP.HasValue ? currentP.Value.ToString() : "--";
+                        string msg = $"【趨勢轉向】{dirStr}\n" +
+                                     $"時間：{evt.EstablishedTime}\n" +
+                                     $"觸發價位：{cpStr}\n" +
+                                     $"未破狀態：做多 {longCount} 項 {op} 做空 {shortCount} 項";
+                        
+                        _parentApp?.PushTelegramMessage(msg);
                     }
                 }
             }
@@ -570,7 +600,7 @@ namespace ExtremeSignalAppCS.Controls
                                 if (block is Paragraph p) p.Background = Brushes.Transparent;
                             }
                             para.Background = new SolidColorBrush(Color.FromArgb(80, 255, 255, 255));
-                            _parentApp?.FocusChartOnTime(evt.EstablishedTime);
+                            _parentApp?.FocusChartOnTime(evt.EstablishedTime, evt.EstablishedPrice);
                         }
                         e.Handled = true;
                     };

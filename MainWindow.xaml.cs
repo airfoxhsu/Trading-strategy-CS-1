@@ -208,6 +208,69 @@ namespace ExtremeSignalAppCS
             klineChart.Reset();
         }
 
+        private void Window_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (!_isInitialized) return;
+
+            // 基準寬度為 1300，計算縮放比例
+            double scale = Math.Max(0.5, this.ActualWidth / 1300.0);
+            double newFontSize = 13.0 * scale;
+
+            // 1. 主表單日誌裡的內容
+            txtOutput.FontSize = newFontSize;
+
+            // 2. 未破分 K 棒停損監控表單裡的內容
+            wndUnbrokenK.txtDisplay.FontSize = newFontSize;
+
+            // 3. 趨勢方向表單的內容
+            wndUnbrokenK.txtTrendHistory.FontSize = newFontSize;
+
+            // 4. K 線表格的內容
+            dgKline.FontSize = newFontSize;
+
+            // 5. 極值觀測表的內容
+            dgObserver.FontSize = newFontSize;
+
+            // 6. 大臺內外盤，以及小臺內外盤，再加上最高價與最低價的 label的內容
+            lblSpeedTxf.FontSize = newFontSize;
+            lblSpeedMxf.FontSize = newFontSize;
+            tbPriceInfo.FontSize = newFontSize;
+
+            // 7. 補充：共識與速差與成交價
+            lblConsensusDir.FontSize = newFontSize;
+            lblTxfNetSpeed.FontSize = newFontSize;
+            lblMxfNetSpeed.FontSize = newFontSize;
+            lblLivePrice.FontSize = newFontSize;
+
+            // 8. 補充：未破分 K 監控的標題條
+            wndUnbrokenK.lblTitle.FontSize = newFontSize;
+            wndUnbrokenK.lblSummaryShort.FontSize = newFontSize;
+            wndUnbrokenK.lblSummaryLong.FontSize = newFontSize;
+
+            // 9. 補充：最底部觀察參數列
+            foreach (System.Windows.UIElement child in spBottomBar.Children)
+            {
+                if (child is System.Windows.Controls.Control c)
+                {
+                    c.FontSize = newFontSize;
+                    
+                    if (c is System.Windows.Controls.ComboBox cbo)
+                    {
+                        if (cbo.Name == "cboObsN") cbo.Width = 55.0 * scale;
+                        else if (cbo.Name == "cboObsHigh" || cbo.Name == "cboObsLow") cbo.Width = 70.0 * scale;
+                    }
+                    else if (c is System.Windows.Controls.TextBox txt)
+                    {
+                        if (txt.Name == "txtObsHigh" || txt.Name == "txtObsLow") txt.Width = 60.0 * scale;
+                    }
+                }
+                else if (child is System.Windows.Controls.TextBlock tb)
+                {
+                    tb.FontSize = newFontSize;
+                }
+            }
+        }
+
         // ==================== 0. 設定載入 ====================
 
         private void LoadConfig()
@@ -654,17 +717,17 @@ namespace ExtremeSignalAppCS
 
         private async Task AnalysisWorkerLoopAsync(CancellationToken token)
         {
-            var waitHandle = new AutoResetEvent(false);
+            // 將 CancellationToken 的 WaitHandle 與 _analysisEvent 組合，實現真正的零 CPU 阻塞等待
+            var handles = new WaitHandle[] { _analysisEvent, token.WaitHandle };
 
             while (!token.IsCancellationRequested)
             {
-                // 等待 Tick 行情通知，或 1 秒自動超時
-                bool triggered = await Task.Run(() => _analysisEvent.WaitOne(1000), token);
-                if (token.IsCancellationRequested) break;
-                if (!triggered) continue;
+                // 真正的零 CPU 阻塞：沒有 Tick 行情就完全不消耗，從根本消滅每秒 1 次的空轉唤醒
+                int which = WaitHandle.WaitAny(handles);
+                if (token.IsCancellationRequested || which == 1) break;
 
                 // 150ms 節流 Debounce (與原版 ANALYSIS_DEBOUNCE_SEC = 0.15 秒一致)
-                await Task.Delay(150, token);
+                try { await Task.Delay(150, token); } catch (OperationCanceledException) { break; }
                 _analysisEvent.Reset(); // 清除 Debounce 期間的殘餘訊號
 
                 try
@@ -1209,15 +1272,7 @@ namespace ExtremeSignalAppCS
             var tgMsgs = (List<string>)result["telegram_messages"];
             foreach (var msg in tgMsgs)
             {
-                if (chkTelegram.IsChecked == true)
-                {
-                    AppendLog($"\n>>>> 觸發推播: {msg.Replace('\n', ' ')}");
-                    _tgService.PushMessage(msg);
-                }
-                else
-                {
-                    AppendLog($"\n>>>> 觸發 (未啟用TG): {msg.Replace('\n', ' ')}");
-                }
+                PushTelegramMessage(msg);
             }
 
             // 4. 刷新 K線與圖表 (O(1) / O(N) 零 CPU 聚合開銷)
@@ -1231,6 +1286,29 @@ namespace ExtremeSignalAppCS
 
             // 6. 更新底部狀態計數面板
             RefreshInfoPanel();
+
+            // 7. 標記未破停損監控有新資料需重算 (事件驅動取代無條件輪詢)
+            wndUnbrokenK.MarkDirty();
+        }
+
+        public void PushTelegramMessage(string msg)
+        {
+            // 確保必須在 UI 執行緒執行 (因讀取 chkTelegram.IsChecked)
+            if (!Dispatcher.CheckAccess())
+            {
+                Dispatcher.BeginInvoke(new Action(() => PushTelegramMessage(msg)));
+                return;
+            }
+
+            if (chkTelegram.IsChecked == true)
+            {
+                AppendLog($"\n>>>> 觸發推播: {msg.Replace('\n', ' ')}");
+                _tgService.PushMessage(msg);
+            }
+            else
+            {
+                AppendLog($"\n>>>> 觸發 (未啟用TG): {msg.Replace('\n', ' ')}");
+            }
         }
 
         public void ClearChartCrosshair()
@@ -1238,7 +1316,7 @@ namespace ExtremeSignalAppCS
             klineChart.ClearCrosshair();
         }
 
-        public void FocusChartOnTime(string timeStr)
+        public void FocusChartOnTime(string timeStr, int? price = null)
         {
             if (_klineCollection == null || _klineCollection.Count == 0 || string.IsNullOrEmpty(timeStr)) return;
 
@@ -1267,7 +1345,7 @@ namespace ExtremeSignalAppCS
                             
                             if (inRange)
                             {
-                                klineChart.FocusCandle(i);
+                                klineChart.FocusCandle(i, price);
                                 return;
                             }
                         }
@@ -1298,7 +1376,6 @@ namespace ExtremeSignalAppCS
                     _klineCollection[i].BreakLow = klineData[i].BreakLow;
                     _klineCollection[i].Tag = klineData[i].Tag;
                 }
-                dgKline.Items.Refresh();
             }
             else if (newLen > oldLen)
             {
@@ -1318,7 +1395,6 @@ namespace ExtremeSignalAppCS
                 {
                     _klineCollection.Add(klineData[i]);
                 }
-                dgKline.Items.Refresh();
             }
             else
             {
@@ -1379,7 +1455,6 @@ namespace ExtremeSignalAppCS
                     _obsCollection[i].IsBroken = simulationResults[i].IsBroken;
                     _obsCollection[i].StopLossPrice = simulationResults[i].StopLossPrice;
                 }
-                dgObserver.Items.Refresh();
             }
             else if (newLen > oldLen)
             {
@@ -1494,7 +1569,6 @@ namespace ExtremeSignalAppCS
                 }
             }
 
-            dgKline.Items.Refresh();
         }
 
         private void RefreshInfoPanel()

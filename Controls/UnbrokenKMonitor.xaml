@@ -21,7 +21,7 @@
 
         <!-- 標題 -->
         <Border Grid.Row="0" BorderBrush="{StaticResource WidgetBorderBrush}" BorderThickness="0,0,0,1" Padding="6,4">
-            <TextBlock x:Name="lblTitle" Text="🛡️ 未破分 K 停損監控" Foreground="{StaticResource SciFiGreen}" FontWeight="Bold" FontSize="12"/>
+            <TextBlock x:Name="lblTitle" Text="🛡️ 未破分 K 停損監控" Foreground="{StaticResource SciFiGreen}" FontWeight="Bold" FontSize="12" HorizontalAlignment="Center"/>
         </Border>
 
         <!-- 統計顯示條 -->

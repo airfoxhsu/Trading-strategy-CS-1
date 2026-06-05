@@ -9,6 +9,7 @@
         mc:Ignorable="d"
         Title="台指極值訊號自動對比 - WPF 現代高性能 DirectX 32位元版" 
         Height="800" Width="1300"
+        SizeChanged="Window_SizeChanged"
         Background="{StaticResource ExtremeDarkBg}">
     
     <Grid Margin="10">
@@ -132,7 +133,7 @@
                     
                     <!-- 左側資訊標籤們 -->
                     <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                        <TextBlock VerticalAlignment="Center">
+                        <TextBlock x:Name="tbPriceInfo" VerticalAlignment="Center">
                             <Run x:Name="runMaxInfo" Text="最高價: -- (--)" Foreground="#EB4B4B" FontWeight="Bold"/>
                             <Run Text=" | " Foreground="{StaticResource TextMuted}"/>
                             <Run x:Name="runMinInfo" Text="最低價: -- (--)" Foreground="#28A745" FontWeight="Bold"/>
@@ -142,7 +143,7 @@
                         <TextBlock x:Name="lblConsensusDir" Text="| 共識: --" Foreground="Gray" FontWeight="Bold" Margin="12,0,0,0" VerticalAlignment="Center"/>
                         <TextBlock x:Name="lblTxfNetSpeed" Text="| 大臺速差: --" Foreground="Gray" FontWeight="Bold" Margin="12,0,0,0" VerticalAlignment="Center"/>
                         <TextBlock x:Name="lblMxfNetSpeed" Text="| 小臺速差: --" Foreground="Gray" FontWeight="Bold" Margin="12,0,0,0" VerticalAlignment="Center"/>
-                        <TextBlock x:Name="lblLivePrice" Text="| 價: --" Foreground="#00A2ED" FontWeight="Bold" Margin="12,0,0,0" VerticalAlignment="Center"/>
+                        <TextBlock x:Name="lblLivePrice" Text="| 成交價: --" Foreground="#00A2ED" FontWeight="Bold" Margin="12,0,0,0" VerticalAlignment="Center"/>
                     </StackPanel>
                     
                     <!-- 右側參數設定下拉選單 -->
@@ -316,7 +317,7 @@
         <!-- ==================== 4. 底部觀察參數列 ==================== -->
         <Border Grid.Row="4" BorderBrush="{StaticResource WidgetBorderBrush}" BorderThickness="0,1,0,0" Padding="0,10,0,0" Margin="0,4,0,0">
             <Grid>
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Center">
+                <StackPanel x:Name="spBottomBar" Orientation="Horizontal" HorizontalAlignment="Left" VerticalAlignment="Center">
                     <Label Content="觀察N:" Foreground="White" VerticalAlignment="Center" Margin="0,0,4,0"/>
                     <ComboBox x:Name="cboObsN" Width="55" SelectedIndex="4" SelectionChanged="CboObsN_SelectionChanged">
                         <ComboBoxItem Content="5"/>

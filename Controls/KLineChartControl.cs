@@ -368,6 +368,8 @@ namespace ExtremeSignalAppCS.Controls
         // 狀態快取，防止 UpdateCandles 時強制蓋掉十字游標所指的 K 棒
         private bool _isMouseInChart;
         private int _lastHoverIndex = -1;
+        private bool _isLockedCrosshair;
+        private double _lockedCrosshairPrice;
 
         public KLineChartControl()
         {
@@ -538,6 +540,13 @@ namespace ExtremeSignalAppCS.Controls
                 _painter.SetData(_candles, _minX, _maxX, _minY, _maxY);
             }
 
+            if (_isLockedCrosshair && _lastHoverIndex >= 0 && _lastHoverIndex < _candles.Count)
+            {
+                double newX = _painter.GetCanvasX(_lastHoverIndex, ActualWidth);
+                double newY = _painter.GetCanvasY(_lockedCrosshairPrice, ActualHeight);
+                _crosshair.SetMousePos(new Point(newX, newY));
+            }
+
             // 若滑鼠正停留在畫面上觀察，則保持顯示游標所指的 K 棒資訊，否則更新顯示最新的一根
             if (_isMouseInChart && _lastHoverIndex >= 0 && _lastHoverIndex < _candles.Count)
             {
@@ -620,8 +629,21 @@ namespace ExtremeSignalAppCS.Controls
             _maxY = highest + height * 0.05;
         }
 
+        // 預建 Frozen 畫刷快取，供 ShowKlineInfo 高頻呼叫使用，消滅每次 new SolidColorBrush 的 GC 壓力
+        private static readonly Brush _infoCyanBrush = CreateFrozenBrush(0, 255, 204);
+        private static readonly Brush _infoRedBrush = CreateFrozenBrush(235, 75, 75);
+        private static readonly Brush _infoGreenBrush = CreateFrozenBrush(40, 167, 69);
+
+        private static SolidColorBrush CreateFrozenBrush(byte r, byte g, byte b)
+        {
+            var brush = new SolidColorBrush(Color.FromRgb(r, g, b));
+            brush.Freeze();
+            return brush;
+        }
+
         /// <summary>
         /// 將指定 K棒 資料渲染成 HTML/簡潔文字並呈現在右上角不透明面板上。
+        /// 使用預建 Frozen Brush 快取，避免高頻行情下大量 GC 分配。
         /// </summary>
         private void ShowKlineInfo(int index)
         {
@@ -635,7 +657,7 @@ namespace ExtremeSignalAppCS.Controls
             _infoText.Inlines.Clear();
             
             // 標題 (時間)
-            _infoText.Inlines.Add(new Run($"📊 {c.TimeLabel}\n") { Foreground = new SolidColorBrush(Color.FromRgb(0, 255, 204)), FontWeight = FontWeights.Bold });
+            _infoText.Inlines.Add(new Run($"📊 {c.TimeLabel}\n") { Foreground = _infoCyanBrush, FontWeight = FontWeights.Bold });
             
             // 開盤
             _infoText.Inlines.Add(new Run("開："));
@@ -643,18 +665,18 @@ namespace ExtremeSignalAppCS.Controls
             
             // 最高
             _infoText.Inlines.Add(new Run("高："));
-            _infoText.Inlines.Add(new Run($"{c.High}\n") { FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(235, 75, 75)) });
+            _infoText.Inlines.Add(new Run($"{c.High}\n") { FontWeight = FontWeights.Bold, Foreground = _infoRedBrush });
             
             // 最低
             _infoText.Inlines.Add(new Run("低："));
-            _infoText.Inlines.Add(new Run($"{c.Low}\n") { FontWeight = FontWeights.Bold, Foreground = new SolidColorBrush(Color.FromRgb(40, 167, 69)) });
+            _infoText.Inlines.Add(new Run($"{c.Low}\n") { FontWeight = FontWeights.Bold, Foreground = _infoGreenBrush });
             
             // 收盤
             Brush closeBrush = Brushes.White;
             if (c.Close > c.Open)
-                closeBrush = new SolidColorBrush(Color.FromRgb(235, 75, 75));
+                closeBrush = _infoRedBrush;
             else if (c.Close < c.Open)
-                closeBrush = new SolidColorBrush(Color.FromRgb(40, 167, 69));
+                closeBrush = _infoGreenBrush;
 
             _infoText.Inlines.Add(new Run("收："));
             _infoText.Inlines.Add(new Run($"{c.Close}") { FontWeight = FontWeights.Bold, Foreground = closeBrush });
@@ -713,6 +735,7 @@ namespace ExtremeSignalAppCS.Controls
             // 2. 十字游標物理移動
             _crosshair.SetMousePos(mousePoint);
             _isMouseInChart = true;
+            _isLockedCrosshair = false;
 
             // 3. 計算滑鼠所在的 K棒 index
             double rangeX = _maxX - _minX;
@@ -781,6 +804,13 @@ namespace ExtremeSignalAppCS.Controls
             AutoRangeYForVisibleX();
 
             _painter.SetData(_candles, _minX, _maxX, _minY, _maxY);
+
+            if (_isLockedCrosshair && _lastHoverIndex >= 0 && _lastHoverIndex < _candles.Count)
+            {
+                double newX = _painter.GetCanvasX(_lastHoverIndex, ActualWidth);
+                double newY = _painter.GetCanvasY(_lockedCrosshairPrice, ActualHeight);
+                _crosshair.SetMousePos(new Point(newX, newY));
+            }
         }
 
         /// <summary>
@@ -791,13 +821,14 @@ namespace ExtremeSignalAppCS.Controls
             _painter.ResetCache();
             _candles.Clear();
             _isZoomedOrPanned = false;
+            _isLockedCrosshair = false;
             _infoPanel.Visibility = Visibility.Collapsed;
         }
 
         /// <summary>
         /// 將圖表視界中心平移對焦到指定 K 線，並更新右上角面板與十字游標。
         /// </summary>
-        public void FocusCandle(int index)
+        public void FocusCandle(int index, int? price = null)
         {
             if (_candles == null || index < 0 || index >= _candles.Count) return;
             
@@ -822,9 +853,12 @@ namespace ExtremeSignalAppCS.Controls
             AutoRangeYForVisibleX();
             _painter.SetData(_candles, _minX, _maxX, _minY, _maxY);
 
-            // 同步十字游標到該 K 棒中心
+            // 同步十字游標到該 K 棒中心或指定價格
             double x = _painter.GetCanvasX(index, ActualWidth);
-            double y = _painter.GetCanvasY((_candles[index].Open + _candles[index].Close) / 2.0, ActualHeight);
+            double targetPrice = price ?? (_candles[index].Open + _candles[index].Close) / 2.0;
+            _isLockedCrosshair = true;
+            _lockedCrosshairPrice = targetPrice;
+            double y = _painter.GetCanvasY(targetPrice, ActualHeight);
             _crosshair.SetMousePos(new Point(x, y));
             _lastHoverIndex = index;
             _isMouseInChart = true;
@@ -837,6 +871,7 @@ namespace ExtremeSignalAppCS.Controls
         {
             _crosshair.SetMousePos(null);
             _isMouseInChart = false;
+            _isLockedCrosshair = false;
             if (_candles != null && _candles.Count > 0)
             {
                 ShowKlineInfo(_candles.Count - 1);
