@@ -73,16 +73,17 @@ namespace ExtremeSignalAppCS.Controls
             double x = _mousePos.Value.X;
             double y = _mousePos.Value.Y;
 
-            // 只在 K 線繪圖區畫十字線 (避開左側 Y 軸保留區)
-            double leftMargin = 55.0; // 同步 KLinePainter.LeftMargin
+            // 只在 K 線繪圖區畫十字線 (避開右側 Y 軸與底部 X 軸保留區)
+            double rightMargin = 55.0; // 同步 KLinePainter.RightMargin
+            double bottomMargin = 20.0; // 同步 KLinePainter.BottomMargin
             
             // 建立剪裁區域，禁止游標畫進刻度區
-            drawingContext.PushClip(new RectangleGeometry(new Rect(leftMargin, 0, Math.Max(1.0, w - leftMargin), h)));
+            drawingContext.PushClip(new RectangleGeometry(new Rect(0, 0, Math.Max(1.0, w - rightMargin), Math.Max(1.0, h - bottomMargin))));
             try
             {
                 // 畫十字科幻綠虛線
-                drawingContext.DrawLine(_sciFiPen, new Point(x, 0), new Point(x, h));
-                drawingContext.DrawLine(_sciFiPen, new Point(leftMargin, y), new Point(w, y));
+                drawingContext.DrawLine(_sciFiPen, new Point(x, 0), new Point(x, Math.Max(0, h - bottomMargin)));
+                drawingContext.DrawLine(_sciFiPen, new Point(0, y), new Point(Math.Max(0, w - rightMargin), y));
 
                 // 於交叉點繪製一個實心科技小圓點
                 drawingContext.DrawEllipse(_sciFiBrush, null, new Point(x, y), 3, 3);

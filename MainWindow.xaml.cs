@@ -288,6 +288,8 @@ namespace ExtremeSignalAppCS
                         _tgService.Token = tokenProp.GetString() ?? "";
                     if (root.TryGetProperty("telegram_chat_id", out var chatProp))
                         _tgService.ChatId = chatProp.GetString() ?? "";
+                    
+                    _tgService.IsEnabled = true;
                 }
             }
             catch (Exception ex)
@@ -1063,7 +1065,8 @@ namespace ExtremeSignalAppCS
                             }
                             catch { }
 
-                            string dirText = d.Type == "K低" ? $"做空  {d.DisplayTitle}" : $"做多  {d.DisplayTitle}";
+                            string displayTitle = isContradiction ? d.DisplayTitle.Replace("未達標", "矛盾") : d.DisplayTitle;
+                            string dirText = d.Type == "K低" ? $"做空  {displayTitle}" : $"做多  {displayTitle}";
                             string msgTitle = isContradiction ? "【極值矛盾】" : "【極值達標】";
                             string msg = $"{msgTitle}{symbol} {activeSession}\n" +
                                          $"方向：{dirText}\n" +
@@ -1278,7 +1281,13 @@ namespace ExtremeSignalAppCS
             // 4. 刷新 K線與圖表 (O(1) / O(N) 零 CPU 聚合開銷)
             var klineData = (List<KlineBar>)result["kline_data"];
             UpdateKlineViews(klineData);
-            klineChart.UpdateCandles(klineData);
+            klineChart.UpdateCandles(klineData, currentTickTimeStr: _lastMxfTime);
+
+            // 圖表資料更新完成後，才重新對焦白框（必須在 UpdateCandles 之後）
+            if (_lockedFocusTime != null)
+            {
+                RefocusChartOnTime(_lockedFocusTime, _lockedFocusPrice, false);
+            }
 
             // 5. 差量更新 DataGrid 行情與選取反白保留
             var simulationResults = (List<SimulationResult>)result["simulation_results"];
@@ -1311,45 +1320,155 @@ namespace ExtremeSignalAppCS
             }
         }
 
+        private string? _lockedFocusTime;
+        private int? _lockedFocusPrice;
+        private double _lockedFocusRelativePos = 1.0;
+        private int _lockedFocusDirection = 0; // 1=多方, -1=空方, 0=無
+
         public void ClearChartCrosshair()
         {
+            _lockedFocusTime = null;
+            _lockedFocusPrice = null;
+            _lockedFocusRelativePos = 1.0;
+            _lockedFocusDirection = 0;
             klineChart.ClearCrosshair();
         }
 
-        public void FocusChartOnTime(string timeStr, int? price = null)
+        /// <summary>
+        /// 將圖表對焦到指定時間的 K 棒，並繪製停損黃線。
+        /// </summary>
+        /// <param name="timeStr">事件時間字串 (HH:MM:SS)</param>
+        /// <param name="price">事件價格 (白色橫線)</param>
+        /// <param name="direction">趨勢方向：1=多方, -1=空方, 0=無</param>
+        public void FocusChartOnTime(string timeStr, int? price = null, int direction = 0)
+        {
+            _lockedFocusTime = timeStr;
+            _lockedFocusPrice = price;
+            _lockedFocusDirection = direction;
+            RefocusChartOnTime(timeStr, price, true);
+        }
+
+        private void RefocusChartOnTime(string timeStr, int? price = null, bool snapView = true)
         {
             if (_klineCollection == null || _klineCollection.Count == 0 || string.IsNullOrEmpty(timeStr)) return;
 
-            string cleanTime = timeStr.Replace(":", "");
-            if (cleanTime.Length >= 4 && int.TryParse(cleanTime[..4], out int hmVal))
-            {
-                int targetMins = (hmVal / 100) * 60 + (hmVal % 100);
+            // 先清除舊的高亮，避免切換層級時若找不到匹配時間，會殘留舊的隨機 Index
+            klineChart.ClearHighlightOnly();
 
-                for (int i = 0; i < _klineCollection.Count; i++)
+            // 解析事件時間為「總秒數」（支援 HH:MM:SS 或 HHMMSS 格式）
+            string cleanTime = timeStr.Replace(":", "");
+            if (cleanTime.Length < 4) return;
+
+            int targetSecs;
+            if (cleanTime.Length >= 6 && int.TryParse(cleanTime[..6], out int hmsVal))
+            {
+                // 有秒數：HHMMSS
+                int h = hmsVal / 10000;
+                int m = (hmsVal / 100) % 100;
+                int s = hmsVal % 100;
+                targetSecs = h * 3600 + m * 60 + s;
+            }
+            else if (int.TryParse(cleanTime[..4], out int hmVal))
+            {
+                // 無秒數：HHMM（秒數視為 00）
+                targetSecs = (hmVal / 100) * 3600 + (hmVal % 100) * 60;
+            }
+            else
+            {
+                return;
+            }
+
+            List<int> matchedIndices = new List<int>();
+
+            // 收集所有符合時間的 K 棒索引
+            // K 棒的 TimeLabel 格式為 "HH:MM~HH:MM"，轉為秒數後以 [startSecs, endSecs) 半開區間判定
+            for (int i = 0; i < _klineCollection.Count; i++)
+            {
+                var parts = _klineCollection[i].TimeLabel.Split('~');
+                if (parts.Length == 2)
                 {
-                    var parts = _klineCollection[i].TimeLabel.Split('~');
-                    if (parts.Length == 2)
+                    var p0 = parts[0].Split(':');
+                    var p1 = parts[1].Split(':');
+                    if (p0.Length == 2 && p1.Length == 2 && 
+                        int.TryParse(p0[0], out int sH) && int.TryParse(p0[1], out int sM) &&
+                        int.TryParse(p1[0], out int eH) && int.TryParse(p1[1], out int eM))
                     {
-                        var p0 = parts[0].Split(':');
-                        var p1 = parts[1].Split(':');
-                        if (p0.Length == 2 && p1.Length == 2 && 
-                            int.TryParse(p0[0], out int sH) && int.TryParse(p0[1], out int sM) &&
-                            int.TryParse(p1[0], out int eH) && int.TryParse(p1[1], out int eM))
+                        int startSecs = sH * 3600 + sM * 60;
+                        int endSecs = eH * 3600 + eM * 60;
+                        
+                        // 半開區間 [start, end)：事件時間必須 >= 起始秒 且 < 結束秒
+                        bool inRange = (startSecs <= endSecs)
+                            ? (targetSecs >= startSecs && targetSecs < endSecs)
+                            : (targetSecs >= startSecs || targetSecs < endSecs);
+                        
+                        if (inRange)
                         {
-                            int startMins = sH * 60 + sM;
-                            int endMins = eH * 60 + eM;
-                            
-                            bool inRange = (startMins <= endMins) 
-                                ? (targetMins >= startMins && targetMins < endMins)
-                                : (targetMins >= startMins || targetMins < endMins);
-                            
-                            if (inRange)
-                            {
-                                klineChart.FocusCandle(i, price);
-                                return;
-                            }
+                            matchedIndices.Add(i);
                         }
                     }
+                }
+            }
+
+            if (matchedIndices.Count > 0)
+            {
+                // 從所有匹配的 K 棒中，找出相對位置與上次最接近的那根
+                // 這確保了在切換時間週期時，即使陣列長度改變，依然會精準對齊同一天的同一根 K 棒
+                int bestIndex = matchedIndices[^1]; // 預設拿最後一筆
+                double minDiff = double.MaxValue;
+                
+                foreach (int idx in matchedIndices)
+                {
+                    double relPos = (double)idx / _klineCollection.Count;
+                    double diff = Math.Abs(relPos - _lockedFocusRelativePos);
+                    if (diff < minDiff)
+                    {
+                        minDiff = diff;
+                        bestIndex = idx;
+                    }
+                }
+
+                // 記錄新的相對位置供下次切換使用
+                _lockedFocusRelativePos = (double)bestIndex / _klineCollection.Count;
+
+                if (snapView)
+                    klineChart.FocusCandle(bestIndex, price);
+                else
+                    klineChart.SetHighlightIndexOnly(bestIndex, price);
+
+                // 計算停損價：比較當時 K 棒與前一根 K 棒，若無上一根則以當時 K 棒為準
+                if (_lockedFocusDirection != 0 && bestIndex >= 0)
+                {
+                    var currBar = klineChart.GetCandle(bestIndex);
+                    
+                    if (currBar != null)
+                    {
+                        double stopLoss;
+                        if (bestIndex >= 1)
+                        {
+                            var prevBar = klineChart.GetCandle(bestIndex - 1);
+                            if (prevBar != null)
+                            {
+                                if (_lockedFocusDirection == 1)
+                                    stopLoss = Math.Min(currBar.Low, prevBar.Low);
+                                else
+                                    stopLoss = Math.Max(currBar.High, prevBar.High);
+                            }
+                            else
+                            {
+                                stopLoss = _lockedFocusDirection == 1 ? currBar.Low : currBar.High;
+                            }
+                        }
+                        else
+                        {
+                            // 第 0 根，沒有上一根
+                            stopLoss = _lockedFocusDirection == 1 ? currBar.Low : currBar.High;
+                        }
+                        klineChart.SetStopLossPrice(stopLoss, _lockedFocusDirection);
+                    }
+                }
+                else
+                {
+                    klineChart.SetStopLossPrice(null, 0);
                 }
             }
         }
@@ -1431,6 +1550,7 @@ namespace ExtremeSignalAppCS
                     AppendLog($"【自動觀察】分 K 轉換！已自動載入前分 K 最高: {prevHigh} / 最低: {prevLow}。");
                 }
             }
+
         }
 
         private void UpdateObserverViews(List<SimulationResult> simulationResults)
@@ -1482,9 +1602,12 @@ namespace ExtremeSignalAppCS
                 foreach (var o in simulationResults) _obsCollection.Add(o);
             }
 
-            if (dgObserver.SelectedIndex == -1 && _obsCollection.Count > 0)
+            if (_obsCollection.Count > 0)
             {
-                dgObserver.ScrollIntoView(_obsCollection[^1]);
+                if (newLen > oldLen || dgObserver.SelectedIndex == -1)
+                {
+                    dgObserver.ScrollIntoView(_obsCollection[^1]);
+                }
             }
 
             ApplyObserverHighlightsToKline();
@@ -1757,6 +1880,12 @@ namespace ExtremeSignalAppCS
             {
                 UpdateKlineViews(allOfflineKlineData);
                 klineChart.UpdateCandles(allOfflineKlineData);
+
+                // 圖表資料更新完成後，才重新對焦白框
+                if (_lockedFocusTime != null)
+                {
+                    RefocusChartOnTime(_lockedFocusTime, _lockedFocusPrice, false);
+                }
             }
 
             lblStatus.Content = $"更新完成 | {GetQuantReportStatus()}";
@@ -1887,6 +2016,12 @@ namespace ExtremeSignalAppCS
             {
                 UpdateKlineViews(allOfflineKlineData);
                 klineChart.UpdateCandles(allOfflineKlineData);
+
+                // 圖表資料更新完成後，才重新對焦白框
+                if (_lockedFocusTime != null)
+                {
+                    RefocusChartOnTime(_lockedFocusTime, _lockedFocusPrice, false);
+                }
             }
 
             // 觸發未破停損監控重新計算
