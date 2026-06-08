@@ -25,6 +25,8 @@ public partial class App : System.Windows.Application
             // 確保只針對本專案的執行檔進行清理，避免誤殺 dotnet.exe 或除錯器
             if (procName.Contains("ExtremeSignalAppCS", StringComparison.OrdinalIgnoreCase))
             {
+                string currentFilePath = current.MainModule?.FileName ?? string.Empty;
+
                 var running = Process.GetProcessesByName(procName)
                                      .Where(p => p.Id != current.Id);
                 
@@ -32,12 +34,16 @@ public partial class App : System.Windows.Application
                 {
                     try
                     {
-                        p.Kill();
-                        p.WaitForExit(300); // 縮短等待時間，快速通過
+                        // 確保只有相同資料夾下的同名程式，才會被視為殭屍程序殺死
+                        if (!string.IsNullOrEmpty(currentFilePath) && p.MainModule?.FileName == currentFilePath)
+                        {
+                            p.Kill();
+                            p.WaitForExit(300); // 縮短等待時間，快速通過
+                        }
                     }
                     catch
                     {
-                        // 忽略權限等異常
+                        // 忽略權限存取（例如存取 MainModule 被拒）等異常
                     }
                 }
             }

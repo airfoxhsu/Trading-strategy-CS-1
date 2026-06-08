@@ -88,6 +88,7 @@ namespace ExtremeSignalAppCS
         private List<TradeTick> _allParsedTicks = [];
         private bool _isReplaying;
         private bool _isPreloading; // 預載今日歷史 Tick 標記，在此期間暫停 Tick 的背景計算
+        private bool _isRecovering; // 標記網路中斷重新連線後的歷史行情回補，避免重發推播
         private bool _wasPlayingBeforeDrag;
 
         // 快取與狀態變數
@@ -339,6 +340,7 @@ namespace ExtremeSignalAppCS
                 _rtLastNetSpeedsBot["TXF"] = null;
                 _rtLastNetSpeedsBot["MXF"] = null;
                 _rtLastMatchQty.Clear();
+                _isRecovering = true;
             }
 
             try
@@ -784,6 +786,13 @@ namespace ExtremeSignalAppCS
             var telegramMessages = new List<string>();
             int nTicks = _engine.AbsNTicks;
 
+            bool isRecovering;
+            lock (_rtLock)
+            {
+                isRecovering = _isRecovering;
+                if (_isRecovering) _isRecovering = false;
+            }
+
             foreach (var symbol in new[] { "TXF", "MXF" })
             {
                 var trades = tradesSnapshot[symbol];
@@ -1076,7 +1085,11 @@ namespace ExtremeSignalAppCS
                                          $"觸發價：{d.TrigPrice}\n" +
                                          $"進場/停損：{zoneStr}\n" +
                                          $"當下振幅：{d.AmpVal}";
-                            telegramMessages.Add(msg);
+                            
+                            if (!isRecovering)
+                            {
+                                telegramMessages.Add(msg);
+                            }
                         }
                     }
                 }
@@ -1220,6 +1233,8 @@ namespace ExtremeSignalAppCS
             };
         }
 
+        private string _latestTriggerLog = "";
+
         // ==================== 4. 主執行緒 UI 渲染與著色 (ApplyRealtimeAnalysisUI) ====================
 
         private void ApplyRealtimeAnalysisUI(Dictionary<string, object> result)
@@ -1242,7 +1257,14 @@ namespace ExtremeSignalAppCS
             lblMxfNetSpeed.Text = snap["net_mxf_str"];
             SetWidgetStyleLazy(lblMxfNetSpeed, snap["net_mxf_color"]);
 
-            // 2. 智慧操作感知型降頻節流 (Interaction-Aware Throttle) 著色排版
+            // 2. TG 推播發送 (先處理以更新最新觸發狀態)
+            var tgMsgs = (List<string>)result["telegram_messages"];
+            foreach (var msg in tgMsgs)
+            {
+                PushTelegramMessage(msg);
+            }
+
+            // 3. 智慧操作感知型降頻節流 (Interaction-Aware Throttle) 著色排版
             if (result.TryGetValue("realtime_extreme_report", out var reportObj) && reportObj is string rtReport && !string.IsNullOrEmpty(rtReport))
             {
                 if (!App.Current.Resources.Contains("_system_logs"))
@@ -1259,7 +1281,8 @@ namespace ExtremeSignalAppCS
                 var telegramMessages = (List<string>)result["telegram_messages"];
 
                 string logsStr = string.Join("\n", systemLogs);
-                string fullContent = "═══ 系統即時監控日誌 ═══\n" + logsStr + "\n\n" + rtReport;
+                string tgInfo = string.IsNullOrEmpty(_latestTriggerLog) ? "" : _latestTriggerLog + "\n\n";
+                string fullContent = "═══ 系統即時監控日誌 ═══\n" + logsStr + "\n\n" + tgInfo + rtReport;
 
                 if (fullContent != _lastRenderedContent && (nowMs - _lastTxtRenderTime >= renderInterval || telegramMessages.Count > 0))
                 {
@@ -1269,13 +1292,6 @@ namespace ExtremeSignalAppCS
                     // O(1) 零開銷增量染色插入
                     LogHighlighter.AppendLog(txtOutput, fullContent, clear: true);
                 }
-            }
-
-            // 3. TG 推播發送
-            var tgMsgs = (List<string>)result["telegram_messages"];
-            foreach (var msg in tgMsgs)
-            {
-                PushTelegramMessage(msg);
             }
 
             // 4. 刷新 K線與圖表 (O(1) / O(N) 零 CPU 聚合開銷)
@@ -1309,14 +1325,15 @@ namespace ExtremeSignalAppCS
                 return;
             }
 
+            string cleanMsg = msg.Replace('\n', ' ');
             if (chkTelegram.IsChecked == true)
             {
-                AppendLog($"\n>>>> 觸發推播: {msg.Replace('\n', ' ')}");
+                _latestTriggerLog = $">>>> 最新觸發推播: {cleanMsg}";
                 _tgService.PushMessage(msg);
             }
             else
             {
-                AppendLog($"\n>>>> 觸發 (未啟用TG): {msg.Replace('\n', ' ')}");
+                _latestTriggerLog = ""; // 未啟用 TG 時不再顯示
             }
         }
 
@@ -2485,28 +2502,36 @@ namespace ExtremeSignalAppCS
                 mxfN = netM.HasValue ? $"{netM.Value:+0.0000;-0.0000;+0.0000}s" : "--";
             }
 
-            static string FmtPad(string text, int width)
+            static string FmtPadLeft(string text, int width)
             {
+                if (text == null) text = "";
                 int actualW = text.Sum(c => c > 127 ? 2 : 1);
                 return text + new string(' ', Math.Max(0, width - actualW));
             }
 
-            string hType = FmtPad("類型", 22);
-            string hZone = FmtPad("進場區/停損", 23);
-            string hATime = FmtPad("A點時間", 15);
-            string hAPri = FmtPad("A點價", 8);
-            string hBTime = FmtPad("B點時間", 15);
-            string hTrig = FmtPad("觸發價", 8);
-            string hPre = FmtPad("前向平均", 12);
-            string hPost = FmtPad("後向平均", 12);
-            string hAmp = FmtPad("當時振幅", 8);
+            static string FmtPadRight(string text, int width)
+            {
+                if (text == null) text = "";
+                int actualW = text.Sum(c => c > 127 ? 2 : 1);
+                return new string(' ', Math.Max(0, width - actualW)) + text;
+            }
 
-            string header = $"{hType} | {hZone} | {hATime} | {hAPri} | {hBTime} | {hTrig} | {hPre} | {hPost} | {hAmp}";
-            string sep = "    " + new string('-', 142);
+            string hType = FmtPadLeft("類型", 22);
+            string hZone = FmtPadLeft("進場區/停損", 24);
+            string hATime = FmtPadLeft("A點時間", 9);
+            string hAPri = FmtPadLeft("A點價", 6);
+            string hBTime = FmtPadLeft("B點時間", 9);
+            string hTrig = FmtPadLeft("觸發價", 6);
+            string hPre = FmtPadLeft("前向平均", 8);
+            string hPost = FmtPadLeft("後向平均", 8);
+            string hAmp = FmtPadLeft("振幅", 5);
+
+            string header = $"{hType}|{hZone}|{hATime}|{hAPri} |{hBTime}|{hTrig} |{hPre}|{hPost} | {hAmp}";
+            string sep = "    " + new string('-', header.Sum(c => c > 127 ? 2 : 1));
 
             var sb = new StringBuilder();
             sb.AppendLine($"\n    [{symbol} 即時極值詳情 (平均每筆間隔)]  最新價: {finalClose}");
-            sb.AppendLine($"    ● 成交速度: 外盤(買) {outerS} | 內盤(賣) {innerS} → {dStr} | 大台速差: {txfN,-15} 小台速差: {mxfN,-15} | 均價:{avgPri}");
+            sb.AppendLine($"    ● 成交速度: {dStr} | 大台速差: {txfN,-15} 小台速差: {mxfN,-15} | 均價:{avgPri}");
             sb.AppendLine($"    {header}");
             sb.AppendLine(sep);
 
@@ -2523,9 +2548,22 @@ namespace ExtremeSignalAppCS
                 lastAbsType = currentType;
 
                 string bTimeVal = d.TrigTime;
+                if (!string.IsNullOrEmpty(bTimeVal))
+                {
+                    var c = bTimeVal.Replace(":", "");
+                    if (c.Length >= 6) bTimeVal = $"{c.Substring(0, 2)}:{c.Substring(2, 2)}:{c.Substring(4, 2)}";
+                }
+
+                string aTimeVal = d.BestATime;
+                if (!string.IsNullOrEmpty(aTimeVal))
+                {
+                    var c = aTimeVal.Replace(":", "");
+                    if (c.Length >= 6) aTimeVal = $"{c.Substring(0, 2)}:{c.Substring(2, 2)}:{c.Substring(4, 2)}";
+                }
+
                 string bPriVal = d.TrigPrice;
-                string preS = d.Pre.PadLeft(12);
-                string postS = d.Post.PadLeft(12);
+                string preS = FmtPadRight(d.Pre, 8);
+                string postS = FmtPadRight(d.Post, 8);
 
                 string side = currentType == "最高" ? "top" : "bottom";
                 string speedInfo = d.Tags.FirstOrDefault() ?? "";
@@ -2596,7 +2634,7 @@ namespace ExtremeSignalAppCS
                     catch { }
                 }
 
-                sb.AppendLine($"    {FmtPad(displayTypeStr, 22)} | {FmtPad(zoneStr, 23)} | {FmtPad(d.BestATime, 15)} | {FmtPad(d.BestAPrice.ToString(), 8)} | {FmtPad(bTimeVal, 15)} | {FmtPad(bPriVal, 8)} | {preS} | {postS} | {d.AmpVal,8}");
+                sb.AppendLine($"    {FmtPadLeft(displayTypeStr, 22)}|{FmtPadLeft(zoneStr, 24)}|{FmtPadRight(aTimeVal, 9)}|{FmtPadRight(d.BestAPrice.ToString(), 6)}|{FmtPadRight(bTimeVal, 9)}|{FmtPadRight(bPriVal, 6)}|{preS}|{postS}|{d.AmpVal,5}");
                 if (!string.IsNullOrEmpty(speedInfo))
                 {
                     sb.AppendLine($"    {speedInfo.Trim()}");

@@ -504,27 +504,42 @@ namespace ExtremeSignalAppCS.Controls
             // --- 趨勢方向表單邏輯 ---
             if (newHistory != null && newDir != null)
             {
-                int oldDir = _trendDirection;
-                _trendDirection = newDir.Value;
-                _trendHistory.Clear();
-                _trendHistory.AddRange(newHistory);
-
-                if (oldDir != _trendDirection && _trendDirection != 0 && newHistory.Count > 0)
+                // 防止舊的背景計算快照覆蓋了 UI 執行緒的樂觀更新
+                bool isStale = false;
+                if (_trendHistory.Count > 0 && newHistory.Count > 0)
                 {
-                    var evt = newHistory[^1];
-                    string dirStr = _trendDirection == 1 ? "多方 📈" : "空方 📉";
-                    string op = _trendDirection == 1 ? (evt.LongCount > evt.ShortCount ? ">" : "=") : (evt.ShortCount > evt.LongCount ? ">" : "=");
-                    string statusStr = _trendDirection == 1
-                        ? $"做多 {evt.LongCount} 項 {op} 做空 {evt.ShortCount} 項"
-                        : $"做空 {evt.ShortCount} 項 {op} 做多 {evt.LongCount} 項";
-                    string cpStr = evt.EstablishedPrice.HasValue ? evt.EstablishedPrice.Value.ToString() : "--";
-                    string msgTitle = oldDir == 0 ? "【趨勢確立】" : "【趨勢轉向】";
-                    string msg = $"{msgTitle}{dirStr}\n" +
-                                 $"時間：{evt.EstablishedTime}\n" +
-                                 $"觸發價位：{cpStr}\n" +
-                                 $"未破狀態：{statusStr}";
-                    
-                    _parentApp?.PushTelegramMessage(msg);
+                    double currentLatest = ParseTimeStr(_trendHistory[^1].EstablishedTime);
+                    double incomingLatest = ParseTimeStr(newHistory[^1].EstablishedTime);
+                    if (incomingLatest < currentLatest)
+                    {
+                        isStale = true;
+                    }
+                }
+
+                if (!isStale)
+                {
+                    int oldDir = _trendDirection;
+                    _trendDirection = newDir.Value;
+                    _trendHistory.Clear();
+                    _trendHistory.AddRange(newHistory);
+
+                    if (oldDir != _trendDirection && _trendDirection != 0 && newHistory.Count > 0)
+                    {
+                        var evt = newHistory[^1];
+                        string dirStr = _trendDirection == 1 ? "多方 📈" : "空方 📉";
+                        string op = _trendDirection == 1 ? (evt.LongCount > evt.ShortCount ? ">" : "=") : (evt.ShortCount > evt.LongCount ? ">" : "=");
+                        string statusStr = _trendDirection == 1
+                            ? $"做多 {evt.LongCount} 項 {op} 做空 {evt.ShortCount} 項"
+                            : $"做空 {evt.ShortCount} 項 {op} 做多 {evt.LongCount} 項";
+                        string cpStr = evt.EstablishedPrice.HasValue ? evt.EstablishedPrice.Value.ToString() : "--";
+                        string msgTitle = oldDir == 0 ? "【趨勢確立】" : "【趨勢轉向】";
+                        string msg = $"{msgTitle}{dirStr}\n" +
+                                     $"時間：{evt.EstablishedTime}\n" +
+                                     $"觸發價位：{cpStr}\n" +
+                                     $"未破狀態：{statusStr}";
+                        
+                        _parentApp?.PushTelegramMessage(msg);
+                    }
                 }
             }
             else

@@ -1414,7 +1414,7 @@ namespace ExtremeSignalAppCS.Services
             netSpeedsDisp[baseSym] = FormatNet(baseSym, baseNet);
             netSpeedsDisp[otherSym] = FormatNet(otherSym, otherNet);
 
-            return $"    成交速度: 外盤(買) {oS} | 內盤(賣) {iS} → {dStr} | 大台速差: {netSpeedsDisp["TXF"]}  小台速差: {netSpeedsDisp["MXF"]} | 均價:{avgPri}";
+            return $"    成交速度: {dStr} | 大台速差: {netSpeedsDisp["TXF"]}  小台速差: {netSpeedsDisp["MXF"]} | 均價:{avgPri}";
         }
 
         /// <summary>
