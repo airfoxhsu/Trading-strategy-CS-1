@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Windows.Controls;
 using System.Windows.Documents;
 using System.Windows.Media;
@@ -31,8 +33,52 @@ namespace ExtremeSignalAppCS.Helper
             return null;
         }
 
+        private static Paragraph CreateLineParagraph(string line)
+        {
+            var p = new Paragraph { Margin = new System.Windows.Thickness(0, 2, 0, 2) };
+            
+            if (string.IsNullOrEmpty(line))
+            {
+                p.Inlines.Add(new Run(""));
+                return p;
+            }
+
+            var run = new Run(line);
+
+            // 💡 100% 遵守規則：若包含 "未達標" 則保持白/預設色，不染任何色
+            if (line.Contains("未達標"))
+            {
+                run.Foreground = DefaultBrush;
+            }
+            else if (line.Contains("最高") || line.Contains("K低"))
+            {
+                run.Foreground = DownBrush; // Python 做空/綠色高亮 (買賣相反：最高/K低為做空->綠)
+                run.FontWeight = System.Windows.FontWeights.Bold;
+            }
+            else if (line.Contains("最低") || line.Contains("K高"))
+            {
+                run.Foreground = UpBrush;   // Python 做多/紅色高亮 (最低/K高為做多->紅)
+                run.FontWeight = System.Windows.FontWeights.Bold;
+            }
+            else if (line.Contains("共識推播") || line.Contains("觸發推播") || 
+                     line.Contains("行情狀態") || line.Contains("預載") ||
+                     line.Contains("系統"))
+            {
+                run.Foreground = SystemBrush; // 青色高亮
+                run.FontWeight = System.Windows.FontWeights.Bold;
+            }
+            else
+            {
+                run.Foreground = DefaultBrush;
+            }
+
+            p.Inlines.Add(run);
+            return p;
+        }
+
         /// <summary>
         /// 執行緒安全地向 RichTextBox 增量添加一行已被著色的日誌。
+        /// 支援差量更新 (clear=true 時會啟用快取比對)，大幅降低 WPF Measure/Arrange 負擔。
         /// </summary>
         public static void AppendLog(System.Windows.Controls.RichTextBox rtb, string text, bool clear = false, bool forceScrollToEnd = false)
         {
@@ -51,72 +97,77 @@ namespace ExtremeSignalAppCS.Helper
 
             var document = rtb.Document;
 
+            string cleanText = text.TrimEnd('\r', '\n');
+            string[] newLines = string.IsNullOrEmpty(cleanText) ? Array.Empty<string>() : cleanText.Replace("\r", "").Split('\n');
+
             if (clear)
             {
-                document.Blocks.Clear();
-            }
-
-            // 內存防護：限制日誌總行數 (不超過 500 行)，防止 WPF 佈局引擎隨長度線性退化
-            if (document.Blocks.Count > 500)
-            {
-                // 刪除頭部的 200 行
-                for (int i = 0; i < 200; i++)
-                {
-                    if (document.Blocks.FirstBlock != null)
-                    {
-                        document.Blocks.Remove(document.Blocks.FirstBlock);
-                    }
-                }
-            }
-
-            string cleanText = text.TrimEnd('\r', '\n');
-            if (string.IsNullOrEmpty(cleanText)) return;
-
-            string[] lines = cleanText.Replace("\r", "").Split('\n');
-
-            foreach (var line in lines)
-            {
-                var p = new Paragraph { Margin = new System.Windows.Thickness(0, 2, 0, 2) };
+                // ========== 差量更新邏輯 (取代暴力 Blocks.Clear()) ==========
+                int existingCount = document.Blocks.Count;
+                int newCount = newLines.Length;
                 
-                // 如果是空行，只要加入空字串即可
-                if (string.IsNullOrEmpty(line))
+                // 若差距太大或現有行數超過 500 (異常狀態)，直接暴力清空重建比較快
+                if (existingCount > 500 || existingCount == 0 || newCount == 0)
                 {
-                    p.Inlines.Add(new Run(""));
-                    document.Blocks.Add(p);
-                    continue;
-                }
-
-                var run = new Run(line);
-
-                // 💡 100% 遵守規則：若包含 "未達標" 則保持白/預設色，不染任何色
-                if (line.Contains("未達標"))
-                {
-                    run.Foreground = DefaultBrush;
-                }
-                else if (line.Contains("最高") || line.Contains("K低"))
-                {
-                    run.Foreground = DownBrush; // Python 做空/綠色高亮 (買賣相反：最高/K低為做空->綠)
-                    run.FontWeight = System.Windows.FontWeights.Bold;
-                }
-                else if (line.Contains("最低") || line.Contains("K高"))
-                {
-                    run.Foreground = UpBrush;   // Python 做多/紅色高亮 (最低/K高為做多->紅)
-                    run.FontWeight = System.Windows.FontWeights.Bold;
-                }
-                else if (line.Contains("共識推播") || line.Contains("觸發推播") || 
-                         line.Contains("行情狀態") || line.Contains("預載") ||
-                         line.Contains("系統"))
-                {
-                    run.Foreground = SystemBrush; // 青色高亮
-                    run.FontWeight = System.Windows.FontWeights.Bold;
+                    document.Blocks.Clear();
+                    foreach (var line in newLines)
+                    {
+                        document.Blocks.Add(CreateLineParagraph(line));
+                    }
                 }
                 else
                 {
-                    run.Foreground = DefaultBrush;
+                    // 就地修改/新增/刪除 Paragraph
+                    var currentBlocks = document.Blocks.ToList();
+                    
+                    for (int i = 0; i < Math.Max(existingCount, newCount); i++)
+                    {
+                        if (i < newCount && i < existingCount)
+                        {
+                            // 修改既有段落 (避免重建 Paragraph 樹節點)
+                            var p = (Paragraph)currentBlocks[i];
+                            var currentText = new TextRange(p.ContentStart, p.ContentEnd).Text;
+                            // 只有當文字真的改變時才重新賦值 (WPF TextRange 讀出來會有 \r\n，這裡簡單做 StartsWith 判斷)
+                            if (string.IsNullOrEmpty(currentText) || !currentText.StartsWith(newLines[i]))
+                            {
+                                var newP = CreateLineParagraph(newLines[i]);
+                                document.Blocks.InsertBefore(p, newP);
+                                document.Blocks.Remove(p);
+                            }
+                        }
+                        else if (i < newCount && i >= existingCount)
+                        {
+                            // 追加新段落
+                            document.Blocks.Add(CreateLineParagraph(newLines[i]));
+                        }
+                        else if (i >= newCount && i < existingCount)
+                        {
+                            // 刪除多餘段落
+                            document.Blocks.Remove(currentBlocks[i]);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // 內存防護：限制日誌總行數 (不超過 500 行)，防止 WPF 佈局引擎隨長度線性退化
+                if (document.Blocks.Count > 500)
+                {
+                    // 刪除頭部的 200 行
+                    for (int i = 0; i < 200; i++)
+                    {
+                        if (document.Blocks.FirstBlock != null)
+                        {
+                            document.Blocks.Remove(document.Blocks.FirstBlock);
+                        }
+                    }
                 }
 
-                p.Inlines.Add(run);
-                document.Blocks.Add(p);
+                // Append 模式直接追加
+                foreach (var line in newLines)
+                {
+                    document.Blocks.Add(CreateLineParagraph(line));
+                }
             }
 
             // 智慧捲動：只有在原本已經在最底部時，或強制指定時，才跟著往下捲動

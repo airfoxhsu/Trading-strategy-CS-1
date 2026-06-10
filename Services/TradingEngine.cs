@@ -158,7 +158,7 @@ namespace ExtremeSignalAppCS.Services
         /// <summary>
         /// 計算外盤與內盤的每筆平均間隔時間與共識方向。
         /// </summary>
-        public (double? OuterAvg, double? InnerAvg, string Direction) CalcSideSpeed(List<TradeTick> trades)
+        public (double? OuterAvg, double? InnerAvg, string Direction) CalcSideSpeed(IReadOnlyList<TradeTick> trades)
         {
             var outerTimes = trades.Where(t => t.Side == TradeSide.Outer).Select(t => t.TimeVal).ToList();
             var innerTimes = trades.Where(t => t.Side == TradeSide.Inner).Select(t => t.TimeVal).ToList();
@@ -224,9 +224,10 @@ namespace ExtremeSignalAppCS.Services
         /// 這是系統過濾雜訊、保證訊號高勝率的物理護城河。
         /// </summary>
         public (double? PreAvg, double? PostAvg, int? Threshold, string? TrigTime, int? TrigPrice, int ActPre, int ActPost, int LastIndex)
-            GetDurations(List<TradeTick> trades, int n, int idx, TradeSide preSide, TradeSide postSide)
+            GetDurations(IReadOnlyList<TradeTick> trades, int n, int idx, TradeSide preSide, TradeSide postSide, int maxCount = -1)
         {
-            if (idx >= trades.Count || idx < 0)
+            int limit = maxCount < 0 ? trades.Count : maxCount;
+            if (idx >= limit || idx < 0)
                 return (null, null, null, null, null, 0, 0, idx);
 
             // 前向：蒐集 idx 及其前 n 筆同盤成交 (pre_list)
@@ -246,7 +247,7 @@ namespace ExtremeSignalAppCS.Services
             int extremePrice = trades[idx].Price;
             curr = idx + 1;
 
-            while (curr < trades.Count && postList.Count < (n + 1))
+            while (curr < limit && postList.Count < (n + 1))
             {
                 // 約束條件：B 點形成前 A 點不准被突破
                 if (postSide == TradeSide.Inner) // 疑似頭部，不准再創新高
@@ -573,7 +574,7 @@ namespace ExtremeSignalAppCS.Services
         /// 100% 移植 _calc_kline_data。
         /// </summary>
         public (List<KlineBar> KlineData, List<(string Direction, string BreakTime, string SigTime, List<SimulationResult> SigObjs)> Breakouts)
-            CalcKlineData(string sessionName, List<TradeTick> trades, List<SimulationResult> txfSigs, List<SimulationResult> mxfSigs, int intervalMins = 30)
+            CalcKlineData(string sessionName, IReadOnlyList<TradeTick> trades, List<SimulationResult> txfSigs, List<SimulationResult> mxfSigs, int intervalMins = 30)
         {
             double startTVal = sessionName == "日盤" ? 31500.0 : 54000.0;
             double interval = intervalMins * 60.0;
@@ -630,8 +631,9 @@ namespace ExtremeSignalAppCS.Services
 
             // 將 Tick 按時間區段分桶
             var buckets = new Dictionary<int, (List<TradeTick> Trades, List<string> Signals, List<SimulationResult> SignalObjs)>();
-            foreach (var t in trades)
+            for (int i = 0; i < trades.Count; i++)
             {
+                var t = trades[i];
                 double tVal = t.TimeVal;
                 if (tVal < startTVal) continue;
                 
@@ -777,11 +779,23 @@ namespace ExtremeSignalAppCS.Services
         /// 100% 移植 _calc_simulation_results。
         /// 核心停損時序狀態機回測模擬。
         /// </summary>
-        public List<SimulationResult> CalcSimulationResults(string session, List<TradeTick> trades, List<KlineBar> klines, int obsN)
+        public List<SimulationResult> CalcSimulationResults(string session, IReadOnlyList<TradeTick> trades, List<KlineBar> klines, int obsN, bool useDynamicN = false, Action<int>? onDynamicNUpdated = null)
         {
             var results = new List<SimulationResult>();
-            if (klines == null || klines.Count < 2)
+            if (klines == null || klines.Count < 2 || trades == null || trades.Count == 0)
                 return results;
+
+            int[]? dynamicNMap = null;
+            if (useDynamicN)
+            {
+                dynamicNMap = new int[trades.Count];
+                var calc = new DynamicNCalculator(60.0, 3.0, 10, 150);
+                for (int i = 0; i < trades.Count; i++)
+                {
+                    dynamicNMap[i] = calc.UpdateAndGetDynamicN(trades[i].TimeVal);
+                }
+                onDynamicNUpdated?.Invoke(dynamicNMap[^1]);
+            }
 
             var klineBoundaries = new List<(double startT, double endT, int obsHighEntry, int obsLowEntry, int prevHigh, int prevLow)>();
 
@@ -881,26 +895,25 @@ namespace ExtremeSignalAppCS.Services
                 lastKnownStartIdx = klineStartIdx;
                 lastKnownEndIdx = klineEndTradeIdx;
 
-                var slicedTrades = trades.Take(klineEndTradeIdx).ToList();
-                if (slicedTrades.Count == 0) continue;
+                if (klineEndTradeIdx == 0) continue;
 
                 var klineResults = new List<( (int Price, string ATime, int ObsN) Key, SimulationResult Raw, List<string> Tags )>();
 
                 // ════════ 做空路徑 (觀察 K 低) ════════
                 int searchStart = klineStartIdx;
-                while (searchStart < slicedTrades.Count)
+                while (searchStart < klineEndTradeIdx)
                 {
                     int? gateIdx = null;
-                    for (int j = Math.Max(1, searchStart); j < slicedTrades.Count; j++)
+                    for (int j = Math.Max(1, searchStart); j < klineEndTradeIdx; j++)
                     {
-                        if (slicedTrades[j].Price < obsHighEntry && slicedTrades[j - 1].Price >= obsHighEntry)
+                        if (trades[j].Price < obsHighEntry && trades[j - 1].Price >= obsHighEntry)
                         {
                             gateIdx = j;
                             break;
                         }
                     }
 
-                    if (!gateIdx.HasValue && searchStart < slicedTrades.Count && slicedTrades[searchStart].Price < obsHighEntry)
+                    if (!gateIdx.HasValue && searchStart < klineEndTradeIdx && trades[searchStart].Price < obsHighEntry)
                     {
                         if (searchStart == klineStartIdx)
                             gateIdx = searchStart;
@@ -912,13 +925,13 @@ namespace ExtremeSignalAppCS.Services
                     // 尋找過門後的最高價點 (疑似做空 A 點)
                     var runningMaxes = new List<int>();
                     int? currentMax = null;
-                    for (int j = gateIdx.Value; j < slicedTrades.Count; j++)
+                    for (int j = gateIdx.Value; j < klineEndTradeIdx; j++)
                     {
-                        if (slicedTrades[j].Price > obsHighEntry)
+                        if (trades[j].Price > obsHighEntry)
                         {
-                            if (currentMax == null || slicedTrades[j].Price > currentMax.Value)
+                            if (currentMax == null || trades[j].Price > currentMax.Value)
                             {
-                                currentMax = slicedTrades[j].Price;
+                                currentMax = trades[j].Price;
                                 runningMaxes.Add(j);
                             }
                         }
@@ -930,29 +943,30 @@ namespace ExtremeSignalAppCS.Services
                     int? lastSuccessfulBIdx = null;
                     foreach (var aIdx in runningMaxes)
                     {
-                        int aPrice = slicedTrades[aIdx].Price;
+                        int aPrice = trades[aIdx].Price;
+                        int currentN = useDynamicN && dynamicNMap != null ? dynamicNMap[aIdx] : obsN;
                         var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
-                            GetDurations(slicedTrades, obsN, aIdx, TradeSide.Outer, TradeSide.Inner);
+                            GetDurations(trades, currentN, aIdx, TradeSide.Outer, TradeSide.Inner, klineEndTradeIdx);
 
-                        if (pre.HasValue && post.HasValue && actPre >= obsN && actPost >= obsN && post.Value < pre.Value && trigPrice.HasValue)
+                        if (pre.HasValue && post.HasValue && actPre >= currentN && actPost >= currentN && post.Value < pre.Value && trigPrice.HasValue)
                         {
-                            var key = (aPrice, slicedTrades[aIdx].Time, obsN);
+                            var key = (aPrice, trades[aIdx].Time, currentN);
                             if (!klineResults.Any(k => k.Key == key))
                             {
                                 var raw = new SimulationResult
                                 {
                                     Type = "K低",
                                     ObsEntry = obsHighEntry,
-                                    BestATime = slicedTrades[aIdx].Time,
+                                    BestATime = trades[aIdx].Time,
                                     BestAPrice = aPrice,
-                                    TrigTime = trigTime ?? "N/A",
+                                    TrigTime = trigTime ?? trades[aIdx].Time,
                                     TrigPrice = trigPrice.Value.ToString(),
                                     Pre = pre.HasValue ? $"{pre.Value:F4}s" : "N/A",
                                     Post = post.HasValue ? $"{post.Value:F4}s" : "N/A",
                                     PrevHigh = prevHigh,
                                     PrevLow = prevLow,
                                     BIndex = bIdx,
-                                    ObsN = obsN,
+                                    ObsN = currentN,
                                     StopLossPrice = prevHigh
                                 };
                                 klineResults.Add((key, raw, new List<string> { "obs_high" }));
@@ -969,19 +983,19 @@ namespace ExtremeSignalAppCS.Services
 
                 // ════════ 做多路徑 (觀察 K 高) ════════
                 searchStart = klineStartIdx;
-                while (searchStart < slicedTrades.Count)
+                while (searchStart < klineEndTradeIdx)
                 {
                     int? gateIdx = null;
-                    for (int j = Math.Max(1, searchStart); j < slicedTrades.Count; j++)
+                    for (int j = Math.Max(1, searchStart); j < klineEndTradeIdx; j++)
                     {
-                        if (slicedTrades[j].Price > obsLowEntry && slicedTrades[j - 1].Price <= obsLowEntry)
+                        if (trades[j].Price > obsLowEntry && trades[j - 1].Price <= obsLowEntry)
                         {
                             gateIdx = j;
                             break;
                         }
                     }
 
-                    if (!gateIdx.HasValue && searchStart < slicedTrades.Count && slicedTrades[searchStart].Price > obsLowEntry)
+                    if (!gateIdx.HasValue && searchStart < klineEndTradeIdx && trades[searchStart].Price > obsLowEntry)
                     {
                         if (searchStart == klineStartIdx)
                             gateIdx = searchStart;
@@ -993,13 +1007,13 @@ namespace ExtremeSignalAppCS.Services
                     // 尋找過門後的最低價點 (疑似做多 A 點)
                     var runningMins = new List<int>();
                     int? currentMin = null;
-                    for (int j = gateIdx.Value; j < slicedTrades.Count; j++)
+                    for (int j = gateIdx.Value; j < klineEndTradeIdx; j++)
                     {
-                        if (slicedTrades[j].Price < obsLowEntry)
+                        if (trades[j].Price < obsLowEntry)
                         {
-                            if (currentMin == null || slicedTrades[j].Price < currentMin.Value)
+                            if (currentMin == null || trades[j].Price < currentMin.Value)
                             {
-                                currentMin = slicedTrades[j].Price;
+                                currentMin = trades[j].Price;
                                 runningMins.Add(j);
                             }
                         }
@@ -1011,29 +1025,30 @@ namespace ExtremeSignalAppCS.Services
                     int? lastSuccessfulBIdx = null;
                     foreach (var aIdx in runningMins)
                     {
-                        int aPrice = slicedTrades[aIdx].Price;
+                        int aPrice = trades[aIdx].Price;
+                        int currentN = useDynamicN && dynamicNMap != null ? dynamicNMap[aIdx] : obsN;
                         var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
-                            GetDurations(slicedTrades, obsN, aIdx, TradeSide.Inner, TradeSide.Outer);
+                            GetDurations(trades, currentN, aIdx, TradeSide.Inner, TradeSide.Outer, klineEndTradeIdx);
 
-                        if (pre.HasValue && post.HasValue && actPre >= obsN && actPost >= obsN && post.Value < pre.Value && trigPrice.HasValue)
+                        if (pre.HasValue && post.HasValue && actPre >= currentN && actPost >= currentN && post.Value < pre.Value && trigPrice.HasValue)
                         {
-                            var key = (aPrice, slicedTrades[aIdx].Time, obsN);
+                            var key = (aPrice, trades[aIdx].Time, currentN);
                             if (!klineResults.Any(k => k.Key == key))
                             {
                                 var raw = new SimulationResult
                                 {
                                     Type = "K高",
                                     ObsEntry = obsLowEntry,
-                                    BestATime = slicedTrades[aIdx].Time,
+                                    BestATime = trades[aIdx].Time,
                                     BestAPrice = aPrice,
-                                    TrigTime = trigTime ?? "N/A",
+                                    TrigTime = trigTime ?? trades[aIdx].Time,
                                     TrigPrice = trigPrice.Value.ToString(),
                                     Pre = pre.HasValue ? $"{pre.Value:F4}s" : "N/A",
                                     Post = post.HasValue ? $"{post.Value:F4}s" : "N/A",
                                     PrevHigh = prevHigh,
                                     PrevLow = prevLow,
                                     BIndex = bIdx,
-                                    ObsN = obsN,
+                                    ObsN = currentN,
                                     StopLossPrice = prevLow
                                 };
                                 klineResults.Add((key, raw, new List<string> { "obs_low" }));
@@ -1121,37 +1136,53 @@ namespace ExtremeSignalAppCS.Services
                     nextBIndex = aggregatedRawResults[currentListIdx + 1].Raw.BIndex;
                 }
 
-                var checkTradesChrono = trades.Skip(bIdx).Take(nextBIndex - bIdx).ToList();
-                var checkTradesGreedy = trades.Skip(bIdx).ToList();
-
                 bool isBrokenChrono = false;
                 bool isBrokenGreedy = false;
-
                 string? breakTime = null;
+
                 if (lockedSL.HasValue)
                 {
+                    int chronoEnd = Math.Min(nextBIndex, trades.Count);
+                    int greedyEnd = trades.Count;
+                    
                     if (sigType == "K低")
                     {
-                        int bkIdx = checkTradesChrono.FindIndex(t => t.Price > lockedSL.Value);
-                        if (bkIdx >= 0) isBrokenChrono = true;
-
-                        int bkgIdx = checkTradesGreedy.FindIndex(t => t.Price > lockedSL.Value);
-                        if (bkgIdx >= 0)
+                        for (int i = bIdx; i < greedyEnd; i++)
                         {
-                            isBrokenGreedy = true;
-                            breakTime = checkTradesGreedy[bkgIdx].Time;
+                            if (trades[i].Price > lockedSL.Value)
+                            {
+                                if (i < chronoEnd && !isBrokenChrono)
+                                    isBrokenChrono = true;
+                                    
+                                if (!isBrokenGreedy)
+                                {
+                                    isBrokenGreedy = true;
+                                    breakTime = trades[i].Time;
+                                }
+                                
+                                if (isBrokenChrono && isBrokenGreedy)
+                                    break;
+                            }
                         }
                     }
                     else if (sigType == "K高")
                     {
-                        int bkIdx = checkTradesChrono.FindIndex(t => t.Price < lockedSL.Value);
-                        if (bkIdx >= 0) isBrokenChrono = true;
-
-                        int bkgIdx = checkTradesGreedy.FindIndex(t => t.Price < lockedSL.Value);
-                        if (bkgIdx >= 0)
+                        for (int i = bIdx; i < greedyEnd; i++)
                         {
-                            isBrokenGreedy = true;
-                            breakTime = checkTradesGreedy[bkgIdx].Time;
+                            if (trades[i].Price < lockedSL.Value)
+                            {
+                                if (i < chronoEnd && !isBrokenChrono)
+                                    isBrokenChrono = true;
+                                    
+                                if (!isBrokenGreedy)
+                                {
+                                    isBrokenGreedy = true;
+                                    breakTime = trades[i].Time;
+                                }
+                                
+                                if (isBrokenChrono && isBrokenGreedy)
+                                    break;
+                            }
                         }
                     }
                 }
@@ -1197,7 +1228,7 @@ namespace ExtremeSignalAppCS.Services
         /// <summary>
         /// 100% 移植共識推播歷史紀錄模擬。
         /// </summary>
-        public List<string> SimulateSpeedPushesDual(List<TradeTick> txfTrades, List<TradeTick> mxfTrades)
+        public List<string> SimulateSpeedPushesDual(IReadOnlyList<TradeTick> txfTrades, IReadOnlyList<TradeTick> mxfTrades)
         {
             var pushes = new List<string>();
 

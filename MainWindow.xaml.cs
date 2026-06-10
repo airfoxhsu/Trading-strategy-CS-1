@@ -55,6 +55,7 @@ namespace ExtremeSignalAppCS
 
         // 【新增】實時狀態機快取 (與 Python 的 _rt_triggers 等效)
         private readonly Dictionary<string, Dictionary<string, List<(int Index, int Price, bool IsTrigH, bool IsTrigB, int RunningMax, int RunningMin)>>> _rtTriggers;
+        private readonly Dictionary<string, Dictionary<string, List<(double TVal, string StatusOnly, string ATime, int PriceVal, string TrigTime, int TrigPrice, double? Pre, double? Post, int AmpVal, int BIdx, bool IsTrigH)>>> _rtCompletedDetails;
 
         private readonly System.Threading.Lock _rtLock = new(); // C# 13 新型執行緒同步安全鎖
 
@@ -81,6 +82,8 @@ namespace ExtremeSignalAppCS
         private readonly AutoResetEvent _analysisEvent = new(false);
         private CancellationTokenSource? _analysisCts;
         private Task? _analysisTask;
+        private volatile int _uiGeneration = 0; // UI 世代計數器，防止過期 Dispatcher 任務覆蓋已清空的 UI
+        private DispatcherTimer? _sessionTimer; // 盤別自動切換計時器
 
         // 復盤回放背景執行緒相關
         private CancellationTokenSource? _replayCts;
@@ -158,6 +161,12 @@ namespace ExtremeSignalAppCS
                 { "MXF", new Dictionary<string, List<(int, int, bool, bool, int, int)>> { { "日盤", new() }, { "夜盤", new() } } }
             };
 
+            _rtCompletedDetails = new Dictionary<string, Dictionary<string, List<(double, string, string, int, string, int, double?, double?, int, int, bool)>>>
+            {
+                { "TXF", new Dictionary<string, List<(double, string, string, int, string, int, double?, double?, int, int, bool)>> { { "日盤", new() }, { "夜盤", new() } } },
+                { "MXF", new Dictionary<string, List<(double, string, string, int, string, int, double?, double?, int, int, bool)>> { { "日盤", new() }, { "夜盤", new() } } }
+            };
+
             InitializeComponent();
 
             // 2. 繫結 WPF DataGrid 容器
@@ -193,6 +202,32 @@ namespace ExtremeSignalAppCS
 
             // 啟動自動連線與訂閱商品 (開機即時載入)
             StartRealtime();
+
+            // 啟動盤別自動切換檢查計時器 (每 60 秒檢查一次)
+            _sessionTimer = new DispatcherTimer(DispatcherPriority.Background)
+            {
+                Interval = TimeSpan.FromSeconds(60)
+            };
+            _sessionTimer.Tick += CheckSessionChange;
+            _sessionTimer.Start();
+        }
+
+        private void CheckSessionChange(object? sender, EventArgs e)
+        {
+            if (_yuantaQuote == null && _axHost == null) return; // 若未連線則不處理
+
+            var (port, session) = CheckSessionPort();
+            if (session != _currentSessionName)
+            {
+                AppendLog($"\n--- 偵測到盤別切換：重啟連線至 {port} ({session}) ---");
+                StopRealtime();
+                
+                // 延遲 2 秒後重新連線並自動清空資料
+                Task.Delay(2000).ContinueWith(_ => Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    StartRealtime();
+                })));
+            }
         }
 
         private void MainWindow_Closed(object? sender, EventArgs e)
@@ -200,10 +235,10 @@ namespace ExtremeSignalAppCS
             StopReplay();
             StopRealtime();
 
-            // 釋放背景 Task 與 Channel
             _analysisCts?.Cancel();
             _analysisCts?.Dispose();
             _tgService.Dispose();
+            _sessionTimer?.Stop();
 
             wndUnbrokenK.Reset();
             klineChart.Reset();
@@ -333,6 +368,11 @@ namespace ExtremeSignalAppCS
                 _rtTriggers["TXF"]["夜盤"].Clear();
                 _rtTriggers["MXF"]["日盤"].Clear();
                 _rtTriggers["MXF"]["夜盤"].Clear();
+
+                _rtCompletedDetails["TXF"]["日盤"].Clear();
+                _rtCompletedDetails["TXF"]["夜盤"].Clear();
+                _rtCompletedDetails["MXF"]["日盤"].Clear();
+                _rtCompletedDetails["MXF"]["夜盤"].Clear();
 
                 _rtNotifiedKeys.Clear();
                 _rtLastNetSpeedsTop["TXF"] = null;
@@ -736,11 +776,18 @@ namespace ExtremeSignalAppCS
 
                 try
                 {
+                    // 先捕獲世代再計算：若計算期間 _uiGeneration 被遞增（載入復盤/停止復盤），結果即失效
+                    int gen = _uiGeneration;
+
                     // 在背景執行緒執行高密度狀態機計算
                     var result = RunRealtimeAnalysisCompute();
                     
                     // 安全分發至主介面更新 UI (WPF RichTextBox, DataGrids, Labels)
-                    _ = Dispatcher.BeginInvoke(new Action(() => ApplyRealtimeAnalysisUI(result)));
+                    _ = Dispatcher.BeginInvoke(new Action(() =>
+                    {
+                        if (_uiGeneration != gen) return; // 世代不符，丟棄過期的分析結果
+                        ApplyRealtimeAnalysisUI(result);
+                    }));
                 }
                 catch (Exception ex)
                 {
@@ -815,7 +862,11 @@ namespace ExtremeSignalAppCS
 
                 if (scanIdx == 0)
                 {
-                    lock (_rtLock) { _rtTriggers[symbol][activeSession].Clear(); }
+                    lock (_rtLock)
+                    {
+                        _rtTriggers[symbol][activeSession].Clear();
+                        _rtCompletedDetails[symbol][activeSession].Clear();
+                    }
                 }
 
                 // 增量時序對比運算
@@ -855,11 +906,18 @@ namespace ExtremeSignalAppCS
                     if (isTrigH) lastCheckTimeH = tVal;
                     if (isTrigB) lastCheckTimeB = tVal;
 
-                    if (isTrigH || isTrigB)
+                    if (isTrigH)
                     {
                         lock (_rtLock)
                         {
-                            _rtTriggers[symbol][activeSession].Add((i, price, isTrigH, isTrigB, runningMax, runningMin));
+                            _rtTriggers[symbol][activeSession].Add((i, price, true, false, runningMax, runningMin));
+                        }
+                    }
+                    if (isTrigB)
+                    {
+                        lock (_rtLock)
+                        {
+                            _rtTriggers[symbol][activeSession].Add((i, price, false, true, runningMax, runningMin));
                         }
                     }
 
@@ -904,6 +962,12 @@ namespace ExtremeSignalAppCS
                             int amp = rMin != 999999 ? (rMax - rMin) : 0;
                             string prefix = (price == dayMax) ? "時段最高" : (status.Contains("未達標") ? "曾未達標最高" : "曾達標最高");
                             absDetails.Add((tVal, prefix + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
+
+                            lock (_rtLock)
+                            {
+                                _rtTriggers[symbol][activeSession].Remove(item);
+                                _rtCompletedDetails[symbol][activeSession].Add((tVal, status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx, true));
+                            }
                         }
                     }
 
@@ -917,7 +981,30 @@ namespace ExtremeSignalAppCS
                             int amp = rMax != -999999 ? (rMax - rMin) : 0;
                             string prefix = (price == dayMin) ? "時段最低" : (status.Contains("未達標") ? "曾未達標最低" : "曾達標最低");
                             absDetails.Add((tVal, prefix + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
+
+                            lock (_rtLock)
+                            {
+                                _rtTriggers[symbol][activeSession].Remove(item);
+                                _rtCompletedDetails[symbol][activeSession].Add((tVal, status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx, false));
+                            }
                         }
+                    }
+                }
+
+                lock (_rtLock)
+                {
+                    foreach (var cached in _rtCompletedDetails[symbol][activeSession])
+                    {
+                        string prefix;
+                        if (cached.IsTrigH)
+                        {
+                            prefix = (cached.PriceVal == dayMax) ? "時段最高" : (cached.StatusOnly.Contains("未達標") ? "曾未達標最高" : "曾達標最高");
+                        }
+                        else
+                        {
+                            prefix = (cached.PriceVal == dayMin) ? "時段最低" : (cached.StatusOnly.Contains("未達標") ? "曾未達標最低" : "曾達標最低");
+                        }
+                        absDetails.Add((cached.TVal, prefix + cached.StatusOnly, cached.ATime, cached.PriceVal, cached.TrigTime, cached.TrigPrice, cached.Pre, cached.Post, cached.AmpVal, cached.BIdx));
                     }
                 }
 
@@ -1030,10 +1117,8 @@ namespace ExtremeSignalAppCS
                             {
                                 string side = d.Type == "K低" ? "top" : "bottom";
                                 var tDict = (Dictionary<string, (int p50, int p75, int p90)>)quantParams[side == "top" ? "time_top" : "time_bottom"];
-                                string bTimeClean = d.BestATime.Replace(":", "");
-                                int hmVal = bTimeClean.Length >= 4 ? int.Parse(bTimeClean[..4]) : 0;
-                                int h = hmVal / 100, m = hmVal % 100;
-                                int totalM = h * 60 + m;
+                                int totalM = ParseTimeToMinutes(d.BestATime);
+                                if (totalM < 0) throw new Exception("Invalid time");
                                 if (activeSession == "夜盤" && totalM < 900) totalM += 1440;
 
                                 int? p50 = null, p75 = null, p90 = null;
@@ -1184,7 +1269,7 @@ namespace ExtremeSignalAppCS
                 _currentKlineInterval
             );
 
-            var simulationResults = _engine.CalcSimulationResults(activeSession, mxfTradesRt, klineData, _currentObsN);
+            var simulationResults = _engine.CalcSimulationResults(activeSession, mxfTradesRt, klineData, _currentObsN, true, (dynN) => { Dispatcher.BeginInvoke(new System.Action(() => { lblObsN.Content = $"觀察N: {dynN}"; })); });
 
             return new Dictionary<string, object>
             {
@@ -1572,6 +1657,8 @@ namespace ExtremeSignalAppCS
 
         private void UpdateObserverViews(List<SimulationResult> simulationResults)
         {
+            RefreshObserverComboboxes();
+
             int oldLen = _obsCollection.Count;
             int newLen = simulationResults.Count;
 
@@ -1621,7 +1708,7 @@ namespace ExtremeSignalAppCS
 
             if (_obsCollection.Count > 0)
             {
-                if (newLen > oldLen || dgObserver.SelectedIndex == -1)
+                if (dgObserver.SelectedIndex == -1)
                 {
                     dgObserver.ScrollIntoView(_obsCollection[^1]);
                 }
@@ -1761,6 +1848,11 @@ namespace ExtremeSignalAppCS
                     var color = dStr.Contains("多方") ? Color.FromRgb(235, 75, 75) : dStr.Contains("空方") ? Color.FromRgb(40, 167, 69) : Color.FromRgb(160, 160, 160);
                     lbl.Foreground = new SolidColorBrush(color);
                 }
+                else
+                {
+                    lbl.Text = $"{name}: 外盤(買) --/筆 | 內盤(賣) --/筆 → 資料不足 | 均價:--";
+                    lbl.Foreground = new SolidColorBrush(Color.FromRgb(160, 160, 160));
+                }
             }
         }
 
@@ -1885,7 +1977,7 @@ namespace ExtremeSignalAppCS
                     // 預載停損極值對比表
                     wndUnbrokenK.Dispatcher.BeginInvoke(new Action(() =>
                     {
-                        var results = _engine.CalcSimulationResults(session, mxfT, klineData, _currentObsN);
+                        var results = _engine.CalcSimulationResults(session, mxfT, klineData, _currentObsN, true, (dynN) => { Dispatcher.BeginInvoke(new System.Action(() => { lblObsN.Content = $"觀察N: {dynN}"; })); });
                         UpdateObserverViews(results);
                     }));
                 }
@@ -2025,7 +2117,7 @@ namespace ExtremeSignalAppCS
                 allOfflineKlineData.AddRange(klineData);
 
                 // 重新計算停損觀測表
-                var results = _engine.CalcSimulationResults(session, mxfT, klineData, _currentObsN);
+                var results = _engine.CalcSimulationResults(session, mxfT, klineData, _currentObsN, true, (dynN) => { Dispatcher.BeginInvoke(new System.Action(() => { lblObsN.Content = $"觀察N: {dynN}"; })); });
                 UpdateObserverViews(results);
             }
 
@@ -2589,10 +2681,8 @@ namespace ExtremeSignalAppCS
                     try
                     {
                         var tDict = (Dictionary<string, (int p50, int p75, int p90)>)quantParams[side == "top" ? "time_top" : "time_bottom"];
-                        string bTimeClean = d.BestATime.Replace(":", "");
-                        int hmVal = bTimeClean.Length >= 4 ? int.Parse(bTimeClean[..4]) : 0;
-                        int h = hmVal / 100, m = hmVal % 100;
-                        int totalM = h * 60 + m;
+                        int totalM = ParseTimeToMinutes(d.BestATime);
+                        if (totalM < 0) throw new Exception("Invalid time");
                         if (session == "夜盤" && totalM < 900) totalM += 1440;
 
                         int? p50 = null, p75 = null, p90 = null;
@@ -2814,7 +2904,35 @@ namespace ExtremeSignalAppCS
             // 修正 WPF ComboBox.Text 抓取空值 Bug，改以 SelectedItem 安全取得
             string activeSession = (cboReplaySession.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "日盤";
 
-            // 2. 背景非同步解析 log 檔案成 Ticks 陣列 ( parser_worker 轉 C#背景 Task)
+            // 2. 先鎖定復盤旗標，立即阻擋 Live Tick 在背景解析期間觸發分析迴圈覆蓋 UI
+            _isReplaying = true;
+            _uiGeneration++; // 遞增世代，讓所有已排入 Dispatcher 佇列的過期分析結果自動失效
+
+            // 3. 立即清空底部所有觀察欄位，防止 Live 分析迴圈的殘留 Dispatcher 任務回寫
+            txtObsHigh.Text = "";
+            txtObsLow.Text = "";
+            cboObsHigh.Text = "";
+            cboObsHigh.Items.Clear();
+            cboObsLow.Text = "";
+            cboObsLow.Items.Clear();
+            lblObsN.Content = "觀測N: --";
+            lblObsStatus.Text = "觀察: 待設定";
+            _lastAutofillKlineTime = null;
+            _engine._obs_high_entry_price = null;
+            _engine._obs_low_entry_price = null;
+            _engine._obs_high_price = null;
+            _engine._obs_low_price = null;
+
+            // 清空分析快照，防止 RefreshObserverComboboxes 從殘留的 Live 資料重新填充下拉選單
+            _lastRtStatusSnapshot = [];
+
+            // 4. 清空大小臺速度標籤，避免殘留即時行情數據
+            lblSpeedTxf.Text = "大臺: 外盤(買) --/筆 | 內盤(賣) --/筆 → 資料不足 | 均價:--";
+            lblSpeedTxf.Foreground = new SolidColorBrush(Color.FromRgb(160, 160, 160));
+            lblSpeedMxf.Text = "小臺: 外盤(買) --/筆 | 內盤(賣) --/筆 → 資料不足 | 均價:--";
+            lblSpeedMxf.Foreground = new SolidColorBrush(Color.FromRgb(160, 160, 160));
+
+            // 5. 背景非同步解析 log 檔案成 Ticks 陣列 ( parser_worker 轉 C#背景 Task)
             Task.Run(() =>
             {
                 try
@@ -2915,6 +3033,8 @@ namespace ExtremeSignalAppCS
                             lblStatus.Content = $"無 [{activeSession}] Tick 資料！";
                             btnPlayPause.IsEnabled = false;
                             sldProgress.IsEnabled = false;
+                            // 無資料時解除復盤旗標，讓 Live Tick 恢復正常運作
+                            _isReplaying = false;
                         }
                         else
                         {
@@ -2926,9 +3046,6 @@ namespace ExtremeSignalAppCS
                             sldProgress.Minimum = 0;
                             sldProgress.Maximum = _allParsedTicks.Count - 1;
                             sldProgress.Value = 0;
-
-                            // 進入復盤模式
-                            _isReplaying = true;
 
                             ResetReplayTrack();
                             ReconstructReplayUpTo(0);
@@ -2973,6 +3090,18 @@ namespace ExtremeSignalAppCS
                 _rtLastMatchQty.Clear();
                 
                 _engine.ClearCache();
+            }
+
+            if (wndUnbrokenK != null)
+            {
+                if (wndUnbrokenK.Dispatcher.CheckAccess())
+                {
+                    wndUnbrokenK.Clear();
+                }
+                else
+                {
+                    wndUnbrokenK.Dispatcher.BeginInvoke(new Action(() => wndUnbrokenK.Clear()));
+                }
             }
         }
 
@@ -3115,6 +3244,7 @@ namespace ExtremeSignalAppCS
         private void StopReplay()
         {
             _isReplaying = false;
+            _uiGeneration++; // 遞增世代，讓復盤期間排入的過期分析結果自動失效
             StopReplayTaskOnly();
 
             // ── UI 控制項狀態全面還原 ──
@@ -3484,18 +3614,7 @@ namespace ExtremeSignalAppCS
 
         // ==================== 9. 底部參數更改同步槽 ====================
 
-        private void CboObsN_SelectionChanged(object sender, SelectionChangedEventArgs e)
-        {
-            if (!_isInitialized) return;
-            if (cboObsN.SelectedItem is ComboBoxItem item && int.TryParse(item.Content.ToString(), out int val))
-            {
-                _currentObsN = val;
-                _analysisEvent.Set();
-
-                // 離線模式下（無即時行情、無復盤）直接重繪，因為 _analysisEvent 沒有 Tick 驅動
-                ReplotOfflineData();
-            }
-        }
+        
 
         private void CboKlineInterval_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
@@ -3701,11 +3820,10 @@ namespace ExtremeSignalAppCS
             }
             else if (App.Current.Resources.Contains("_temp_offline_trades"))
             {
-                var dict = (Dictionary<string, List<TradeTick>>)App.Current.Resources["_temp_offline_trades"];
+                var dict = (Dictionary<string, Dictionary<string, List<TradeTick>>>)App.Current.Resources["_temp_offline_trades"];
                 foreach (var session in new[] { "日盤", "夜盤" })
                 {
-                    string key = $"MXF ({session})";
-                    if (dict.TryGetValue(key, out var trades))
+                    if (dict.TryGetValue("MXF", out var innerDict) && innerDict.TryGetValue(session, out var trades))
                     {
                         var txfSigs = GetSimResultsFromSnapshot("TXF", session);
                         var mxfSigs = GetSimResultsFromSnapshot("MXF", session);
@@ -3733,8 +3851,6 @@ namespace ExtremeSignalAppCS
                     var qParams = _engine.LoadQuantParams(sym, _currentTargetDays);
                     foreach (var d in sigs)
                     {
-                        if (d.Post == "N/A") continue;
-
                         string speedInfo = d.Tags.FirstOrDefault() ?? "";
                         bool isUnmet = d.DisplayTitle.Contains(" [未達標]");
                         bool isContradiction = false;
@@ -3757,10 +3873,8 @@ namespace ExtremeSignalAppCS
                         try
                         {
                             var tDict = (Dictionary<string, (int p50, int p75, int p90)>)qParams[side == "top" ? "time_top" : "time_bottom"];
-                            string bTimeClean = d.BestATime.Replace(":", "");
-                            int hmVal = bTimeClean.Length >= 4 ? int.Parse(bTimeClean[..4]) : 0;
-                            int h = hmVal / 100, m = hmVal % 100;
-                            int totalM = h * 60 + m;
+                            int totalM = ParseTimeToMinutes(d.BestATime);
+                            if (totalM < 0) throw new Exception("Invalid time");
                             if (sessionName == "夜盤" && totalM < 900) totalM += 1440;
 
                             int? p50 = null, p75 = null;
@@ -3856,6 +3970,48 @@ namespace ExtremeSignalAppCS
         private void AppendLog(string text, bool clear = false, bool forceScrollToEnd = false)
         {
             LogHighlighter.AppendLog(txtOutput, text, clear, forceScrollToEnd);
+        }
+
+        private static int ParseTimeToMinutes(string timeStr)
+        {
+            if (string.IsNullOrEmpty(timeStr) || timeStr == "N/A") return -1;
+            try
+            {
+                timeStr = timeStr.Trim();
+                if (timeStr.Contains(':'))
+                {
+                    var parts = timeStr.Split(':');
+                    if (parts.Length >= 2 && int.TryParse(parts[0], out int h) && int.TryParse(parts[1], out int m))
+                        return h * 60 + m;
+                }
+                else
+                {
+                    if (timeStr.Contains('.'))
+                        timeStr = timeStr.Split('.')[0];
+
+                    string digits = new string(timeStr.Where(char.IsDigit).ToArray());
+                    if (digits.Length >= 3)
+                    {
+                        int h = 0, m = 0;
+                        if (digits.Length >= 4)
+                        {
+                            h = int.Parse(digits.Substring(0, 2));
+                            m = int.Parse(digits.Substring(2, 2));
+                        }
+
+                        if (digits.Length == 5 || digits.Length == 3 || h > 23 || m > 59)
+                        {
+                            h = int.Parse(digits.Substring(0, 1));
+                            m = int.Parse(digits.Substring(1, 2));
+                        }
+
+                        if (h >= 0 && h <= 23 && m >= 0 && m <= 59)
+                            return h * 60 + m;
+                    }
+                }
+            }
+            catch { }
+            return -1;
         }
 
         private static CheckSessionPortResult CheckSessionPort()

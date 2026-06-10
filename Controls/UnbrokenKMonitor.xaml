@@ -35,14 +35,28 @@
         <!-- 監控顯示區 -->
         <RichTextBox Grid.Row="2" x:Name="txtDisplay" IsReadOnly="True" Background="#1A1A1A" Foreground="#DCDCDC" 
                      FontFamily="Consolas" FontSize="13" BorderThickness="0" Margin="4"
-                     VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"/>
+                     VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+            <RichTextBox.ContextMenu>
+                <ContextMenu>
+                    <MenuItem Command="Copy" Header="複製選取內容 (Ctrl+C)" />
+                    <MenuItem Header="複製全部內容" Click="MenuCopyDisplay_Click"/>
+                </ContextMenu>
+            </RichTextBox.ContextMenu>
+        </RichTextBox>
 
         <GridSplitter Grid.Row="3" Height="3" HorizontalAlignment="Stretch" Background="#333333" Margin="0,2"/>
 
         <Border Grid.Row="4" Background="#1A1A1A" BorderBrush="{StaticResource WidgetBorderBrush}" BorderThickness="0,1,0,0" Padding="4">
             <RichTextBox x:Name="txtTrendHistory" IsReadOnly="True" Background="Transparent" Foreground="#DCDCDC" 
                          FontFamily="Consolas" FontSize="13" BorderThickness="0" Margin="0"
-                         VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"/>
+                         VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto">
+                <RichTextBox.ContextMenu>
+                    <ContextMenu>
+                        <MenuItem Command="Copy" Header="複製選取內容 (Ctrl+C)" />
+                        <MenuItem Header="複製全部內容" Click="MenuCopyTrend_Click"/>
+                    </ContextMenu>
+                </RichTextBox.ContextMenu>
+            </RichTextBox>
         </Border>
 
     </Grid>
