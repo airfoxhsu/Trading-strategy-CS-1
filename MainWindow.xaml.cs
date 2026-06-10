@@ -2760,8 +2760,21 @@ namespace ExtremeSignalAppCS
 
         private void PreloadTodayLog()
         {
-            string todayStr = DateTime.Now.ToString("yyyyMMdd");
-            string todayLog = Path.Combine(GetLogsDirectory(), todayStr, "event.log");
+            DateTime now = DateTime.Now;
+            string targetDateStr = now.ToString("yyyyMMdd");
+
+            // 夜盤跨日預載修正：若當前時間早於早上 08:30，夜盤資料通常存在於昨日的日誌資料夾中
+            if (now.TimeOfDay < new TimeSpan(8, 30, 0))
+            {
+                string yesterdayStr = now.AddDays(-1).ToString("yyyyMMdd");
+                string yesterdayLog = Path.Combine(GetLogsDirectory(), yesterdayStr, "event.log");
+                if (File.Exists(yesterdayLog))
+                {
+                    targetDateStr = yesterdayStr;
+                }
+            }
+
+            string todayLog = Path.Combine(GetLogsDirectory(), targetDateStr, "event.log");
 
             if (!File.Exists(todayLog))
             {
@@ -4020,12 +4033,12 @@ namespace ExtremeSignalAppCS
             int timeVal = now.Hour * 3600 + now.Minute * 60 + now.Second;
             int weekday = (int)now.DayOfWeek; // Sunday=0, Monday=1, ... Saturday=6
 
-            // 週一至週五 08:30 ~ 13:45 為日盤 (1 <= weekday <= 5)
-            bool isDay = (1 <= weekday && weekday <= 5) && (timeVal >= 8 * 3600 + 30 * 60 && timeVal <= 13 * 3600 + 45 * 60);
+            // 週一至週五 08:30 ~ 14:50 為日盤 (1 <= weekday <= 5)
+            bool isDay = (1 <= weekday && weekday <= 5) && (timeVal >= 8 * 3600 + 30 * 60 && timeVal <= 14 * 3600 + 50 * 60);
             
-            // 週一至週五 14:50 之後，或者週二至週六 05:00 之前為夜盤
-            bool isNight1 = (1 <= weekday && weekday <= 5) && (timeVal >= 14 * 3600 + 50 * 60);
-            bool isNight2 = (2 <= weekday && weekday <= 6) && (timeVal <= 5 * 3600);
+            // 週一至週五 15:00 之後，或者週二至週六 08:30 之前為夜盤
+            bool isNight1 = (1 <= weekday && weekday <= 5) && (timeVal >= 15 * 3600);
+            bool isNight2 = (2 <= weekday && weekday <= 6) && (timeVal <= 8 * 3600 + 30 * 60);
 
             if (isDay) return new CheckSessionPortResult(443, "日盤");
             if (isNight1 || isNight2) return new CheckSessionPortResult(442, "夜盤");
