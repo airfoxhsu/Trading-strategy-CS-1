@@ -24,10 +24,7 @@ namespace ExtremeSignalAppCS.Controls
         private TradingEngine? _engine;
         private MainWindow? _parentApp;
         
-        private readonly DispatcherTimer _timer;
         private bool _bgCheckInProgress;
-        private double _lastTriggerTime;
-        private volatile bool _isDirty; // 髒標記：只有行情變動時才標記為 true
         private readonly object _lock = new();
         private long _currentCheckId = 0;
 
@@ -55,39 +52,24 @@ namespace ExtremeSignalAppCS.Controls
         public UnbrokenKMonitor()
         {
             InitializeComponent();
-
-            // 3 秒輪詢檢查髒標記 (實際計算僅在行情變動時觸發，閒置時零 CPU)
-            _timer = new DispatcherTimer(DispatcherPriority.Background)
-            {
-                Interval = TimeSpan.FromMilliseconds(3000)
-            };
-            _timer.Tick += (s, e) =>
-            {
-                // 只有當 MainWindow 呼叫 MarkDirty() 標記有新資料時，才真正執行背景計算
-                if (_isDirty)
-                {
-                    _isDirty = false;
-                    TriggerUnbrokenCheck(false);
-                }
-            };
         }
 
         public void Initialize(TradingEngine engine, MainWindow parentApp)
         {
             _engine = engine;
             _parentApp = parentApp;
-            
-            _timer.Start();
         }
 
         /// <summary>
         /// 標記有新行情資料需要重新計算。
-        /// 由 MainWindow 在實時分析完成後呼叫，取代原本的無條件輪詢。
+        /// 由 MainWindow 在實時分析完成後呼叫，將受限於 2000ms 的降頻保護。
         /// </summary>
         public void MarkDirty()
         {
-            _isDirty = true;
+            TriggerUnbrokenCheck(false); // 必須設為 false 以啟動降頻保護
         }
+
+        private double _lastCheckTimeMs = 0;
 
         /// <summary>
         /// 週期性或事件驅動觸發未破停損分析。
@@ -97,15 +79,11 @@ namespace ExtremeSignalAppCS.Controls
             if (_engine == null || _parentApp == null) return;
             if (_bgCheckInProgress) return;
 
-            double now = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
-            
-            // 普通 Tick 行情跳動期間限制 1.5 秒 Debounce。如果是極值訊號達標，則 force = true 瞬間啟動背景 Thread 計算
-            if (!force && (now - _lastTriggerTime < 1.5))
-            {
-                return;
-            }
+            // 加入 2000ms 的操作感知型降頻，因為這牽涉到 7 個時間級別的全局大迴圈狀態機運算
+            double nowMs = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
+            if (!force && nowMs - _lastCheckTimeMs < 2000) return;
+            _lastCheckTimeMs = nowMs;
 
-            _lastTriggerTime = now;
             _bgCheckInProgress = true;
             long myRunId = Interlocked.Increment(ref _currentCheckId);
 
@@ -133,9 +111,6 @@ namespace ExtremeSignalAppCS.Controls
                     {
                         if (!int.TryParse(intervalStr, out int intMins))
                             continue;
-
-                        // 微幅休眠 5ms 給 UI Thread 絕對流暢渲染優先權
-                        Thread.Sleep(5);
 
                         foreach (var (sessionName, trades, txfSigs, mxfSigs) in sessionDataSnapshot)
                         {
@@ -756,7 +731,6 @@ namespace ExtremeSignalAppCS.Controls
         /// </summary>
         public void Reset()
         {
-            _timer.Stop();
             lock (_lock)
             {
                 _currentUnbrokenMap.Clear();
@@ -785,7 +759,6 @@ namespace ExtremeSignalAppCS.Controls
                 _currentUnbrokenMap.Clear();
             }
             _bgCheckInProgress = false;
-            _lastTriggerTime = 0;
             txtDisplay.Document.Blocks.Clear();
             lblTitle.Text = "🛡️ 未破分 K 停損監控";
             lblSummaryShort.Text = "做空共有 0 項";

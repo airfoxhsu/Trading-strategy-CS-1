@@ -8,3 +8,7 @@ Logs/
 scratch/
 config.json
 code.json
+*.dmp
+*.speedscope
+*.speedscope.json
+pstacks.txt

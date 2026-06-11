@@ -1,4 +1,5 @@
 using System;
+using ExtremeSignalAppCS.Helper;
 
 namespace ExtremeSignalAppCS.Models
 {
@@ -6,18 +7,19 @@ namespace ExtremeSignalAppCS.Models
     /// 唯讀高性能成交 Tick 資料結構。
     /// 宣告為 struct 以在 high-frequency 行情（每秒 10,000+ Ticks）下
     /// 完全在 Stack 上運行，杜絕 GC Heap 分配與垃圾回收暫停。
+    /// 引進 Flyweight Pattern 字串快取與 Enum/Byte 替代 Reference Type。
     /// </summary>
     public readonly struct TradeTick
     {
         /// <summary>
-        /// 商品名稱 (如 "TXF" 或 "MXF")
+        /// 商品代碼 ID (0=TXF, 1=MXF)
         /// </summary>
-        public string Symbol { get; }
+        public byte SymbolId { get; }
 
         /// <summary>
-        /// 行情時間字串 (例如 "08:45:00" 或 "084500000000")
+        /// 交易盤別 ID (0=日盤, 1=夜盤)
         /// </summary>
-        public string Time { get; }
+        public byte SessionId { get; }
 
         /// <summary>
         /// 當日累計秒數 (高精精確至微秒)
@@ -44,24 +46,49 @@ namespace ExtremeSignalAppCS.Models
         /// </summary>
         public int BestSp { get; }
 
-        /// <summary>
-        /// 交易盤別 ("日盤" 或 "夜盤")
-        /// </summary>
-        public string Session { get; }
+        // === 零分配唯讀屬性封裝 ===
 
         /// <summary>
-        /// 初始化唯讀成交 Tick 實例。
+        /// 取得商品名稱 (字串實例已 interned)
         /// </summary>
-        public TradeTick(string symbol, string time, double timeVal, int price, TradeSide side, int bestBp = 0, int bestSp = 0, string session = "")
+        public string Symbol => SymbolId == 1 ? "MXF" : "TXF";
+
+        /// <summary>
+        /// 取得盤別名稱 (字串實例已 interned)
+        /// </summary>
+        public string Session => SessionId == 1 ? "夜盤" : "日盤";
+
+        /// <summary>
+        /// 取得行情時間字串，由快取池提供，避免字串分配 (0 Alloc)
+        /// </summary>
+        public string Time => TimeStringCache.GetTimeStr((int)TimeVal);
+
+        /// <summary>
+        /// 高效能 Zero Allocation 建構子
+        /// </summary>
+        public TradeTick(byte symbolId, byte sessionId, double timeVal, int price, TradeSide side, int bestBp = 0, int bestSp = 0)
         {
-            Symbol = symbol;
-            Time = time;
+            SymbolId = symbolId;
+            SessionId = sessionId;
             TimeVal = timeVal;
             Price = price;
             Side = side;
             BestBp = bestBp;
             BestSp = bestSp;
-            Session = session;
+        }
+
+        /// <summary>
+        /// 向下相容建構子，於轉換過程中使用。
+        /// </summary>
+        public TradeTick(string symbol, string time, double timeVal, int price, TradeSide side, int bestBp = 0, int bestSp = 0, string session = "")
+        {
+            SymbolId = (byte)(symbol == "MXF" ? 1 : 0);
+            SessionId = (byte)(session == "夜盤" ? 1 : 0);
+            TimeVal = timeVal;
+            Price = price;
+            Side = side;
+            BestBp = bestBp;
+            BestSp = bestSp;
         }
     }
 }

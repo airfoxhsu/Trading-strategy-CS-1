@@ -82,9 +82,9 @@ namespace ExtremeSignalAppCS.Models
         private string FormatTimeStr(string raw)
         {
             if (string.IsNullOrEmpty(raw) || raw == "N/A" || raw.Contains(":")) return raw;
-            string padded = raw.PadLeft(12, '0');
-            if (padded.Length >= 6)
-                return $"{padded.Substring(0, 2)}:{padded.Substring(2, 2)}:{padded.Substring(4, 2)}";
+            string digits = new string(raw.Where(char.IsDigit).ToArray());
+            if (digits.Length >= 6)
+                return $"{digits.Substring(0, 2)}:{digits.Substring(2, 2)}:{digits.Substring(4, 2)}";
             return raw;
         }
 

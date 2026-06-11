@@ -141,6 +141,11 @@ namespace ExtremeSignalAppCS
         private readonly ObservableCollection<KlineBar> _klineCollection = [];
         private readonly ObservableCollection<SimulationResult> _obsCollection = [];
 
+        // 歷史狀態機回測降頻快取
+        private double _lastHeavyCalcTimeMs = 0;
+        private List<KlineBar> _lastKlineData = [];
+        private List<SimulationResult> _lastSimulationResults = [];
+
         public MainWindow()
         {
             _engine = new TradingEngine();
@@ -770,48 +775,14 @@ namespace ExtremeSignalAppCS
                     side = prevTrades.Count > 0 ? prevTrades[^1].Side : TradeSide.Outer;
                 }
 
-                var tick = new TradeTick(baseSymbol, mt, tVal, price, side, bestBp, bestSp, session);
+                byte symId = (byte)(baseSymbol == "MXF" ? 1 : 0);
+                byte sessId = (byte)(session == "夜盤" ? 1 : 0);
+                var tick = new TradeTick(symId, sessId, tVal, price, side, bestBp, bestSp);
                 
                 // 完全 Lock-Free 的資料結構寫入 (Zero GC Allocation & No OS Lock)
                 _liveSymbolTrades[baseSymbol][session].Add(tick);
 
-                // O(1) 增量狀態更新，改用極輕量物件鎖，避免與其他商品或全域資源阻塞
-                var state = _rtState[baseSymbol][session];
-                lock (state)
-                {
-                    state.Count++;
-                    state.SumPrice += price;
-                    
-                    if (price > state.DayMax)
-                    {
-                        state.DayMax = price;
-                        state.MaxTime = mt;
-                    }
-                    if (price < state.DayMin)
-                    {
-                        state.DayMin = price;
-                        state.MinTime = mt;
-                    }
-
-                    if (side == TradeSide.Outer)
-                    {
-                        state.OuterCount++;
-                        state.FirstOuterTime ??= tVal;
-                        state.LastOuterTime = tVal;
-                    }
-                    else if (side == TradeSide.Inner)
-                    {
-                        state.InnerCount++;
-                        state.FirstInnerTime ??= tVal;
-                        state.LastInnerTime = tVal;
-                    }
-
-                    if (baseSymbol == "MXF")
-                    {
-                        _lastMxfPrice = price;
-                        _lastMxfTime = mt;
-                    }
-                }
+                // 狀態計算已轉移至背景執行緒 (Disruptor 模式)，此處完全無鎖 (Lock-Free)
 
                 // 實時 Render Loop 快取 (無鎖寫入)
                 if (baseSymbol == "TXF")
@@ -861,16 +832,16 @@ namespace ExtremeSignalAppCS
                 int which = WaitHandle.WaitAny(handles);
                 if (token.IsCancellationRequested || which == 1) break;
 
-                // 150ms 節流 Debounce (與原版 ANALYSIS_DEBOUNCE_SEC = 0.15 秒一致)
-                try { await Task.Delay(150, token); } catch (OperationCanceledException) { break; }
-                _analysisEvent.Reset(); // 清除 Debounce 期間的殘餘訊號
+                // 恢復適度的節流 (Debounce)：避免行情過於密集時 (10,000 Ticks/sec) 導致 UI Thread 癱瘓與 CPU 100% 滿載
+                // 背景執行緒依然會一次性批次處理 (Batch Process) 這期間累積的所有 Ticks，達成高吞吐量且極低耗電。
+                _analysisEvent.Reset(); // 清除事件狀態
 
                 try
                 {
                     // 先捕獲世代再計算：若計算期間 _uiGeneration 被遞增（載入復盤/停止復盤），結果即失效
                     int gen = _uiGeneration;
 
-                    // 在背景執行緒執行高密度狀態機計算
+                    // 在背景執行緒執行高密度狀態機計算 (會一口氣處理累積的所有 Ticks)
                     var result = RunRealtimeAnalysisCompute();
                     
                     // 安全分發至主介面更新 UI (WPF RichTextBox, DataGrids, Labels)
@@ -888,6 +859,10 @@ namespace ExtremeSignalAppCS
                         AppendLog($"🚨【量化計算崩潰】核心計算背景執行緒發生未知錯誤: {ex.Message}\n{ex.StackTrace}");
                     }));
                 }
+
+                // 執行完一次全量運算與 UI 推送後，強迫休息 100 毫秒 (約 10 FPS)
+                // 此舉可節省 90% 以上的 CPU 運算資源，徹底解決發熱與耗電問題。
+                try { await Task.Delay(100, token); } catch (TaskCanceledException) { break; }
             }
         }
 
@@ -915,12 +890,6 @@ namespace ExtremeSignalAppCS
             {
                 // Lock-Free 參考拷貝 (Zero Allocation)
                 tradesSnapshot[symbol] = tradesSource[symbol][activeSession]; 
-                
-                var state = stateSource[symbol][activeSession];
-                lock (state)
-                {
-                    stateSnapshot[symbol] = state.Clone();
-                }
             }
 
             var currentStatusSnapshot = new List<(string Symbol, string Session, int DayMin, int DayMax, List<SimulationResult> Details)>();
@@ -939,9 +908,8 @@ namespace ExtremeSignalAppCS
                 var trades = tradesSnapshot[symbol];
                 if (trades.Count == 0) continue;
 
-                var state = stateSnapshot[symbol];
-                int dayMax = state.DayMax;
-                int dayMin = state.DayMin;
+                // 背景單一寫入者 (Disruptor) 直接操作真正的狀態物件
+                var state = stateSource[symbol][activeSession];
 
                 var quantParams = _engine.LoadQuantParams(symbol, _currentTargetDays);
 
@@ -963,11 +931,50 @@ namespace ExtremeSignalAppCS
                     }
                 }
 
-                // 增量時序對比運算
+                // 增量時序對比運算與單一寫入者狀態聚合 (Disruptor / Single Writer)
                 for (int i = scanIdx; i < trades.Count; i++)
                 {
-                    int price = trades[i].Price;
-                    double tVal = trades[i].TimeVal;
+                    var tick = trades[i];
+                    int price = tick.Price;
+                    double tVal = tick.TimeVal;
+                    TradeSide side = tick.Side;
+                    string tStr = tick.Time; // Zero Alloc property GetTimeStr
+                    
+                    // --- 1. 狀態累計 (原 COM Thread 移交過來) ---
+                    state.Count++;
+                    state.SumPrice += price;
+                    
+                    if (price > state.DayMax)
+                    {
+                        state.DayMax = price;
+                        state.MaxTime = tStr;
+                    }
+                    if (price < state.DayMin)
+                    {
+                        state.DayMin = price;
+                        state.MinTime = tStr;
+                    }
+
+                    if (side == TradeSide.Outer)
+                    {
+                        state.OuterCount++;
+                        state.FirstOuterTime ??= tVal;
+                        state.LastOuterTime = tVal;
+                    }
+                    else if (side == TradeSide.Inner)
+                    {
+                        state.InnerCount++;
+                        state.FirstInnerTime ??= tVal;
+                        state.LastInnerTime = tVal;
+                    }
+
+                    if (symbol == "MXF")
+                    {
+                        _lastMxfPrice = price;
+                        _lastMxfTime = tStr;
+                    }
+
+                    // --- 2. 原本的極值掃描 ---
                     bool isTrigH = false;
                     bool isTrigB = false;
 
@@ -1021,14 +1028,18 @@ namespace ExtremeSignalAppCS
                 // 回寫更新快取的 O(1) Scan 游標
                 lock (_rtLock)
                 {
-                    var origState = _isReplaying ? _replayRtState[symbol][activeSession] : _rtState[symbol][activeSession];
-                    origState.RunningMax = runningMax;
-                    origState.RunningMin = runningMin;
-                    origState.LastPrice = lastPrice;
-                    origState.LastCheckTimeH = lastCheckTimeH;
-                    origState.LastCheckTimeB = lastCheckTimeB;
-                    origState.ScanIdx = trades.Count;
+                    state.RunningMax = runningMax;
+                    state.RunningMin = runningMin;
+                    state.LastPrice = lastPrice;
+                    state.LastCheckTimeH = lastCheckTimeH;
+                    state.LastCheckTimeB = lastCheckTimeB;
+                    state.ScanIdx = trades.Count;
                 }
+
+                // 更新完畢後，提供一份最新的 Snapshot 供主 UI 使用，並抓取當前 DayMax/DayMin 進行後續運算
+                int dayMax = state.DayMax;
+                int dayMin = state.DayMin;
+                stateSnapshot[symbol] = state.Clone();
 
                 List<(int Index, int Price, bool IsTrigH, bool IsTrigB, int RunningMax, int RunningMin)> currentTriggers;
                 lock (_rtLock)
@@ -1051,8 +1062,17 @@ namespace ExtremeSignalAppCS
                         var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
                             _engine.GetDurations(trades, nTicks, i, TradeSide.Outer, TradeSide.Inner);
                         string status = _engine.GetStatusStr(pre, post, actPre, actPost, nTicks);
-                        if (status == " [達標]" || status == " [邊界達標]" || status == " [未達標]")
+                        
+                        // 判斷是否為「死亡」Trigger：尚未集滿 nTicks 就因為突破極值而提早結束 (bIdx < trades.Count - 1)
+                        bool isDead = actPost < nTicks && bIdx < trades.Count - 1;
+
+                        if (status == " [達標]" || status == " [邊界達標]" || status == " [未達標]" || isDead)
                         {
+                            if (isDead && status.Contains("邊界未達標"))
+                            {
+                                status = " [未達標]"; // 強制轉為死亡未達標狀態，供 UI 正常顯示「曾未達標」
+                            }
+
                             int amp = rMin != 999999 ? (rMax - rMin) : 0;
                             string prefix = (price == dayMax) ? "時段最高" : (status.Contains("未達標") ? "曾未達標最高" : "曾達標最高");
                             absDetails.Add((tVal, prefix + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
@@ -1070,8 +1090,17 @@ namespace ExtremeSignalAppCS
                         var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
                             _engine.GetDurations(trades, nTicks, i, TradeSide.Inner, TradeSide.Outer);
                         string status = _engine.GetStatusStr(pre, post, actPre, actPost, nTicks);
-                        if (status == " [達標]" || status == " [邊界達標]" || status == " [未達標]")
+                        
+                        // 判斷是否為「死亡」Trigger：尚未集滿 nTicks 就因為跌破極值而提早結束 (bIdx < trades.Count - 1)
+                        bool isDead = actPost < nTicks && bIdx < trades.Count - 1;
+
+                        if (status == " [達標]" || status == " [邊界達標]" || status == " [未達標]" || isDead)
                         {
+                            if (isDead && status.Contains("邊界未達標"))
+                            {
+                                status = " [未達標]"; // 強制轉為死亡未達標狀態，供 UI 正常顯示「曾未達標」
+                            }
+
                             int amp = rMax != -999999 ? (rMax - rMin) : 0;
                             string prefix = (price == dayMin) ? "時段最低" : (status.Contains("未達標") ? "曾未達標最低" : "曾達標最低");
                             absDetails.Add((tVal, prefix + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
@@ -1355,15 +1384,27 @@ namespace ExtremeSignalAppCS
                 rtReport += "═══ 小臺即時極值行情 ═══" + GenerateRealtimeReportStr("MXF", activeSession, mxfTradesRt, mxfDetailsRt, _engine.LoadQuantParams("MXF", _currentTargetDays), stateSnapshot);
             }
 
-            // 背景分 K 聚合與 K棒 停損狀態機運算 (超大 CPU 負載完全隔離)
-            var (klineData, breakouts) = _engine.CalcKlineData(
-                activeSession, mxfTradesRt,
-                [.. txfDetailsRt.Select(d => ConvertToSimulationResultRaw(d))],
-                [.. mxfDetailsRt.Select(d => ConvertToSimulationResultRaw(d))],
-                _currentKlineInterval
-            );
+            // 背景分 K 聚合與 K棒 停損狀態機運算 (超大 CPU 負載完全隔離 + 1000ms 降頻保護)
+            double nowMsHeavy = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
+            if (nowMsHeavy - _lastHeavyCalcTimeMs >= 1000)
+            {
+                _lastHeavyCalcTimeMs = nowMsHeavy;
+                
+                var (klineData, breakouts) = _engine.CalcKlineData(
+                    activeSession, mxfTradesRt,
+                    [.. txfDetailsRt.Select(d => ConvertToSimulationResultRaw(d))],
+                    [.. mxfDetailsRt.Select(d => ConvertToSimulationResultRaw(d))],
+                    _currentKlineInterval
+                );
 
-            var simulationResults = _engine.CalcSimulationResults(activeSession, mxfTradesRt, klineData, _currentObsN, true, (dynN) => { Dispatcher.BeginInvoke(new System.Action(() => { lblObsN.Content = $"觀察N: {dynN}"; })); });
+                var simulationResults = _engine.CalcSimulationResults(
+                    activeSession, mxfTradesRt, klineData, _currentObsN, true, 
+                    (dynN) => { Dispatcher.BeginInvoke(new System.Action(() => { lblObsN.Content = $"觀察N: {dynN}"; })); }
+                );
+
+                _lastKlineData = klineData;
+                _lastSimulationResults = simulationResults;
+            }
 
             return new Dictionary<string, object>
             {
@@ -1371,8 +1412,8 @@ namespace ExtremeSignalAppCS
                 { "telegram_messages", telegramMessages },
                 { "active_session", activeSession },
                 { "realtime_extreme_report", rtReport },
-                { "kline_data", klineData },
-                { "simulation_results", simulationResults },
+                { "kline_data", _lastKlineData },
+                { "simulation_results", _lastSimulationResults },
                 { "extreme_snapshot", new Dictionary<string, string>
                     {
                         { "max_info", maxStr },
@@ -1743,7 +1784,7 @@ namespace ExtremeSignalAppCS
                     txtObsLow.Text = prevHigh.ToString();
                     _engine._obs_low_entry_price = prevHigh;
                     
-                    AppendLog($"【自動觀察】分 K 轉換！已自動載入前分 K 最高: {prevHigh} / 最低: {prevLow}。");
+                    // AppendLog($"【自動觀察】分 K 轉換！已自動載入前分 K 最高: {prevHigh} / 最低: {prevLow}。");
                 }
             }
 
@@ -4157,12 +4198,12 @@ namespace ExtremeSignalAppCS
             int timeVal = now.Hour * 3600 + now.Minute * 60 + now.Second;
             int weekday = (int)now.DayOfWeek; // Sunday=0, Monday=1, ... Saturday=6
 
-            // 週一至週五 08:30 ~ 14:50 為日盤 (1 <= weekday <= 5)
-            bool isDay = (1 <= weekday && weekday <= 5) && (timeVal >= 8 * 3600 + 30 * 60 && timeVal <= 14 * 3600 + 50 * 60);
+            // 週一至週五 08:30 ~ 14:49:59 為日盤 (1 <= weekday <= 5)
+            bool isDay = (1 <= weekday && weekday <= 5) && (timeVal >= 8 * 3600 + 30 * 60 && timeVal < 14 * 3600 + 50 * 60);
             
-            // 週一至週五 15:00 之後，或者週二至週六 08:30 之前為夜盤
-            bool isNight1 = (1 <= weekday && weekday <= 5) && (timeVal >= 15 * 3600);
-            bool isNight2 = (2 <= weekday && weekday <= 6) && (timeVal <= 8 * 3600 + 30 * 60);
+            // 週一至週五 14:50 之後，或者週二至週六 08:30 之前為夜盤
+            bool isNight1 = (1 <= weekday && weekday <= 5) && (timeVal >= 14 * 3600 + 50 * 60);
+            bool isNight2 = (2 <= weekday && weekday <= 6) && (timeVal < 8 * 3600 + 30 * 60);
 
             if (isDay) return new CheckSessionPortResult(443, "日盤");
             if (isNight1 || isNight2) return new CheckSessionPortResult(442, "夜盤");

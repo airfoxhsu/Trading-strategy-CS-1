@@ -30,6 +30,21 @@ namespace ExtremeSignalAppCS.Services
         // 專案根目錄
         private readonly string _appDir;
 
+        // O(1) 增量狀態快取變數
+        private int _lastTxfIdx = 0;
+        private int _lastMxfIdx = 0;
+        private TradingState _dualStateTXF = new();
+        private TradingState _dualStateMXF = new();
+        private List<string> _cachedPushes = new();
+        private string? _lastConsensus = null;
+        private bool _hasPushed = false;
+
+        private Dictionary<string, (int LastIdx, Dictionary<int, (List<TradeTick> Trades, List<string> Signals, List<SimulationResult> SignalObjs)> Buckets)> _klineBucketsCache = new();
+
+        private DynamicNCalculator? _dynamicNCalc = null;
+        private List<int> _cachedDynamicNMap = new(40000);
+        private int _lastDynamicNTickIdx = 0;
+
         public TradingEngine()
         {
             _appDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -651,21 +666,39 @@ namespace ExtremeSignalAppCS.Services
 
             signalTVals.Sort((x, y) => x.TVals.CompareTo(y.TVals));
 
-            // 將 Tick 按時間區段分桶
-            var buckets = new Dictionary<int, (List<TradeTick> Trades, List<string> Signals, List<SimulationResult> SignalObjs)>();
+            // 將 Tick 按時間區段分桶 (O(1) 增量更新)
+            string cacheKey = $"{sessionName}_{intervalMins}";
+            if (!_klineBucketsCache.TryGetValue(cacheKey, out var cacheData))
+            {
+                cacheData = (0, new Dictionary<int, (List<TradeTick> Trades, List<string> Signals, List<SimulationResult> SignalObjs)>());
+            }
+
+            var buckets = cacheData.Buckets;
+            int lastProcessedIdx = cacheData.LastIdx;
             int totalTradesCount = trades.Count;
-            for (int i = 0; i < totalTradesCount; i++)
+
+            for (int i = lastProcessedIdx; i < totalTradesCount; i++)
             {
                 var t = trades[i];
                 double tVal = t.TimeVal;
                 if (tVal < startTVal) continue;
                 
                 int bucketIdx = (int)((tVal - startTVal) / interval);
-                if (!buckets.ContainsKey(bucketIdx))
+                if (!buckets.TryGetValue(bucketIdx, out var bucket))
                 {
-                    buckets[bucketIdx] = (new List<TradeTick>(), new List<string>(), new List<SimulationResult>());
+                    bucket = (new List<TradeTick>(), new List<string>(), new List<SimulationResult>());
+                    buckets[bucketIdx] = bucket;
                 }
-                buckets[bucketIdx].Trades.Add(t);
+                bucket.Trades.Add(t);
+            }
+
+            _klineBucketsCache[cacheKey] = (totalTradesCount, buckets);
+
+            // 清理舊的訊號標記，因為每次進來的 signals 可能會更新
+            foreach (var b in buckets.Values)
+            {
+                b.Signals.Clear();
+                b.SignalObjs.Clear();
             }
 
             // 將對應 B 點秒數的訊號放入時間分桶
@@ -674,9 +707,8 @@ namespace ExtremeSignalAppCS.Services
                 if (sigTVal >= startTVal)
                 {
                     int bucketIdx = (int)((sigTVal - startTVal) / interval);
-                    if (buckets.ContainsKey(bucketIdx))
+                    if (buckets.TryGetValue(bucketIdx, out var b))
                     {
-                        var b = buckets[bucketIdx];
                         if (b.Signals.Count == 0 || b.Signals[^1] != sigType)
                         {
                             b.Signals.Add(sigType);
@@ -808,31 +840,24 @@ namespace ExtremeSignalAppCS.Services
             if (klines == null || klines.Count < 2 || totalTradesCount == 0)
                 return new List<SimulationResult>();
 
-            int[]? dynamicNMap = null;
-            try
+            if (useDynamicN)
             {
-                if (useDynamicN)
+                if (_dynamicNCalc == null)
+                    _dynamicNCalc = new DynamicNCalculator(60.0, 3.0, 10, 150);
+
+                for (int i = _lastDynamicNTickIdx; i < totalTradesCount; i++)
                 {
-                    dynamicNMap = System.Buffers.ArrayPool<int>.Shared.Rent(totalTradesCount);
-                    var calc = new DynamicNCalculator(60.0, 3.0, 10, 150);
-                    for (int i = 0; i < totalTradesCount; i++)
-                    {
-                        dynamicNMap[i] = calc.UpdateAndGetDynamicN(trades![i].TimeVal);
-                    }
-                    onDynamicNUpdated?.Invoke(dynamicNMap[totalTradesCount - 1]);
+                    _cachedDynamicNMap.Add(_dynamicNCalc.UpdateAndGetDynamicN(trades![i].TimeVal));
                 }
-                return CalcSimulationResultsInternal(session, trades!, klines, obsN, dynamicNMap, totalTradesCount, useDynamicN);
+                _lastDynamicNTickIdx = totalTradesCount;
+
+                onDynamicNUpdated?.Invoke(_cachedDynamicNMap[totalTradesCount - 1]);
             }
-            finally
-            {
-                if (dynamicNMap != null)
-                {
-                    System.Buffers.ArrayPool<int>.Shared.Return(dynamicNMap);
-                }
-            }
+
+            return CalcSimulationResultsInternal(session, trades!, klines, obsN, useDynamicN ? _cachedDynamicNMap : null, totalTradesCount, useDynamicN);
         }
 
-        private List<SimulationResult> CalcSimulationResultsInternal(string session, IReadOnlyList<TradeTick> trades, List<KlineBar> klines, int obsN, int[]? dynamicNMap, int totalTradesCount, bool useDynamicN)
+        private List<SimulationResult> CalcSimulationResultsInternal(string session, IReadOnlyList<TradeTick> trades, List<KlineBar> klines, int obsN, IReadOnlyList<int>? dynamicNMap, int totalTradesCount, bool useDynamicN)
         {
             var results = new List<SimulationResult>();
 
@@ -1265,150 +1290,129 @@ namespace ExtremeSignalAppCS.Services
         }
 
         /// <summary>
-        /// 100% 移植共識推播歷史紀錄模擬。
+        /// 100% 移植共識推播歷史紀錄模擬 (O(1) 增量更新版)。
         /// </summary>
         public List<string> SimulateSpeedPushesDual(IReadOnlyList<TradeTick> txfTrades, IReadOnlyList<TradeTick> mxfTrades)
         {
-            var pushes = new List<string>();
+            int currentTxfCount = txfTrades.Count;
+            int currentMxfCount = mxfTrades.Count;
 
-            // 雙軌融合排序
-            var tagged = txfTrades.Select(t => (Sym: "TXF", Tick: t))
-                       .Concat(mxfTrades.Select(t => (Sym: "MXF", Tick: t)))
-                       .OrderBy(x => x.Tick.TimeVal)
-                       .ToList();
-
-            var states = new Dictionary<string, TradingState>
+            // 提取新增的 Ticks
+            var newTagged = new List<(string Sym, TradeTick Tick)>();
+            for (int i = _lastTxfIdx; i < currentTxfCount; i++)
             {
-                { "TXF", new TradingState() },
-                { "MXF", new TradingState() }
-            };
-
-            string? lastConsensus = null;
-            bool hasPushed = false;
-
-            foreach (var item in tagged)
+                newTagged.Add(("TXF", txfTrades[i]));
+            }
+            for (int i = _lastMxfIdx; i < currentMxfCount; i++)
             {
-                var sym = item.Sym;
-                var t = item.Tick;
-                var s = states[sym];
-
-                s.SumPrice += t.Price;
-                s.Count++;
-
-                if (t.Side == TradeSide.Outer)
-                {
-                    if (s.FirstOuterTime == null) s.FirstOuterTime = t.TimeVal;
-                    s.OuterCount++;
-                    s.LastOuterTime = t.TimeVal;
-                }
-                else if (t.Side == TradeSide.Inner)
-                {
-                    if (s.FirstInnerTime == null) s.FirstInnerTime = t.TimeVal;
-                    s.InnerCount++;
-                    s.LastInnerTime = t.TimeVal;
-                }
-
-                // 增量計算外內盤平均速度
-                double? oAvg = (s.OuterCount >= 2 && s.LastOuterTime.HasValue && s.FirstOuterTime.HasValue)
-                    ? (s.LastOuterTime.Value - s.FirstOuterTime.Value) / (s.OuterCount - 1)
-                    : null;
-
-                double? iAvg = (s.InnerCount >= 2 && s.LastInnerTime.HasValue && s.FirstInnerTime.HasValue)
-                    ? (s.LastInnerTime.Value - s.FirstInnerTime.Value) / (s.InnerCount - 1)
-                    : null;
-
-                string direction = "資料不足";
-                if (oAvg.HasValue && iAvg.HasValue)
-                {
-                    if (Math.Abs(oAvg.Value - iAvg.Value) > 0.01)
-                    {
-                        direction = oAvg.Value < iAvg.Value ? "多方 📈" : "空方 📉";
-                    }
-                    else
-                    {
-                        direction = "持平 ⚖️";
-                    }
-                }
-
-                // 更新此商品的方向
-                // 在 C# 中，我們先透過暫時方法對其做模擬狀態
-                // 但要實現多空共識的判定：
-                // Python: both_ready = all(state[k]["o_count"] >= 250 and state[k]["i_count"] >= 250 for k in ["TXF", "MXF"])
-                bool bothReady = states["TXF"].OuterCount >= 250 && states["TXF"].InnerCount >= 250 &&
-                                 states["MXF"].OuterCount >= 250 && states["MXF"].InnerCount >= 250;
-
-                if (!bothReady) continue;
-
-                // 重新計算 TXF 與 MXF 的當前方向
-                var (_, _, txfDir) = CalcSideSpeedFromState(states["TXF"]);
-                var (_, _, mxfDir) = CalcSideSpeedFromState(states["MXF"]);
-
-                string? consensus = null;
-                if (txfDir.Contains("多方") && mxfDir.Contains("多方"))
-                    consensus = "多方 📈";
-                else if (txfDir.Contains("空方") && mxfDir.Contains("空方"))
-                    consensus = "空方 📉";
-
-                if (consensus == null) continue;
-
-                bool switched = false;
-                string arrow = "";
-
-                if (lastConsensus != null)
-                {
-                    if (lastConsensus.Contains("空方") && consensus.Contains("多方"))
-                    {
-                        arrow = "空方 → 多方 📈";
-                        switched = true;
-                    }
-                    else if (lastConsensus.Contains("多方") && consensus.Contains("空方"))
-                    {
-                        arrow = "多方 → 空方 📉";
-                        switched = true;
-                    }
-                }
-                else if (!hasPushed)
-                {
-                    arrow = $"初步確立 → {consensus}";
-                    switched = true;
-                }
-
-                if (switched)
-                {
-                    hasPushed = true;
-                    lastConsensus = consensus;
-
-                    string spd(TradingState st, bool isOuter)
-                    {
-                        if (isOuter)
-                        {
-                            return (st.OuterCount >= 2 && st.LastOuterTime.HasValue && st.FirstOuterTime.HasValue)
-                                ? $"{(st.LastOuterTime.Value - st.FirstOuterTime.Value) / (st.OuterCount - 1):F4}s"
-                                : "--";
-                        }
-                        else
-                        {
-                            return (st.InnerCount >= 2 && st.LastInnerTime.HasValue && st.FirstInnerTime.HasValue)
-                                ? $"{(st.LastInnerTime.Value - st.FirstInnerTime.Value) / (st.InnerCount - 1):F4}s"
-                                : "--";
-                        }
-                    }
-
-                    int avgPri(TradingState st)
-                    {
-                        return st.Count > 0 ? (int)Math.Round((double)st.SumPrice / st.Count) : 0;
-                    }
-
-                    string pushMsg =
-                        $"    [共識推播] {t.Time} | {arrow.PadRight(15)} | 價: {t.Price,-5}" +
-                        $" | 大臺 外:{spd(states["TXF"], true)} 內:{spd(states["TXF"], false)} 均價:{avgPri(states["TXF"])}" +
-                        $" | 小臺 外:{spd(states["MXF"], true)} 內:{spd(states["MXF"], false)} 均價:{avgPri(states["MXF"])}";
-                    
-                    pushes.Add(pushMsg);
-                }
+                newTagged.Add(("MXF", mxfTrades[i]));
             }
 
-            return pushes;
+            if (newTagged.Count > 0)
+            {
+                // 只對新增部分進行時間排序
+                newTagged.Sort((x, y) => x.Tick.TimeVal.CompareTo(y.Tick.TimeVal));
+
+                foreach (var item in newTagged)
+                {
+                    var sym = item.Sym;
+                    var t = item.Tick;
+                    var s = sym == "TXF" ? _dualStateTXF : _dualStateMXF;
+
+                    s.SumPrice += t.Price;
+                    s.Count++;
+
+                    if (t.Side == TradeSide.Outer)
+                    {
+                        if (s.FirstOuterTime == null) s.FirstOuterTime = t.TimeVal;
+                        s.OuterCount++;
+                        s.LastOuterTime = t.TimeVal;
+                    }
+                    else if (t.Side == TradeSide.Inner)
+                    {
+                        if (s.FirstInnerTime == null) s.FirstInnerTime = t.TimeVal;
+                        s.InnerCount++;
+                        s.LastInnerTime = t.TimeVal;
+                    }
+
+                    bool bothReady = _dualStateTXF.OuterCount >= 250 && _dualStateTXF.InnerCount >= 250 &&
+                                     _dualStateMXF.OuterCount >= 250 && _dualStateMXF.InnerCount >= 250;
+
+                    if (!bothReady) continue;
+
+                    var (_, _, txfDir) = CalcSideSpeedFromState(_dualStateTXF);
+                    var (_, _, mxfDir) = CalcSideSpeedFromState(_dualStateMXF);
+
+                    string? consensus = null;
+                    if (txfDir.Contains("多方") && mxfDir.Contains("多方"))
+                        consensus = "多方 📈";
+                    else if (txfDir.Contains("空方") && mxfDir.Contains("空方"))
+                        consensus = "空方 📉";
+
+                    if (consensus == null) continue;
+
+                    bool switched = false;
+                    string arrow = "";
+
+                    if (_lastConsensus != null)
+                    {
+                        if (_lastConsensus.Contains("空方") && consensus.Contains("多方"))
+                        {
+                            arrow = "空方 → 多方 📈";
+                            switched = true;
+                        }
+                        else if (_lastConsensus.Contains("多方") && consensus.Contains("空方"))
+                        {
+                            arrow = "多方 → 空方 📉";
+                            switched = true;
+                        }
+                    }
+                    else if (!_hasPushed)
+                    {
+                        arrow = $"初步確立 → {consensus}";
+                        switched = true;
+                    }
+
+                    if (switched)
+                    {
+                        _hasPushed = true;
+                        _lastConsensus = consensus;
+
+                        string spd(TradingState st, bool isOuter)
+                        {
+                            if (isOuter)
+                            {
+                                return (st.OuterCount >= 2 && st.LastOuterTime.HasValue && st.FirstOuterTime.HasValue)
+                                    ? $"{(st.LastOuterTime.Value - st.FirstOuterTime.Value) / (st.OuterCount - 1):F4}s"
+                                    : "--";
+                            }
+                            else
+                            {
+                                return (st.InnerCount >= 2 && st.LastInnerTime.HasValue && st.FirstInnerTime.HasValue)
+                                    ? $"{(st.LastInnerTime.Value - st.FirstInnerTime.Value) / (st.InnerCount - 1):F4}s"
+                                    : "--";
+                            }
+                        }
+
+                        int avgPri(TradingState st)
+                        {
+                            return st.Count > 0 ? (int)Math.Round((double)st.SumPrice / st.Count) : 0;
+                        }
+
+                        string pushMsg =
+                            $"    [共識推播] {t.Time} | {arrow.PadRight(15)} | 價: {t.Price,-5}" +
+                            $" | 大臺 外:{spd(_dualStateTXF, true)} 內:{spd(_dualStateTXF, false)} 均價:{avgPri(_dualStateTXF)}" +
+                            $" | 小臺 外:{spd(_dualStateMXF, true)} 內:{spd(_dualStateMXF, false)} 均價:{avgPri(_dualStateMXF)}";
+                        
+                        _cachedPushes.Add(pushMsg);
+                    }
+                }
+
+                _lastTxfIdx = currentTxfCount;
+                _lastMxfIdx = currentMxfCount;
+            }
+
+            return _cachedPushes;
         }
 
         /// <summary>
@@ -1583,6 +1587,21 @@ namespace ExtremeSignalAppCS.Services
         public void ClearCache()
         {
             _simKlineCache.Clear();
+
+            // O(1) 狀態重置
+            _lastTxfIdx = 0;
+            _lastMxfIdx = 0;
+            _dualStateTXF = new TradingState();
+            _dualStateMXF = new TradingState();
+            _cachedPushes.Clear();
+            _lastConsensus = null;
+            _hasPushed = false;
+
+            _klineBucketsCache.Clear();
+
+            _dynamicNCalc = null;
+            _cachedDynamicNMap.Clear();
+            _lastDynamicNTickIdx = 0;
         }
     }
 }
