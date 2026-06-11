@@ -158,19 +158,40 @@ namespace ExtremeSignalAppCS.Services
         /// <summary>
         /// 計算外盤與內盤的每筆平均間隔時間與共識方向。
         /// </summary>
-        public (double? OuterAvg, double? InnerAvg, string Direction) CalcSideSpeed(IReadOnlyList<TradeTick> trades)
+        public (double? OuterAvg, double? InnerAvg, string Direction) CalcSideSpeed(IReadOnlyList<TradeTick> trades, int maxCount = -1)
         {
-            var outerTimes = trades.Where(t => t.Side == TradeSide.Outer).Select(t => t.TimeVal).ToList();
-            var innerTimes = trades.Where(t => t.Side == TradeSide.Inner).Select(t => t.TimeVal).ToList();
+            int totalTradesCount = trades.Count;
+            int count = (maxCount < 0 || maxCount > totalTradesCount) ? totalTradesCount : maxCount;
+            int outerCount = 0;
+            int innerCount = 0;
+            double? firstOuter = null, lastOuter = null;
+            double? firstInner = null, lastInner = null;
+
+            for (int i = 0; i < count; i++)
+            {
+                var t = trades[i];
+                if (t.Side == TradeSide.Outer)
+                {
+                    if (!firstOuter.HasValue) firstOuter = t.TimeVal;
+                    lastOuter = t.TimeVal;
+                    outerCount++;
+                }
+                else if (t.Side == TradeSide.Inner)
+                {
+                    if (!firstInner.HasValue) firstInner = t.TimeVal;
+                    lastInner = t.TimeVal;
+                    innerCount++;
+                }
+            }
 
             double? outerAvg = null;
             double? innerAvg = null;
 
-            if (outerTimes.Count >= 2)
-                outerAvg = (outerTimes[^1] - outerTimes[0]) / (outerTimes.Count - 1);
+            if (outerCount >= 2 && lastOuter.HasValue && firstOuter.HasValue)
+                outerAvg = (lastOuter.Value - firstOuter.Value) / (outerCount - 1);
 
-            if (innerTimes.Count >= 2)
-                innerAvg = (innerTimes[^1] - innerTimes[0]) / (innerTimes.Count - 1);
+            if (innerCount >= 2 && lastInner.HasValue && firstInner.HasValue)
+                innerAvg = (lastInner.Value - firstInner.Value) / (innerCount - 1);
 
             string direction = "資料不足";
             if (outerAvg.HasValue && innerAvg.HasValue)
@@ -226,7 +247,8 @@ namespace ExtremeSignalAppCS.Services
         public (double? PreAvg, double? PostAvg, int? Threshold, string? TrigTime, int? TrigPrice, int ActPre, int ActPost, int LastIndex)
             GetDurations(IReadOnlyList<TradeTick> trades, int n, int idx, TradeSide preSide, TradeSide postSide, int maxCount = -1)
         {
-            int limit = maxCount < 0 ? trades.Count : maxCount;
+            int totalTradesCount = trades.Count;
+            int limit = maxCount < 0 ? totalTradesCount : maxCount;
             if (idx >= limit || idx < 0)
                 return (null, null, null, null, null, 0, 0, idx);
 
@@ -631,7 +653,8 @@ namespace ExtremeSignalAppCS.Services
 
             // 將 Tick 按時間區段分桶
             var buckets = new Dictionary<int, (List<TradeTick> Trades, List<string> Signals, List<SimulationResult> SignalObjs)>();
-            for (int i = 0; i < trades.Count; i++)
+            int totalTradesCount = trades.Count;
+            for (int i = 0; i < totalTradesCount; i++)
             {
                 var t = trades[i];
                 double tVal = t.TimeVal;
@@ -781,21 +804,37 @@ namespace ExtremeSignalAppCS.Services
         /// </summary>
         public List<SimulationResult> CalcSimulationResults(string session, IReadOnlyList<TradeTick> trades, List<KlineBar> klines, int obsN, bool useDynamicN = false, Action<int>? onDynamicNUpdated = null)
         {
-            var results = new List<SimulationResult>();
-            if (klines == null || klines.Count < 2 || trades == null || trades.Count == 0)
-                return results;
+            int totalTradesCount = trades?.Count ?? 0;
+            if (klines == null || klines.Count < 2 || totalTradesCount == 0)
+                return new List<SimulationResult>();
 
             int[]? dynamicNMap = null;
-            if (useDynamicN)
+            try
             {
-                dynamicNMap = new int[trades.Count];
-                var calc = new DynamicNCalculator(60.0, 3.0, 10, 150);
-                for (int i = 0; i < trades.Count; i++)
+                if (useDynamicN)
                 {
-                    dynamicNMap[i] = calc.UpdateAndGetDynamicN(trades[i].TimeVal);
+                    dynamicNMap = System.Buffers.ArrayPool<int>.Shared.Rent(totalTradesCount);
+                    var calc = new DynamicNCalculator(60.0, 3.0, 10, 150);
+                    for (int i = 0; i < totalTradesCount; i++)
+                    {
+                        dynamicNMap[i] = calc.UpdateAndGetDynamicN(trades![i].TimeVal);
+                    }
+                    onDynamicNUpdated?.Invoke(dynamicNMap[totalTradesCount - 1]);
                 }
-                onDynamicNUpdated?.Invoke(dynamicNMap[^1]);
+                return CalcSimulationResultsInternal(session, trades!, klines, obsN, dynamicNMap, totalTradesCount, useDynamicN);
             }
+            finally
+            {
+                if (dynamicNMap != null)
+                {
+                    System.Buffers.ArrayPool<int>.Shared.Return(dynamicNMap);
+                }
+            }
+        }
+
+        private List<SimulationResult> CalcSimulationResultsInternal(string session, IReadOnlyList<TradeTick> trades, List<KlineBar> klines, int obsN, int[]? dynamicNMap, int totalTradesCount, bool useDynamicN)
+        {
+            var results = new List<SimulationResult>();
 
             var klineBoundaries = new List<(double startT, double endT, int obsHighEntry, int obsLowEntry, int prevHigh, int prevLow)>();
 
@@ -871,9 +910,9 @@ namespace ExtremeSignalAppCS.Services
                     continue;
                 }
 
-                // 尋找此分K在 Tick 陣列中的起點與終點索引
+                // 尋找此 K 棒的 Tick 起始點與結束點
                 int klineStartIdx = lastKnownStartIdx;
-                for (int idx = lastKnownStartIdx; idx < trades.Count; idx++)
+                for (int idx = lastKnownStartIdx; idx < totalTradesCount; idx++)
                 {
                     if (trades[idx].TimeVal >= klineStart)
                     {
@@ -882,8 +921,8 @@ namespace ExtremeSignalAppCS.Services
                     }
                 }
 
-                int klineEndTradeIdx = trades.Count;
-                for (int idx = Math.Max(lastKnownEndIdx, klineStartIdx); idx < trades.Count; idx++)
+                int klineEndTradeIdx = totalTradesCount;
+                for (int idx = Math.Max(lastKnownEndIdx, klineStartIdx); idx < totalTradesCount; idx++)
                 {
                     if (trades[idx].TimeVal >= klineEnd)
                     {
@@ -1128,8 +1167,8 @@ namespace ExtremeSignalAppCS.Services
                     }
                 }
 
-                // 找尋從當前 B 點到下一筆 B 點 (Chrono 盤中檢測) 與到最後 Tick (Greedy 全局檢測) 的資料切片
-                int nextBIndex = trades.Count;
+                // 計算前往 B 點下一個 B 點 (Chrono 停損點) 與最後 Tick (Greedy 停損點) 之間
+                int nextBIndex = totalTradesCount;
                 int currentListIdx = aggregatedRawResults.FindIndex(k => k.Key == key);
                 if (currentListIdx + 1 < aggregatedRawResults.Count)
                 {
@@ -1142,8 +1181,8 @@ namespace ExtremeSignalAppCS.Services
 
                 if (lockedSL.HasValue)
                 {
-                    int chronoEnd = Math.Min(nextBIndex, trades.Count);
-                    int greedyEnd = trades.Count;
+                    int chronoEnd = Math.Min(nextBIndex, totalTradesCount);
+                    int greedyEnd = totalTradesCount;
                     
                     if (sigType == "K低")
                     {
@@ -1375,39 +1414,52 @@ namespace ExtremeSignalAppCS.Services
         /// <summary>
         /// 100% 移植 _get_speed_snapshot_str。
         /// </summary>
-        public string GetSpeedSnapshotStr(string symbol, List<TradeTick> trades, int trigIdx, List<TradeTick> otherTradesAll, Dictionary<string, double?>? lastNetSpeeds = null)
+        public string GetSpeedSnapshotStr(string symbol, IReadOnlyList<TradeTick> trades, int trigIdx, IReadOnlyList<TradeTick> otherTradesAll, Dictionary<string, double?>? lastNetSpeeds = null)
         {
-            if (trigIdx >= trades.Count)
-                trigIdx = trades.Count - 1;
+            int totalTradesCount = trades.Count;
+            if (trigIdx >= totalTradesCount)
+                trigIdx = totalTradesCount - 1;
 
             if (trigIdx < 0)
                 return "    成交速度: 資料不足";
 
             double targetTVal = trades[trigIdx].TimeVal;
-            var tradesUpToTrig = trades.Take(trigIdx + 1).ToList();
+            int tradesUpToTrigCount = trigIdx + 1;
 
-            var (oAvg, iAvg, dStr) = CalcSideSpeed(tradesUpToTrig);
-            int oCnt = tradesUpToTrig.Count(t => t.Side == TradeSide.Outer);
-            int iCnt = tradesUpToTrig.Count(t => t.Side == TradeSide.Inner);
+            var (oAvg, iAvg, dStr) = CalcSideSpeed(trades, tradesUpToTrigCount);
+            
+            int oCnt = 0, iCnt = 0;
+            long sumPrice = 0;
+            for (int i = 0; i < tradesUpToTrigCount; i++)
+            {
+                if (trades[i].Side == TradeSide.Outer) oCnt++;
+                else if (trades[i].Side == TradeSide.Inner) iCnt++;
+                sumPrice += trades[i].Price;
+            }
 
             string oS = oAvg.HasValue ? $"{oAvg.Value:F4}s/{oCnt,5}筆" : "資料不足";
             string iS = iAvg.HasValue ? $"{iAvg.Value:F4}s/{iCnt,5}筆" : "資料不足";
-            int avgPri = tradesUpToTrig.Count > 0 ? (int)Math.Round(tradesUpToTrig.Sum(t => (double)t.Price) / tradesUpToTrig.Count) : 0;
+            int avgPri = tradesUpToTrigCount > 0 ? (int)Math.Round((double)sumPrice / tradesUpToTrigCount) : 0;
 
-            double? CalcNet(List<TradeTick> trList)
+            double? CalcNet(IReadOnlyList<TradeTick> trList, int count)
             {
-                var (oa, ia, _) = CalcSideSpeed(trList);
+                var (oa, ia, _) = CalcSideSpeed(trList, count);
                 if (oa.HasValue && ia.HasValue)
                     return ia.Value - oa.Value;
                 return null;
             }
 
-            double? baseNet = CalcNet(tradesUpToTrig);
+            double? baseNet = CalcNet(trades, tradesUpToTrigCount);
             string baseSym = symbol.Contains("TXF") ? "TXF" : "MXF";
             string otherSym = symbol.Contains("TXF") ? "MXF" : "TXF";
 
-            var otherTradesUpTo = otherTradesAll.Where(t => t.TimeVal <= targetTVal).ToList();
-            double? otherNet = CalcNet(otherTradesUpTo);
+            int otherCount = 0;
+            for (int i = 0; i < otherTradesAll.Count; i++)
+            {
+                if (otherTradesAll[i].TimeVal <= targetTVal) otherCount++;
+                else break; // 假定時間有序，提早跳出
+            }
+            double? otherNet = CalcNet(otherTradesAll, otherCount);
 
             var netSpeedsDisp = new Dictionary<string, string> { { "TXF", "--" }, { "MXF", "--" } };
 
