@@ -45,6 +45,28 @@ namespace ExtremeSignalAppCS.Services
         private List<int> _cachedDynamicNMap = new(40000);
         private int _lastDynamicNTickIdx = 0;
 
+        // 新增：K線聚合快取
+        private readonly List<KlineBar> _cachedKlineData = new();
+        private readonly List<(string Direction, string BreakTime, string SigTime, List<SimulationResult> SigObjs)> _cachedBreakouts = new();
+        private int _lastCompletedBucketIdx = -1;
+        private double? _prevHighCache = null;
+        private double? _prevLowCache = null;
+        private double? _pendingLongTriggerPriceCache = null;
+        private double? _pendingShortTriggerPriceCache = null;
+        private List<SimulationResult> _pendingLongSignalObjsCache = new();
+        private List<SimulationResult> _pendingShortSignalObjsCache = new();
+        private string _pendingLongTimeLabelCache = "";
+        private string _pendingShortTimeLabelCache = "";
+        private string _klineCacheSessionKey = "";
+
+        // 新增：模擬狀態機當前 K 棒進度快取
+        private string _simCurrentKlineKey = "";
+        private int _simSearchStartShort = 0;
+        private int _simSearchStartLong = 0;
+        private List<( (int Price, string ATime, int ObsN) Key, SimulationResult Raw, List<string> Tags )> _simCurrentKlineResults = new();
+
+
+
         public TradingEngine()
         {
             _appDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -225,6 +247,17 @@ namespace ExtremeSignalAppCS.Services
         }
 
         /// <summary>
+        /// 獨立計算速差 (InnerAvg - OuterAvg) 的方法。
+        /// </summary>
+        public double? CalcNetSpeed(IReadOnlyList<TradeTick> trList, int count)
+        {
+            var (oa, ia, _) = CalcSideSpeed(trList, count);
+            if (oa.HasValue && ia.HasValue)
+                return ia.Value - oa.Value;
+            return null;
+        }
+
+        /// <summary>
         /// 從當前快取狀態計算內外盤的平均速度與共識方向 (100% 移植原版邏輯)。
         /// </summary>
         public (double? OuterAvg, double? InnerAvg, string Direction) CalcSideSpeedFromState(TradingState state)
@@ -255,57 +288,41 @@ namespace ExtremeSignalAppCS.Services
         }
 
         /// <summary>
-        /// 100% 移植 get_durations 核心判定邏輯。
-        /// 在 B 點未確認前，A 點價格絕對不准突破（做空不准創新高，做多不准創新低），
-        /// 這是系統過濾雜訊、保證訊號高勝率的物理護城河。
+        /// GetDurations 實作已移至上方並改為增量版。
+        /// 這裡提供 GetDurationsFull 供離線回測或全量重算使用 (一次掃描到底)。
         /// </summary>
         public (double? PreAvg, double? PostAvg, int? Threshold, string? TrigTime, int? TrigPrice, int ActPre, int ActPost, int LastIndex)
-            GetDurations(IReadOnlyList<TradeTick> trades, int n, int idx, TradeSide preSide, TradeSide postSide, int maxCount = -1)
+            GetDurationsFull(IReadOnlyList<TradeTick> trades, int n, int idx, TradeSide preSide, TradeSide postSide, int maxCount = -1)
         {
             int totalTradesCount = trades.Count;
             int limit = maxCount < 0 ? totalTradesCount : maxCount;
             if (idx >= limit || idx < 0)
                 return (null, null, null, null, null, 0, 0, idx);
 
-            // 前向：蒐集 idx 及其前 n 筆同盤成交 (pre_list)
             var preList = new List<TradeTick> { trades[idx] };
             int curr = idx - 1;
             while (curr >= 0 && preList.Count < (n + 1))
             {
-                if (trades[curr].Side == preSide)
-                {
-                    preList.Add(trades[curr]);
-                }
+                if (trades[curr].Side == preSide) preList.Add(trades[curr]);
                 curr--;
             }
 
-            // 後向：蒐集 idx 及其後 n 筆同盤成交 (post_list)
             var postList = new List<TradeTick> { trades[idx] };
             int extremePrice = trades[idx].Price;
             curr = idx + 1;
 
             while (curr < limit && postList.Count < (n + 1))
             {
-                // 約束條件：B 點形成前 A 點不准被突破
-                if (postSide == TradeSide.Inner) // 疑似頭部，不准再創新高
+                if (postSide == TradeSide.Inner) 
                 {
-                    if (trades[curr].Price > extremePrice)
-                    {
-                        return (null, null, null, null, null, preList.Count - 1, postList.Count - 1, curr - 1);
-                    }
+                    if (trades[curr].Price > extremePrice) return (null, null, null, null, null, preList.Count - 1, postList.Count - 1, curr - 1);
                 }
-                else // 疑似底部，不准再創新低
+                else 
                 {
-                    if (trades[curr].Price < extremePrice)
-                    {
-                        return (null, null, null, null, null, preList.Count - 1, postList.Count - 1, curr - 1);
-                    }
+                    if (trades[curr].Price < extremePrice) return (null, null, null, null, null, preList.Count - 1, postList.Count - 1, curr - 1);
                 }
 
-                if (trades[curr].Side == postSide)
-                {
-                    postList.Add(trades[curr]);
-                }
+                if (trades[curr].Side == postSide) postList.Add(trades[curr]);
                 curr++;
             }
 
@@ -316,10 +333,7 @@ namespace ExtremeSignalAppCS.Services
             if (actualPreN >= 1)
             {
                 double preSum = 0;
-                for (int i = 0; i < actualPreN; i++)
-                {
-                    preSum += (preList[i].TimeVal - preList[i + 1].TimeVal);
-                }
+                for (int i = 0; i < actualPreN; i++) preSum += (preList[i].TimeVal - preList[i + 1].TimeVal);
                 preAvg = preSum / actualPreN;
             }
 
@@ -327,10 +341,7 @@ namespace ExtremeSignalAppCS.Services
             if (actualPostN >= n)
             {
                 double postSum = 0;
-                for (int i = 0; i < actualPostN; i++)
-                {
-                    postSum += (postList[i + 1].TimeVal - postList[i].TimeVal);
-                }
+                for (int i = 0; i < actualPostN; i++) postSum += (postList[i + 1].TimeVal - postList[i].TimeVal);
                 postAvg = postSum / actualPostN;
             }
 
@@ -340,14 +351,8 @@ namespace ExtremeSignalAppCS.Services
 
             if (actualPostN >= 1)
             {
-                if (postSide == TradeSide.Inner)
-                {
-                    threshold = postList.Min(t => t.Price);
-                }
-                else
-                {
-                    threshold = postList.Max(t => t.Price);
-                }
+                if (postSide == TradeSide.Inner) threshold = postList.Min(t => t.Price);
+                else threshold = postList.Max(t => t.Price);
                 trigTime = postList[^1].Time;
                 trigPrice = postList[^1].Price;
             }
@@ -355,9 +360,140 @@ namespace ExtremeSignalAppCS.Services
             return (preAvg, postAvg, threshold, trigTime, trigPrice, actualPreN, actualPostN, curr - 1);
         }
 
+        public void GetDurations(IReadOnlyList<TradeTick> trades, int n, PendingTrigger trigger, TradeSide preSide, TradeSide postSide)
+        {
+            int totalTradesCount = trades.Count;
+            int idx = trigger.Index;
+
+            if (!trigger.PreScanned)
+            {
+                // 前向：蒐集 idx 及其前 n 筆同盤成交 (pre_list)
+                int preCount = 1;
+                int currPre = idx - 1;
+                double preSum = 0;
+                double? lastPreTime = trades[idx].TimeVal;
+
+                while (currPre >= 0 && preCount < (n + 1))
+                {
+                    if (trades[currPre].Side == preSide)
+                    {
+                        preCount++;
+                        preSum += (lastPreTime.Value - trades[currPre].TimeVal);
+                        lastPreTime = trades[currPre].TimeVal;
+                    }
+                    currPre--;
+                }
+                
+                trigger.ActualPreN = preCount - 1;
+                trigger.PreAvg = (trigger.ActualPreN >= 1) ? (preSum / trigger.ActualPreN) : null;
+                trigger.PreScanned = true;
+            }
+
+            // 後向：增量接續掃描
+            int extremePrice = trades[idx].Price;
+            int curr = trigger.ScanIndex;
+            
+            // 第一次進入，初始化 PostCount 等狀態
+            if (trigger.ActualPostN == 0 && trigger.LastPostTimeVal == null)
+            {
+                trigger.LastPostTimeVal = trades[idx].TimeVal;
+                if (postSide == TradeSide.Inner) trigger.Threshold = extremePrice; // 初始化為極值
+                else trigger.Threshold = extremePrice;
+            }
+
+            while (curr < totalTradesCount && trigger.ActualPostN < n)
+            {
+                // 約束條件：B 點形成前 A 點不准被突破
+                if (postSide == TradeSide.Inner) // 疑似頭部，不准再創新高
+                {
+                    if (trades[curr].Price > extremePrice)
+                    {
+                        trigger.ScanIndex = curr; // 記錄跌破位置
+                        return;
+                    }
+                }
+                else // 疑似底部，不准再創新低
+                {
+                    if (trades[curr].Price < extremePrice)
+                    {
+                        trigger.ScanIndex = curr;
+                        return;
+                    }
+                }
+
+                if (trades[curr].Side == postSide)
+                {
+                    trigger.ActualPostN++;
+                    trigger.PostSum += (trades[curr].TimeVal - trigger.LastPostTimeVal.GetValueOrDefault(trades[curr].TimeVal));
+                    trigger.LastPostTimeVal = trades[curr].TimeVal;
+                    
+                    if (postSide == TradeSide.Inner && trades[curr].Price < (trigger.Threshold ?? 999999))
+                        trigger.Threshold = trades[curr].Price;
+                    else if (postSide == TradeSide.Outer && trades[curr].Price > (trigger.Threshold ?? -999999))
+                        trigger.Threshold = trades[curr].Price;
+                        
+                    trigger.TrigTime = trades[curr].Time;
+                    trigger.TrigPrice = trades[curr].Price;
+                }
+                curr++;
+            }
+            
+            trigger.ScanIndex = curr; // 記錄本次掃描的終點，下次直接從此處接續
+        }
+
+        /// <summary>
+        /// 使用 Binary Search 尋找大於等於 targetTime 的第一筆 Tick 索引。
+        /// 找不到則回傳 trades.Count。
+        /// </summary>
+        public int FindFirstTickIndexGEQ(IReadOnlyList<TradeTick> trades, double targetTime)
+        {
+            int left = 0;
+            int right = trades.Count - 1;
+            int ans = trades.Count;
+            while (left <= right)
+            {
+                int mid = left + (right - left) / 2;
+                if (trades[mid].TimeVal >= targetTime)
+                {
+                    ans = mid;
+                    right = mid - 1; // 往左找更早的
+                }
+                else
+                {
+                    left = mid + 1;
+                }
+            }
+            return ans;
+        }
+
         /// <summary>
         /// 100% 移植原始 _get_status_str 邏輯。
         /// </summary>
+        /// <summary>
+        /// 使用 Binary Search 尋找時間小於等於 targetTime 的 Tick 數量。
+        /// 將線性掃描 O(N) 降至 O(log N)。
+        /// </summary>
+        public int FindTickCountByTime(IReadOnlyList<TradeTick> trades, double targetTime)
+        {
+            int left = 0;
+            int right = trades.Count - 1;
+            int ans = 0;
+            while (left <= right)
+            {
+                int mid = left + (right - left) / 2;
+                if (trades[mid].TimeVal <= targetTime)
+                {
+                    ans = mid + 1;
+                    left = mid + 1;
+                }
+                else
+                {
+                    right = mid - 1;
+                }
+            }
+            return ans;
+        }
+
         public string GetStatusStr(double? pre, double? post, int actualPre, int actualPost, int expectedN)
         {
             if (actualPre >= expectedN && actualPost >= expectedN)
@@ -718,24 +854,44 @@ namespace ExtremeSignalAppCS.Services
                 }
             }
 
-            var klineData = new List<KlineBar>();
-            var breakouts = new List<(string Direction, string BreakTime, string SigTime, List<SimulationResult> SigObjs)>();
-
-            double? prevHigh = null;
-            double? prevLow = null;
-
-            double? pendingLongTriggerPrice = null;
-            double? pendingShortTriggerPrice = null;
-            var pendingLongSignalObjs = new List<SimulationResult>();
-            var pendingShortSignalObjs = new List<SimulationResult>();
-            string pendingLongTimeLabel = "";
-            string pendingShortTimeLabel = "";
-
             var sortedIndices = buckets.Keys.ToList();
             sortedIndices.Sort();
 
+            string sessionKey = $"{sessionName}_{intervalMins}";
+            if (_klineCacheSessionKey != sessionKey)
+            {
+                _klineCacheSessionKey = sessionKey;
+                _cachedKlineData.Clear();
+                _cachedBreakouts.Clear();
+                _lastCompletedBucketIdx = -1;
+                _prevHighCache = null;
+                _prevLowCache = null;
+                _pendingLongTriggerPriceCache = null;
+                _pendingShortTriggerPriceCache = null;
+                _pendingLongSignalObjsCache.Clear();
+                _pendingShortSignalObjsCache.Clear();
+                _pendingLongTimeLabelCache = "";
+                _pendingShortTimeLabelCache = "";
+            }
+
+            var klineData = new List<KlineBar>(_cachedKlineData);
+            var breakouts = new List<(string Direction, string BreakTime, string SigTime, List<SimulationResult> SigObjs)>(_cachedBreakouts);
+
+            double? prevHigh = _prevHighCache;
+            double? prevLow = _prevLowCache;
+
+            double? pendingLongTriggerPrice = _pendingLongTriggerPriceCache;
+            double? pendingShortTriggerPrice = _pendingShortTriggerPriceCache;
+            var pendingLongSignalObjs = new List<SimulationResult>(_pendingLongSignalObjsCache);
+            var pendingShortSignalObjs = new List<SimulationResult>(_pendingShortSignalObjsCache);
+            string pendingLongTimeLabel = _pendingLongTimeLabelCache;
+            string pendingShortTimeLabel = _pendingShortTimeLabelCache;
+
             foreach (var bIdx in sortedIndices)
             {
+                if (bIdx <= _lastCompletedBucketIdx) continue;
+                bool isLastBucket = (bIdx == sortedIndices[^1]);
+
                 var bTrades = buckets[bIdx].Trades;
                 if (bTrades.Count == 0) continue;
 
@@ -825,6 +981,23 @@ namespace ExtremeSignalAppCS.Services
 
                 var klineBar = new KlineBar(timeLabel, highP, lowP, openP, closeP, signalsStr, breakHighText, breakLowText, tag);
                 klineData.Add(klineBar);
+
+                if (!isLastBucket)
+                {
+                    _cachedKlineData.Add(klineBar);
+                    _cachedBreakouts.Clear();
+                    _cachedBreakouts.AddRange(breakouts);
+
+                    _lastCompletedBucketIdx = bIdx;
+                    _prevHighCache = prevHigh;
+                    _prevLowCache = prevLow;
+                    _pendingLongTriggerPriceCache = pendingLongTriggerPrice;
+                    _pendingShortTriggerPriceCache = pendingShortTriggerPrice;
+                    _pendingLongSignalObjsCache = new List<SimulationResult>(pendingLongSignalObjs);
+                    _pendingShortSignalObjsCache = new List<SimulationResult>(pendingShortSignalObjs);
+                    _pendingLongTimeLabelCache = pendingLongTimeLabel;
+                    _pendingShortTimeLabelCache = pendingShortTimeLabel;
+                }
             }
 
             return (klineData, breakouts);
@@ -923,6 +1096,7 @@ namespace ExtremeSignalAppCS.Services
                 // 重要：快取命中時，仍需加入 aggregatedRawResults 走第三階段停損狀態機，
                 //       不可直接 results.AddRange()，否則 DisplayTitle 與 StopLossDisplay 不會被正確填入！
                 string cacheKey = $"{klineStart}_{klineEnd}_{obsHighEntry}_{obsLowEntry}_{prevHigh}_{prevLow}_{obsN}";
+                string sessionCacheKey = $"{session}_{cacheKey}";
                 if (!isLastKline && _simKlineCache.TryGetValue(cacheKey, out var cachedRows))
                 {
                     foreach (var cached in cachedRows)
@@ -935,36 +1109,31 @@ namespace ExtremeSignalAppCS.Services
                     continue;
                 }
 
-                // 尋找此 K 棒的 Tick 起始點與結束點
-                int klineStartIdx = lastKnownStartIdx;
-                for (int idx = lastKnownStartIdx; idx < totalTradesCount; idx++)
-                {
-                    if (trades[idx].TimeVal >= klineStart)
-                    {
-                        klineStartIdx = idx;
-                        break;
-                    }
-                }
-
-                int klineEndTradeIdx = totalTradesCount;
-                for (int idx = Math.Max(lastKnownEndIdx, klineStartIdx); idx < totalTradesCount; idx++)
-                {
-                    if (trades[idx].TimeVal >= klineEnd)
-                    {
-                        klineEndTradeIdx = idx;
-                        break;
-                    }
-                }
+                // 尋找此 K 棒的 Tick 起始點與結束點 (使用 O(log N) 二元搜尋取代 O(N) 全量掃描)
+                int klineStartIdx = FindFirstTickIndexGEQ(trades, klineStart);
+                int klineEndTradeIdx = FindFirstTickIndexGEQ(trades, klineEnd);
 
                 lastKnownStartIdx = klineStartIdx;
                 lastKnownEndIdx = klineEndTradeIdx;
 
                 if (klineEndTradeIdx == 0) continue;
 
+                if (isLastKline)
+                {
+                    if (_simCurrentKlineKey != sessionCacheKey)
+                    {
+                        _simCurrentKlineKey = sessionCacheKey;
+                        _simSearchStartShort = klineStartIdx;
+                        _simSearchStartLong = klineStartIdx;
+                        _simCurrentKlineResults.Clear();
+                    }
+                }
+
                 var klineResults = new List<( (int Price, string ATime, int ObsN) Key, SimulationResult Raw, List<string> Tags )>();
 
                 // ════════ 做空路徑 (觀察 K 低) ════════
-                int searchStart = klineStartIdx;
+                int searchStart = isLastKline ? _simSearchStartShort : klineStartIdx;
+                var newShortResults = new List<( (int Price, string ATime, int ObsN) Key, SimulationResult Raw, List<string> Tags )>();
                 while (searchStart < klineEndTradeIdx)
                 {
                     int? gateIdx = null;
@@ -1010,12 +1179,12 @@ namespace ExtremeSignalAppCS.Services
                         int aPrice = trades[aIdx].Price;
                         int currentN = useDynamicN && dynamicNMap != null ? dynamicNMap[aIdx] : obsN;
                         var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
-                            GetDurations(trades, currentN, aIdx, TradeSide.Outer, TradeSide.Inner, klineEndTradeIdx);
+                            GetDurationsFull(trades, currentN, aIdx, TradeSide.Outer, TradeSide.Inner, klineEndTradeIdx);
 
                         if (pre.HasValue && post.HasValue && actPre >= currentN && actPost >= currentN && post.Value < pre.Value && trigPrice.HasValue)
                         {
                             var key = (aPrice, trades[aIdx].Time, currentN);
-                            if (!klineResults.Any(k => k.Key == key))
+                            if (!newShortResults.Any(k => k.Key == key) && (!isLastKline || !_simCurrentKlineResults.Any(k => k.Key == key)))
                             {
                                 var raw = new SimulationResult
                                 {
@@ -1033,7 +1202,7 @@ namespace ExtremeSignalAppCS.Services
                                     ObsN = currentN,
                                     StopLossPrice = prevHigh
                                 };
-                                klineResults.Add((key, raw, new List<string> { "obs_high" }));
+                                newShortResults.Add((key, raw, new List<string> { "obs_high" }));
                             }
                             lastSuccessfulBIdx = bIdx;
                         }
@@ -1044,9 +1213,15 @@ namespace ExtremeSignalAppCS.Services
                     else
                         break;
                 }
+                
+                if (isLastKline)
+                {
+                    _simSearchStartShort = searchStart;
+                }
 
                 // ════════ 做多路徑 (觀察 K 高) ════════
-                searchStart = klineStartIdx;
+                searchStart = isLastKline ? _simSearchStartLong : klineStartIdx;
+                var newLongResults = new List<( (int Price, string ATime, int ObsN) Key, SimulationResult Raw, List<string> Tags )>();
                 while (searchStart < klineEndTradeIdx)
                 {
                     int? gateIdx = null;
@@ -1092,12 +1267,12 @@ namespace ExtremeSignalAppCS.Services
                         int aPrice = trades[aIdx].Price;
                         int currentN = useDynamicN && dynamicNMap != null ? dynamicNMap[aIdx] : obsN;
                         var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
-                            GetDurations(trades, currentN, aIdx, TradeSide.Inner, TradeSide.Outer, klineEndTradeIdx);
+                            GetDurationsFull(trades, currentN, aIdx, TradeSide.Inner, TradeSide.Outer, klineEndTradeIdx);
 
                         if (pre.HasValue && post.HasValue && actPre >= currentN && actPost >= currentN && post.Value < pre.Value && trigPrice.HasValue)
                         {
                             var key = (aPrice, trades[aIdx].Time, currentN);
-                            if (!klineResults.Any(k => k.Key == key))
+                            if (!newLongResults.Any(k => k.Key == key) && (!isLastKline || !_simCurrentKlineResults.Any(k => k.Key == key)))
                             {
                                 var raw = new SimulationResult
                                 {
@@ -1115,7 +1290,7 @@ namespace ExtremeSignalAppCS.Services
                                     ObsN = currentN,
                                     StopLossPrice = prevLow
                                 };
-                                klineResults.Add((key, raw, new List<string> { "obs_low" }));
+                                newLongResults.Add((key, raw, new List<string> { "obs_low" }));
                             }
                             lastSuccessfulBIdx = bIdx;
                         }
@@ -1131,13 +1306,14 @@ namespace ExtremeSignalAppCS.Services
                 // 注意：必須深拷貝所有欄位，包括 Tags，確保快取命中時第三階段狀態機能正確運作
                 if (!isLastKline)
                 {
+                    klineResults.AddRange(newShortResults);
+                    klineResults.AddRange(newLongResults);
+
                     var cacheList = klineResults.Select(k =>
                     {
                         var copy = new SimulationResult
                         {
                             Type = k.Raw.Type,
-                            // DisplayTitle 在第三階段狀態機中才動態組合，快取存 raw 的 Type 即可，
-                            // 此處刻意留空由第三階段 finalResult 重新填入，無需提前寫入
                             ObsEntry = k.Raw.ObsEntry,
                             BestATime = k.Raw.BestATime,
                             BestAPrice = k.Raw.BestAPrice,
@@ -1151,15 +1327,23 @@ namespace ExtremeSignalAppCS.Services
                             ObsN = k.Raw.ObsN,
                             StopLossPrice = k.Raw.StopLossPrice
                         };
-                        // 深拷貝 Tags 集合，防止快取共用同一個 List<string> 引用導致併發污染
                         foreach (var tag in k.Tags)
                             copy.Tags.Add(tag);
                         return copy;
                     }).ToList();
                     _simKlineCache[cacheKey] = cacheList;
+                    
+                    aggregatedRawResults.AddRange(klineResults);
                 }
-
-                aggregatedRawResults.AddRange(klineResults);
+                else
+                {
+                    _simSearchStartLong = searchStart; // The last searchStart was from Long path
+                    // _simSearchStartShort is already updated after its loop finishes!
+                    
+                    _simCurrentKlineResults.AddRange(newShortResults);
+                    _simCurrentKlineResults.AddRange(newLongResults);
+                    aggregatedRawResults.AddRange(_simCurrentKlineResults);
+                }
             }
 
             // ════════ 階段三：時序停損時序狀態機 (100% 還原已破時序鎖定邏輯) ════════
@@ -1457,12 +1641,7 @@ namespace ExtremeSignalAppCS.Services
             string baseSym = symbol.Contains("TXF") ? "TXF" : "MXF";
             string otherSym = symbol.Contains("TXF") ? "MXF" : "TXF";
 
-            int otherCount = 0;
-            for (int i = 0; i < otherTradesAll.Count; i++)
-            {
-                if (otherTradesAll[i].TimeVal <= targetTVal) otherCount++;
-                else break; // 假定時間有序，提早跳出
-            }
+            int otherCount = FindTickCountByTime(otherTradesAll, targetTVal);
             double? otherNet = CalcNet(otherTradesAll, otherCount);
 
             var netSpeedsDisp = new Dictionary<string, string> { { "TXF", "--" }, { "MXF", "--" } };
@@ -1602,6 +1781,91 @@ namespace ExtremeSignalAppCS.Services
             _dynamicNCalc = null;
             _cachedDynamicNMap.Clear();
             _lastDynamicNTickIdx = 0;
+
+            _cachedKlineData.Clear();
+            _cachedBreakouts.Clear();
+            _lastCompletedBucketIdx = -1;
+            _prevHighCache = null;
+            _prevLowCache = null;
+            _pendingLongTriggerPriceCache = null;
+            _pendingShortTriggerPriceCache = null;
+            _pendingLongSignalObjsCache.Clear();
+            _pendingShortSignalObjsCache.Clear();
+            _pendingLongTimeLabelCache = "";
+            _pendingShortTimeLabelCache = "";
+            _klineCacheSessionKey = "";
+
+            _simCurrentKlineKey = "";
+            _simSearchStartShort = 0;
+            _simSearchStartLong = 0;
+            _simCurrentKlineResults.Clear();
         }
+    }
+}
+
+namespace ExtremeSignalAppCS.Models
+{
+    public class PendingTrigger
+    {
+        public int Index { get; set; }
+        public int Price { get; set; }
+        public bool IsTrigH { get; set; }
+        public bool IsTrigB { get; set; }
+        public int RunningMax { get; set; }
+        public int RunningMin { get; set; }
+
+        // 增量掃描狀態
+        public int ScanIndex { get; set; }
+        
+        // 前向掃描 (Pre) 快取結果，因為發生當下就已經固定了
+        public double? PreAvg { get; set; }
+        public int ActualPreN { get; set; }
+        public bool PreScanned { get; set; }
+
+        // 後向掃描 (Post) 增量狀態
+        public int ActualPostN { get; set; }
+        public double PostSum { get; set; }
+        public double? LastPostTimeVal { get; set; }
+        public int? Threshold { get; set; }
+        public string? TrigTime { get; set; }
+        public int? TrigPrice { get; set; }
+
+        // O(1) 計算用快照
+        public TradingState BaseStateSnapshot { get; set; }
+
+        public PendingTrigger(int index, int price, bool isTrigH, bool isTrigB, int runningMax, int runningMin, TradingState stateSnapshot)
+        {
+            Index = index;
+            Price = price;
+            IsTrigH = isTrigH;
+            IsTrigB = isTrigB;
+            RunningMax = runningMax;
+            RunningMin = runningMin;
+            ScanIndex = index + 1; // 預設從下一個 Tick 開始掃描
+            BaseStateSnapshot = stateSnapshot;
+        }
+    }
+
+    public class CompletedTrigger
+    {
+        public double TVal { get; set; }
+        public string StatusOnly { get; set; } = "";
+        public string ATime { get; set; } = "";
+        public int PriceVal { get; set; }
+        public string TrigTime { get; set; } = "";
+        public int TrigPrice { get; set; }
+        public double? Pre { get; set; }
+        public double? Post { get; set; }
+        public int AmpVal { get; set; }
+        public int BIdx { get; set; }
+        public bool IsTrigH { get; set; }
+
+        // O(1) 速差快取，一經達標/死亡即計算並永久封裝，供 UI 每 100ms O(1) 讀取
+        public double? BaseNet { get; set; }
+        public double? OtherNet { get; set; }
+        public string DStr { get; set; } = "資料不足";
+        public int AvgPri { get; set; }
+
+        public CompletedTrigger() { }
     }
 }

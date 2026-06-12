@@ -10,6 +10,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Threading.Channels;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Data;
@@ -54,8 +55,8 @@ namespace ExtremeSignalAppCS
         private readonly Dictionary<string, Dictionary<string, TradingState>> _replayRtState;
 
         // 【新增】實時狀態機快取 (與 Python 的 _rt_triggers 等效)
-        private readonly Dictionary<string, Dictionary<string, List<(int Index, int Price, bool IsTrigH, bool IsTrigB, int RunningMax, int RunningMin)>>> _rtTriggers;
-        private readonly Dictionary<string, Dictionary<string, List<(double TVal, string StatusOnly, string ATime, int PriceVal, string TrigTime, int TrigPrice, double? Pre, double? Post, int AmpVal, int BIdx, bool IsTrigH)>>> _rtCompletedDetails;
+        private readonly Dictionary<string, Dictionary<string, List<PendingTrigger>>> _rtTriggers;
+        private readonly Dictionary<string, Dictionary<string, List<CompletedTrigger>>> _rtCompletedDetails;
 
         private readonly System.Threading.Lock _rtLock = new(); // C# 13 新型執行緒同步安全鎖
 
@@ -82,6 +83,11 @@ namespace ExtremeSignalAppCS
         private readonly AutoResetEvent _analysisEvent = new(false);
         private CancellationTokenSource? _analysisCts;
         private Task? _analysisTask;
+        
+        // --- 新增：Market Data Channel 與 Background Worker ---
+        private readonly Channel<RawTickData> _tickChannel = Channel.CreateUnbounded<RawTickData>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+        private Task? _marketDataTask;
+        private CancellationTokenSource? _marketDataCts;
         private volatile int _uiGeneration = 0; // UI 世代計數器，防止過期 Dispatcher 任務覆蓋已清空的 UI
         private DispatcherTimer? _sessionTimer; // 盤別自動切換計時器
 
@@ -120,6 +126,8 @@ namespace ExtremeSignalAppCS
         
         private int _lastRenderedMxfPrice = 0;
         private string _lastRenderedMxfTime = "";
+        private int _lastRenderedTxfPrice = 0;
+        private string _lastRenderedTxfTime = "";
 
         // 參數與狀態
         private string _currentSessionName = "日盤";
@@ -176,16 +184,16 @@ namespace ExtremeSignalAppCS
                 { "MXF", new Dictionary<string, TradingState> { { "日盤", new() }, { "夜盤", new() } } }
             };
 
-            _rtTriggers = new Dictionary<string, Dictionary<string, List<(int, int, bool, bool, int, int)>>>
+            _rtTriggers = new Dictionary<string, Dictionary<string, List<PendingTrigger>>>
             {
-                { "TXF", new Dictionary<string, List<(int, int, bool, bool, int, int)>> { { "日盤", new() }, { "夜盤", new() } } },
-                { "MXF", new Dictionary<string, List<(int, int, bool, bool, int, int)>> { { "日盤", new() }, { "夜盤", new() } } }
+                { "TXF", new Dictionary<string, List<PendingTrigger>> { { "日盤", [] }, { "夜盤", [] } } },
+                { "MXF", new Dictionary<string, List<PendingTrigger>> { { "日盤", [] }, { "夜盤", [] } } }
             };
 
-            _rtCompletedDetails = new Dictionary<string, Dictionary<string, List<(double, string, string, int, string, int, double?, double?, int, int, bool)>>>
+            _rtCompletedDetails = new Dictionary<string, Dictionary<string, List<CompletedTrigger>>>
             {
-                { "TXF", new Dictionary<string, List<(double, string, string, int, string, int, double?, double?, int, int, bool)>> { { "日盤", new() }, { "夜盤", new() } } },
-                { "MXF", new Dictionary<string, List<(double, string, string, int, string, int, double?, double?, int, int, bool)>> { { "日盤", new() }, { "夜盤", new() } } }
+                { "TXF", new Dictionary<string, List<CompletedTrigger>> { { "日盤", [] }, { "夜盤", [] } } },
+                { "MXF", new Dictionary<string, List<CompletedTrigger>> { { "日盤", [] }, { "夜盤", [] } } }
             };
 
             InitializeComponent();
@@ -221,6 +229,10 @@ namespace ExtremeSignalAppCS
             // 啟動實時行情背景 Debounce 分析 Task
             _analysisCts = new CancellationTokenSource();
             _analysisTask = Task.Run(() => AnalysisWorkerLoopAsync(_analysisCts.Token));
+
+            // 啟動 Market Data Worker 處理即時 Tick 解析
+            _marketDataCts = new CancellationTokenSource();
+            _marketDataTask = Task.Run(() => MarketDataWorkerLoopAsync(_marketDataCts.Token));
 
             AppendLog("【系統】C# WPF 高性能交易看盤軟體載入成功。", forceScrollToEnd: true);
 
@@ -265,6 +277,11 @@ namespace ExtremeSignalAppCS
 
             _analysisCts?.Cancel();
             _analysisCts?.Dispose();
+            
+            _tickChannel.Writer.TryComplete();
+            _marketDataCts?.Cancel();
+            _marketDataCts?.Dispose();
+
             _tgService.Dispose();
             _sessionTimer?.Stop();
             CompositionTarget.Rendering -= OnCompositionTargetRendering;
@@ -280,20 +297,69 @@ namespace ExtremeSignalAppCS
             
             // 每幀無鎖撈取最新的 volatile 變數
             int mxfPrice = _renderMxfPrice;
-            string mxfTime = Volatile.Read(ref _renderMxfTime);
+            string mxfTime = Volatile.Read(ref _renderMxfTime) ?? "";
+            int txfPrice = _renderTxfPrice;
+            string txfTime = Volatile.Read(ref _renderTxfTime) ?? "";
 
-            if (mxfPrice > 0 && (mxfPrice != _lastRenderedMxfPrice || mxfTime != _lastRenderedMxfTime))
+            bool mxfUpdated = mxfPrice > 0 && (mxfPrice != _lastRenderedMxfPrice || mxfTime != _lastRenderedMxfTime);
+            bool txfUpdated = txfPrice > 0 && (txfPrice != _lastRenderedTxfPrice || txfTime != _lastRenderedTxfTime);
+
+            if (mxfUpdated || txfUpdated)
             {
-                _lastRenderedMxfPrice = mxfPrice;
-                _lastRenderedMxfTime = mxfTime;
-                
-                // 瞬間更新 UI 文字，無 150ms 延遲
-                lblLivePrice.Text = $"| 價: {mxfPrice}";
-                
-                if (wndUnbrokenK != null)
+                if (mxfUpdated)
                 {
-                    // 瞬間觸發停損反向偵測，速度極大化
-                    wndUnbrokenK.CheckInstantUnbrokenBreakout(mxfPrice, mxfTime);
+                    _lastRenderedMxfPrice = mxfPrice;
+                    _lastRenderedMxfTime = mxfTime;
+                    
+                    // 瞬間更新 UI 文字，無 150ms 延遲
+                    lblLivePrice.Text = $"| 價: {mxfPrice}";
+
+                    // 用最新的小台價格更新相關 UI (以小台為主要顯示商品)
+                    if (wndUnbrokenK != null)
+                    {
+                        // 瞬間觸發停損反向偵測，速度極大化
+                        wndUnbrokenK.CheckInstantUnbrokenBreakout(mxfPrice, mxfTime);
+                    }
+                    
+                    if (klineChart != null)
+                    {
+                        // 瞬間更新 K 線圖最後一根 K 棒，繞過 100ms Debounce
+                        klineChart.UpdateLastCandleInstant(mxfPrice, mxfTime);
+                    }
+
+                    // --- 新增：DataGrid K 線表格瞬間閃爍差量更新 ---
+                    if (_klineCollection.Count > 0)
+                    {
+                        var lastBar = _klineCollection[^1];
+                        bool changed = false;
+
+                        if (mxfPrice > lastBar.High)
+                        {
+                            lastBar.High = mxfPrice;
+                            changed = true;
+                        }
+                        if (mxfPrice < lastBar.Low)
+                        {
+                            lastBar.Low = mxfPrice;
+                            changed = true;
+                        }
+                        if (mxfPrice != lastBar.Close)
+                        {
+                            lastBar.Close = mxfPrice;
+                            changed = true;
+                            
+                            // 動態修改顏色標籤
+                            if (lastBar.Close > lastBar.Open) lastBar.Tag = "up";
+                            else if (lastBar.Close < lastBar.Open) lastBar.Tag = "down";
+                            else lastBar.Tag = "flat";
+                        }
+                    }
+                }
+
+                if (txfUpdated)
+                {
+                    _lastRenderedTxfPrice = txfPrice;
+                    _lastRenderedTxfTime = txfTime;
                 }
             }
         }
@@ -711,8 +777,43 @@ namespace ExtremeSignalAppCS
             if (_yuantaQuote == null) return;
             if (tolMatchQty == "-1") return;
 
+            // Zero UI Blocking: 將字串封裝後直接丟入 Lock-Free Channel，交由背景 Market Data Thread 進行 Parse 與增量計算
+            var rawTick = new RawTickData(symbol, matchTime, matchPri, tolMatchQty, bestBuyPri, bestSellPri);
+            _tickChannel.Writer.TryWrite(rawTick);
+        }
+
+        // ==================== 2.5 Market Data Background Worker ====================
+        
+        private async Task MarketDataWorkerLoopAsync(CancellationToken token)
+        {
             try
             {
+                await foreach (var rawTick in _tickChannel.Reader.ReadAllAsync(token))
+                {
+                    ProcessRawTick(rawTick);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex)
+            {
+                _ = Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    AppendLog($"🚨【行情處理崩潰】Market Data Thread 發生未知錯誤: {ex.Message}\n{ex.StackTrace}");
+                }));
+            }
+        }
+
+        private void ProcessRawTick(RawTickData raw)
+        {
+            try
+            {
+                string symbol = raw.Symbol;
+                string tolMatchQty = raw.TolMatchQty;
+                string matchPri = raw.MatchPri;
+                string matchTime = raw.MatchTime;
+                string bestBuyPri = raw.BestBuyPri;
+                string bestSellPri = raw.BestSellPri;
+
                 int currentQty = int.Parse(tolMatchQty);
                 // Zero Allocation 字串比對
                 string baseSymbol = symbol.StartsWith("TXF") ? "TXF" : (symbol.StartsWith("MXF") ? "MXF" : "");
@@ -782,8 +883,6 @@ namespace ExtremeSignalAppCS
                 // 完全 Lock-Free 的資料結構寫入 (Zero GC Allocation & No OS Lock)
                 _liveSymbolTrades[baseSymbol][session].Add(tick);
 
-                // 狀態計算已轉移至背景執行緒 (Disruptor 模式)，此處完全無鎖 (Lock-Free)
-
                 // 實時 Render Loop 快取 (無鎖寫入)
                 if (baseSymbol == "TXF")
                 {
@@ -851,6 +950,11 @@ namespace ExtremeSignalAppCS
                         ApplyRealtimeAnalysisUI(result);
                     }));
                 }
+                catch (ArgumentOutOfRangeException ex) when (ex.ParamName == "index")
+                {
+                    // 由於背景計算期間 UI 觸發了資料清空或切換 (例如載入新復盤)，導致背景正在遍歷的索引越界。
+                    // 這是無鎖設計下的預期重置競態現象 (Lock-Free Reset Race)，予以安全忽略，下次迴圈即會恢復。
+                }
                 catch (Exception ex)
                 {
                     // 升級：將背景計算例外直接安全輸出至主日誌看板，杜絕 Silent Crash
@@ -913,7 +1017,7 @@ namespace ExtremeSignalAppCS
 
                 var quantParams = _engine.LoadQuantParams(symbol, _currentTargetDays);
 
-                var absDetails = new List<(double TVal, string StatusStr, string ATime, int PriceVal, string TrigTime, int TrigPrice, double? Pre, double? Post, int AmpVal, int BIdx)>();
+                var absDetails = new List<CompletedTrigger>();
                 
                 int runningMax = state.RunningMax;
                 int runningMin = state.RunningMin;
@@ -1011,14 +1115,14 @@ namespace ExtremeSignalAppCS
                     {
                         lock (_rtLock)
                         {
-                            _rtTriggers[symbol][activeSession].Add((i, price, true, false, runningMax, runningMin));
+                            _rtTriggers[symbol][activeSession].Add(new PendingTrigger(i, price, true, false, runningMax, runningMin, state.Clone()));
                         }
                     }
                     if (isTrigB)
                     {
                         lock (_rtLock)
                         {
-                            _rtTriggers[symbol][activeSession].Add((i, price, false, true, runningMax, runningMin));
+                            _rtTriggers[symbol][activeSession].Add(new PendingTrigger(i, price, false, true, runningMax, runningMin, state.Clone()));
                         }
                     }
 
@@ -1041,7 +1145,7 @@ namespace ExtremeSignalAppCS
                 int dayMin = state.DayMin;
                 stateSnapshot[symbol] = state.Clone();
 
-                List<(int Index, int Price, bool IsTrigH, bool IsTrigB, int RunningMax, int RunningMin)> currentTriggers;
+                List<PendingTrigger> currentTriggers;
                 lock (_rtLock)
                 {
                     currentTriggers = [.. _rtTriggers[symbol][activeSession]];
@@ -1059,56 +1163,98 @@ namespace ExtremeSignalAppCS
 
                     if (isTrigH)
                     {
-                        var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
-                            _engine.GetDurations(trades, nTicks, i, TradeSide.Outer, TradeSide.Inner);
-                        string status = _engine.GetStatusStr(pre, post, actPre, actPost, nTicks);
+                        _engine.GetDurations(trades, nTicks, item, TradeSide.Outer, TradeSide.Inner);
+                        double? pre = item.PreAvg;
+                        double? post = item.ActualPostN >= nTicks ? (item.PostSum / item.ActualPostN) : null;
+                        int bIdx = item.ScanIndex - 1;
+
+                        string status = _engine.GetStatusStr(pre, post, item.ActualPreN, item.ActualPostN, nTicks);
                         
-                        // 判斷是否為「死亡」Trigger：尚未集滿 nTicks 就因為突破極值而提早結束 (bIdx < trades.Count - 1)
-                        bool isDead = actPost < nTicks && bIdx < trades.Count - 1;
+                        bool isDead = item.ActualPostN < nTicks && bIdx < trades.Count - 1;
 
                         if (status == " [達標]" || status == " [邊界達標]" || status == " [未達標]" || isDead)
                         {
-                            if (isDead && status.Contains("邊界未達標"))
-                            {
-                                status = " [未達標]"; // 強制轉為死亡未達標狀態，供 UI 正常顯示「曾未達標」
-                            }
+                            if (isDead && status.Contains("邊界未達標")) status = " [未達標]";
 
                             int amp = rMin != 999999 ? (rMax - rMin) : 0;
-                            string prefix = (price == dayMax) ? "時段最高" : (status.Contains("未達標") ? "曾未達標最高" : "曾達標最高");
-                            absDetails.Add((tVal, prefix + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
+
+                            double? baseNet = null;
+                            double? otherNet = null;
+                            var (oAvg, iAvg, dDir) = _engine.CalcSideSpeedFromState(item.BaseStateSnapshot);
+                            if (oAvg.HasValue && iAvg.HasValue) baseNet = iAvg.Value - oAvg.Value;
+                            
+                            long sumPrice = item.BaseStateSnapshot.SumPrice;
+                            int avgPri = item.BaseStateSnapshot.Count > 0 ? (int)Math.Round((double)sumPrice / item.BaseStateSnapshot.Count) : 0;
+
+                            string oSym = symbol == "TXF" ? "MXF" : "TXF";
+                            if (tradesSnapshot.TryGetValue(oSym, out var otherTrades))
+                            {
+                                double targetTVal = trades[bIdx].TimeVal;
+                                int otherCount = _engine.FindTickCountByTime(otherTrades, targetTVal);
+                                otherNet = _engine.CalcNetSpeed(otherTrades, otherCount);
+                            }
+
+                            var completed = new CompletedTrigger
+                            {
+                                TVal = tVal, StatusOnly = status, ATime = trades[i].Time, PriceVal = price,
+                                TrigTime = item.TrigTime ?? "N/A", TrigPrice = item.TrigPrice ?? 0,
+                                Pre = pre, Post = post, AmpVal = amp, BIdx = bIdx, IsTrigH = true,
+                                BaseNet = baseNet, OtherNet = otherNet, DStr = dDir, AvgPri = avgPri
+                            };
 
                             lock (_rtLock)
                             {
                                 _rtTriggers[symbol][activeSession].Remove(item);
-                                _rtCompletedDetails[symbol][activeSession].Add((tVal, status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx, true));
+                                _rtCompletedDetails[symbol][activeSession].Add(completed);
                             }
                         }
                     }
 
                     if (isTrigB)
                     {
-                        var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
-                            _engine.GetDurations(trades, nTicks, i, TradeSide.Inner, TradeSide.Outer);
-                        string status = _engine.GetStatusStr(pre, post, actPre, actPost, nTicks);
+                        _engine.GetDurations(trades, nTicks, item, TradeSide.Inner, TradeSide.Outer);
+                        double? pre = item.PreAvg;
+                        double? post = item.ActualPostN >= nTicks ? (item.PostSum / item.ActualPostN) : null;
+                        int bIdx = item.ScanIndex - 1;
+
+                        string status = _engine.GetStatusStr(pre, post, item.ActualPreN, item.ActualPostN, nTicks);
                         
-                        // 判斷是否為「死亡」Trigger：尚未集滿 nTicks 就因為跌破極值而提早結束 (bIdx < trades.Count - 1)
-                        bool isDead = actPost < nTicks && bIdx < trades.Count - 1;
+                        bool isDead = item.ActualPostN < nTicks && bIdx < trades.Count - 1;
 
                         if (status == " [達標]" || status == " [邊界達標]" || status == " [未達標]" || isDead)
                         {
-                            if (isDead && status.Contains("邊界未達標"))
-                            {
-                                status = " [未達標]"; // 強制轉為死亡未達標狀態，供 UI 正常顯示「曾未達標」
-                            }
+                            if (isDead && status.Contains("邊界未達標")) status = " [未達標]";
 
                             int amp = rMax != -999999 ? (rMax - rMin) : 0;
-                            string prefix = (price == dayMin) ? "時段最低" : (status.Contains("未達標") ? "曾未達標最低" : "曾達標最低");
-                            absDetails.Add((tVal, prefix + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
+
+                            double? baseNet = null;
+                            double? otherNet = null;
+                            var (oAvg, iAvg, dDir) = _engine.CalcSideSpeedFromState(item.BaseStateSnapshot);
+                            if (oAvg.HasValue && iAvg.HasValue) baseNet = iAvg.Value - oAvg.Value;
+                            
+                            long sumPrice = item.BaseStateSnapshot.SumPrice;
+                            int avgPri = item.BaseStateSnapshot.Count > 0 ? (int)Math.Round((double)sumPrice / item.BaseStateSnapshot.Count) : 0;
+
+                            string oSym = symbol == "TXF" ? "MXF" : "TXF";
+                            if (tradesSnapshot.TryGetValue(oSym, out var otherTrades))
+                            {
+                                double targetTVal = trades[bIdx].TimeVal;
+                                int otherCount = _engine.FindTickCountByTime(otherTrades, targetTVal);
+                                otherNet = _engine.CalcNetSpeed(otherTrades, otherCount);
+                            }
+
+                            var completed = new CompletedTrigger
+                            {
+                                TVal = tVal, StatusOnly = status, ATime = trades[i].Time, PriceVal = price,
+                                TrigTime = item.TrigTime ?? "N/A", TrigPrice = item.TrigPrice ?? 0,
+                                Pre = pre, Post = post, AmpVal = amp, BIdx = bIdx, IsTrigH = false,
+                                BaseNet = baseNet, OtherNet = otherNet, DStr = dDir, AvgPri = avgPri
+                            };
 
                             lock (_rtLock)
                             {
                                 _rtTriggers[symbol][activeSession].Remove(item);
-                                _rtCompletedDetails[symbol][activeSession].Add((tVal, status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx, false));
+                                _rtCompletedDetails[symbol][activeSession].Add(completed);
                             }
                         }
                     }
@@ -1118,56 +1264,68 @@ namespace ExtremeSignalAppCS
                 {
                     foreach (var cached in _rtCompletedDetails[symbol][activeSession])
                     {
-                        string prefix;
-                        if (cached.IsTrigH)
-                        {
-                            prefix = (cached.PriceVal == dayMax) ? "時段最高" : (cached.StatusOnly.Contains("未達標") ? "曾未達標最高" : "曾達標最高");
-                        }
-                        else
-                        {
-                            prefix = (cached.PriceVal == dayMin) ? "時段最低" : (cached.StatusOnly.Contains("未達標") ? "曾未達標最低" : "曾達標最低");
-                        }
-                        absDetails.Add((cached.TVal, prefix + cached.StatusOnly, cached.ATime, cached.PriceVal, cached.TrigTime, cached.TrigPrice, cached.Pre, cached.Post, cached.AmpVal, cached.BIdx));
+                        absDetails.Add(cached);
                     }
                 }
 
                 absDetails.Sort((x, y) => x.TVal.CompareTo(y.TVal));
                 
-                var filteredPre = new List<(double TVal, string StatusStr, string ATime, int PriceVal, string TrigTime, int TrigPrice, double? Pre, double? Post, int AmpVal, int BIdx)>();
-                var seen = new HashSet<(string Type, int Price)>();
+                var filteredPre = new List<CompletedTrigger>();
+                var seen = new HashSet<(bool IsTop, int Price)>();
                 foreach (var d in absDetails)
                 {
-                    var key = (d.StatusStr.Contains("最高") ? "最高" : "最低", d.PriceVal);
+                    var key = (d.IsTrigH, d.PriceVal);
                     if (seen.Add(key))
                     {
                         filteredPre.Add(d);
                     }
                 }
 
-                // 實時第二階段：Immutable 歷史速差重算
+                // 實時第二階段：Immutable 歷史速差重算 (O(1))
                 var rtLastNetSpeedsTop = new Dictionary<string, double?> { { "TXF", null }, { "MXF", null } };
                 var rtLastNetSpeedsBot = new Dictionary<string, double?> { { "TXF", null }, { "MXF", null } };
                 
                 var otherSym = symbol == "TXF" ? "MXF" : "TXF";
-                if (!tradesSnapshot.TryGetValue(otherSym, out var otherTrades))
+                string baseSym = symbol.Contains("TXF") ? "TXF" : "MXF";
+                
+                string FormatNet(string sym, double? currVal, Dictionary<string, double?> lastNetSpeeds)
                 {
-                    otherTrades = [];
+                    if (currVal == null) return "--       ";
+                    string baseStr = $"{currVal.Value:+0.0000;-0.0000;+0.0000}s";
+                    string suffix = "";
+                    double? prevVal = lastNetSpeeds.ContainsKey(sym) ? lastNetSpeeds[sym] : null;
+                    if (prevVal.HasValue && Math.Abs(currVal.Value - prevVal.Value) > 0.00001)
+                    {
+                        if (currVal.Value > prevVal.Value)
+                            suffix = currVal.Value > 0 ? " 多速增" : " 空速減";
+                        else
+                            suffix = currVal.Value < 0 ? " 空速增" : " 多速減";
+                    }
+                    lastNetSpeeds[sym] = currVal;
+                    if (string.IsNullOrEmpty(suffix)) suffix = "       ";
+                    return baseStr + suffix;
                 }
 
                 var filteredDetails = new List<SimulationResult>();
-                foreach (var (tVal, statusStr, aTime, priceVal, trigTime, trigPrice, pre, post, ampVal, bIdx) in filteredPre)
+                foreach (var d in filteredPre)
                 {
-                    if (!post.HasValue)
+                    string prefix;
+                    if (d.IsTrigH) prefix = (d.PriceVal == dayMax) ? "時段最高" : (d.StatusOnly.Contains("未達標") ? "曾未達標最高" : "曾達標最高");
+                    else prefix = (d.PriceVal == dayMin) ? "時段最低" : (d.StatusOnly.Contains("未達標") ? "曾未達標最低" : "曾達標最低");
+                    
+                    string displayTitle = prefix + d.StatusOnly;
+
+                    if (!d.Post.HasValue)
                     {
                         var copy = new SimulationResult
                         {
-                            Type = statusStr.Contains("最高") ? "最高" : "最低",
-                            DisplayTitle = statusStr,
-                            BestATime = aTime,
-                            BestAPrice = priceVal,
-                            TrigTime = trigTime,
-                            TrigPrice = trigPrice.ToString(),
-                            Pre = pre.HasValue ? $"{pre.Value:F4}s" : "N/A",
+                            Type = d.IsTrigH ? "最高" : "最低",
+                            DisplayTitle = displayTitle,
+                            BestATime = d.ATime,
+                            BestAPrice = d.PriceVal,
+                            TrigTime = d.TrigTime,
+                            TrigPrice = d.TrigPrice.ToString(),
+                            Pre = d.Pre.HasValue ? $"{d.Pre.Value:F4}s" : "N/A",
                             Post = "N/A",
                             StopLossDisplay = "N/A"
                         };
@@ -1175,38 +1333,31 @@ namespace ExtremeSignalAppCS
                         continue;
                     }
 
-                    bool isTop = statusStr.Contains("最高");
-                    bool isDayExtreme = statusStr.Contains("時段最高") || statusStr.Contains("時段最低");
-                    
-                    bool needSpeed = true;
-                    if (isDayExtreme && !statusStr.Contains("達標"))
-                        needSpeed = false;
-
                     string speedStr = "";
-                    if (needSpeed)
+                    if (d.BaseNet.HasValue && d.OtherNet.HasValue)
                     {
-                        if (isTop)
-                            speedStr = _engine.GetSpeedSnapshotStr(symbol, trades, bIdx, otherTrades, rtLastNetSpeedsTop);
-                        else
-                            speedStr = _engine.GetSpeedSnapshotStr(symbol, trades, bIdx, otherTrades, rtLastNetSpeedsBot);
+                        var lastSpeeds = d.IsTrigH ? rtLastNetSpeedsTop : rtLastNetSpeedsBot;
+                        string baseNetStr = FormatNet(baseSym, d.BaseNet, lastSpeeds);
+                        string otherNetStr = FormatNet(otherSym, d.OtherNet, lastSpeeds);
+                        speedStr = $"    成交速度: {d.DStr} | 大台速差: {(baseSym == "TXF" ? baseNetStr : otherNetStr)}  小台速差: {(baseSym == "MXF" ? baseNetStr : otherNetStr)} | 均價:{d.AvgPri}";
                     }
 
                     var res = new SimulationResult
                     {
-                        Type = isTop ? "K低" : "K高",
-                        DisplayTitle = statusStr,
-                        BestATime = aTime,
-                        BestAPrice = priceVal,
-                        TrigTime = trigTime,
-                        TrigPrice = trigPrice.ToString(),
-                        Pre = pre.HasValue ? $"{pre.Value:F4}s" : "N/A",
-                        Post = $"{post.Value:F4}s",
-                        AmpVal = ampVal,
-                        BIndex = bIdx,
+                        Type = d.IsTrigH ? "K低" : "K高",
+                        DisplayTitle = displayTitle,
+                        BestATime = d.ATime,
+                        BestAPrice = d.PriceVal,
+                        TrigTime = d.TrigTime,
+                        TrigPrice = d.TrigPrice.ToString(),
+                        Pre = d.Pre.HasValue ? $"{d.Pre.Value:F4}s" : "N/A",
+                        Post = $"{d.Post.Value:F4}s",
+                        AmpVal = d.AmpVal,
+                        BIndex = d.BIdx,
                         ObsN = nTicks,
                         StopLossDisplay = "N/A"
                     };
-                    res.Tags.Add(speedStr); // 快取速差字串
+                    res.Tags.Add(speedStr);
                     
                     filteredDetails.Add(res);
                 }
@@ -2575,14 +2726,14 @@ namespace ExtremeSignalAppCS
 
                         if (price == dayMax)
                         {
-                            var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) = _engine.GetDurations(trades, _engine.AbsNTicks, i, TradeSide.Outer, TradeSide.Inner);
+                            var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) = _engine.GetDurationsFull(trades, _engine.AbsNTicks, i, TradeSide.Outer, TradeSide.Inner);
                             string status = _engine.GetStatusStr(pre, post, actPre, actPost, _engine.AbsNTicks);
                             int amp = runningMin != 999999 ? (runningMax - runningMin) : 0;
                             absDetails.Add((tVal, "時段最高" + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
                         }
                         else if (isTrigH)
                         {
-                            var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) = _engine.GetDurations(trades, _engine.AbsNTicks, i, TradeSide.Outer, TradeSide.Inner);
+                            var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) = _engine.GetDurationsFull(trades, _engine.AbsNTicks, i, TradeSide.Outer, TradeSide.Inner);
                             string status = _engine.GetStatusStr(pre, post, actPre, actPost, _engine.AbsNTicks);
                             if (status.Contains("達標") || status.Contains("未達標"))
                             {
@@ -2594,14 +2745,14 @@ namespace ExtremeSignalAppCS
 
                         if (price == dayMin)
                         {
-                            var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) = _engine.GetDurations(trades, _engine.AbsNTicks, i, TradeSide.Inner, TradeSide.Outer);
+                            var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) = _engine.GetDurationsFull(trades, _engine.AbsNTicks, i, TradeSide.Inner, TradeSide.Outer);
                             string status = _engine.GetStatusStr(pre, post, actPre, actPost, _engine.AbsNTicks);
                             int amp = runningMax != -999999 ? (runningMax - runningMin) : 0;
                             absDetails.Add((tVal, "時段最低" + status, trades[i].Time, price, trigTime ?? "N/A", trigPrice ?? 0, pre, post, amp, bIdx));
                         }
                         else if (isTrigB)
                         {
-                            var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) = _engine.GetDurations(trades, _engine.AbsNTicks, i, TradeSide.Inner, TradeSide.Outer);
+                            var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) = _engine.GetDurationsFull(trades, _engine.AbsNTicks, i, TradeSide.Inner, TradeSide.Outer);
                             string status = _engine.GetStatusStr(pre, post, actPre, actPost, _engine.AbsNTicks);
                             if (status.Contains("達標") || status.Contains("未達標"))
                             {

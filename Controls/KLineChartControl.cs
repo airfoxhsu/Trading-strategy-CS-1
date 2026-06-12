@@ -153,9 +153,12 @@ namespace ExtremeSignalAppCS.Controls
             int historyCount = _candles.Count - 1; // 歷史收盤 K 棒
             var group = new DrawingGroup();
             
+            int startIdx = (int)Math.Max(0, Math.Floor(_minX) - 1);
+            int endIdx = (int)Math.Min(historyCount - 1, Math.Ceiling(_maxX) + 1);
+
             using (var dc = group.Open())
             {
-                for (int i = 0; i < historyCount; i++)
+                for (int i = startIdx; i <= endIdx; i++)
                 {
                     var c = _candles[i];
                     double x = GetCanvasX(i, w);
@@ -515,6 +518,7 @@ namespace ExtremeSignalAppCS.Controls
 
         // 智慧操作鎖：偵測使用者是否手動 zoom/pan 過，防止行情跳動時強制 autoRange 重對焦
         private bool _isZoomedOrPanned;
+        private int _lastCandleCount = 0;
         private bool _isYAutoRanged = true; // Y 軸自動對焦狀態
         
         private bool _isDragging;
@@ -717,6 +721,7 @@ namespace ExtremeSignalAppCS.Controls
             MouseWheel += KLineChartControl_MouseWheel;
             MouseLeftButtonDown += KLineChartControl_MouseLeftButtonDown;
             MouseLeftButtonUp += KLineChartControl_MouseLeftButtonUp;
+            MouseRightButtonDown += KLineChartControl_MouseRightButtonDown;
         }
 
         /// <summary>
@@ -735,6 +740,7 @@ namespace ExtremeSignalAppCS.Controls
 
             if (_candles == null || _candles.Count == 0)
             {
+                _lastCandleCount = 0;
                 _infoPanel.Visibility = Visibility.Collapsed;
                 _painter.SetData([], 0, 0, 0, 0);
                 UpdatePriceTag();
@@ -745,22 +751,22 @@ namespace ExtremeSignalAppCS.Controls
             if (forceAutoRange || !_isZoomedOrPanned)
             {
                 AutoRange();
+                _lastCandleCount = _candles.Count;
             }
             else
             {
-                // 動態調節功能：當手動縮放時，如果新 K 棒超過右邊界，則跟隨平移 (X 軸保持比例平移)
                 int lastIdx = _candles.Count - 1;
-                // 只有當原本的右邊界已經包含或是非常接近最新的 K 棒時，才進行自動跟隨平移
-                // 這樣如果使用者往左平移去查詢歷史，_maxX 會遠小於 lastIdx，就不會被強制拉回右邊。
-                if (_maxX >= lastIdx - 0.5)
+                // 當手動縮放時，如果產生「新的一根 K 棒」，且使用者正在觀看最新區域，則 X 軸向右平移
+                if (_lastCandleCount > 0 && _candles.Count > _lastCandleCount)
                 {
-                    if (lastIdx >= _maxX - 1.0)
+                    int addedBars = _candles.Count - _lastCandleCount;
+                    if (_maxX >= lastIdx - 2.0)
                     {
-                        double shift = (lastIdx + 1.5) - _maxX;
-                        _minX += shift;
-                        _maxX += shift;
+                        _minX += addedBars;
+                        _maxX += addedBars;
                     }
                 }
+                _lastCandleCount = _candles.Count;
 
                 // 動態調節功能：選項 A - 確保當前可見範圍內的 K 棒最高/最低價不會超出上下邊界 (Y 軸動態彈簧伸縮)
                 if (_isYAutoRanged)
@@ -789,6 +795,54 @@ namespace ExtremeSignalAppCS.Controls
             }
             
             UpdatePriceTag();
+        }
+
+        /// <summary>
+        /// 提供給 60FPS 渲染迴圈的極速更新接口。只修改最後一根 K 棒並觸發 Dirty Region 重繪，繞過背景 100ms 降頻。
+        /// </summary>
+        public void UpdateLastCandleInstant(double currentPrice, string tickTimeStr)
+        {
+            if (_candles == null || _candles.Count == 0) return;
+            
+            _lastTickTimeStr = tickTimeStr;
+            int lastIdx = _candles.Count - 1;
+            var last = _candles[lastIdx];
+            
+            bool changed = false;
+            if (currentPrice > last.High)
+            {
+                last.High = currentPrice;
+                changed = true;
+            }
+            if (currentPrice < last.Low)
+            {
+                last.Low = currentPrice;
+                changed = true;
+            }
+            if (currentPrice != last.Close)
+            {
+                last.Close = currentPrice;
+                last.Tag = last.Close >= last.Open ? "up" : "down";
+                changed = true;
+            }
+            
+            if (changed)
+            {
+                _candles[lastIdx] = last;
+                _painter.InvalidateVisual();
+                
+                if (_isYAutoRanged && (currentPrice > _maxY || currentPrice < _minY))
+                {
+                    AutoRangeYForVisibleX();
+                }
+            }
+            
+            UpdatePriceTag();
+
+            if (!_isMouseInChart || _lastHoverIndex == lastIdx)
+            {
+                ShowKlineInfo(lastIdx);
+            }
         }
 
         /// <summary>
@@ -945,6 +999,40 @@ namespace ExtremeSignalAppCS.Controls
 
         // ==================== 互動事件 (滑鼠 Drag & Wheel) ====================
 
+        private void KLineChartControl_MouseRightButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (_candles == null || _candles.Count == 0) return;
+
+            _isZoomedOrPanned = true; // 鎖定為手動狀態
+
+            Point mousePoint = e.GetPosition(this);
+            double w = ActualWidth;
+            double h = ActualHeight;
+            double drawWidthLocal = Math.Max(1.0, w - KLinePainter.RightMargin);
+            double drawHeight = Math.Max(1.0, h - KLinePainter.BottomMargin);
+
+            if (mousePoint.X > drawWidthLocal) return; // 若點擊在 Y 軸區域則忽略
+
+            int lastIdx = _candles.Count - 1;
+            var lastCandle = _candles[lastIdx];
+
+            // 1. 計算 X 軸平移 (保持 rangeX 不變)
+            double rangeX = _maxX - _minX;
+            _minX = lastIdx - (mousePoint.X / drawWidthLocal) * rangeX;
+            _maxX = _minX + rangeX;
+
+            // 2. 計算 Y 軸平移 (保持 rangeY 不變)
+            double rangeY = _maxY - _minY;
+            _minY = lastCandle.Close - rangeY * (1.0 - mousePoint.Y / drawHeight);
+            _maxY = _minY + rangeY;
+
+            // 3. 強制解除 Y 軸自動對焦，確保平移不會被下個 Tick 蓋掉
+            _isYAutoRanged = false;
+
+            _painter.SetData(_candles, _minX, _maxX, _minY, _maxY);
+            UpdatePriceTag();
+        }
+
         private void KLineChartControl_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
         {
             if (_candles == null || _candles.Count == 0) return;
@@ -1020,12 +1108,20 @@ namespace ExtremeSignalAppCS.Controls
                     double deltaY = mousePoint.Y - _dragStartPoint.Y;
                     if (Math.Abs(deltaY) > 0)
                     {
-                        double drawHeight = Math.Max(1.0, h - KLinePainter.BottomMargin);
-                        double pricePerPixel = (_dragStartMaxY - _dragStartMinY) / drawHeight;
-                        double priceShift = deltaY * pricePerPixel;
-                        _minY = _dragStartMinY + priceShift;
-                        _maxY = _dragStartMaxY + priceShift;
-                        _isYAutoRanged = false;
+                        if (_isYAutoRanged && Math.Abs(deltaY) > 15)
+                        {
+                            // 拖拉超過 15 像素，判定為蓄意上下平移，自動解除 Y 軸自動對焦
+                            _isYAutoRanged = false;
+                        }
+
+                        if (!_isYAutoRanged)
+                        {
+                            double drawHeight = Math.Max(1.0, h - KLinePainter.BottomMargin);
+                            double pricePerPixel = (_dragStartMaxY - _dragStartMinY) / drawHeight;
+                            double priceShift = deltaY * pricePerPixel;
+                            _minY = _dragStartMinY + priceShift;
+                            _maxY = _dragStartMaxY + priceShift;
+                        }
                     }
                 }
 
@@ -1111,9 +1207,8 @@ namespace ExtremeSignalAppCS.Controls
             }
             else
             {
-                // 在圖表上滾輪 -> 縮放 X 軸，並依據 _isYAutoRanged 決定是否自動縮放 Y 軸
+                // 在圖表上滾輪 -> 縮放 X 軸與 Y 軸
                 double rangeX = _maxX - _minX;
-                double mouseIndex = (mouseX / drawWidthLocal) * rangeX + _minX;
 
                 double zoomFactor = e.Delta > 0 ? 0.85 : 1.15;
                 double newRange = rangeX * zoomFactor;
@@ -1122,13 +1217,23 @@ namespace ExtremeSignalAppCS.Controls
                 if (newRange < 5.0) newRange = 5.0;
                 if (newRange > _candles.Count * 2.0) newRange = _candles.Count * 2.0;
 
-                double leftRatio = (mouseIndex - _minX) / rangeX;
-                _minX = mouseIndex - newRange * leftRatio;
-                _maxX = _minX + newRange;
+                // 以右側 (_maxX) 為基準固定，縮小/放大只改變左側 (_minX)
+                _minX = _maxX - newRange;
 
                 if (_isYAutoRanged)
                 {
                     AutoRangeYForVisibleX();
+                }
+                else
+                {
+                    // 若是手動 Y 軸模式，讓 Y 軸也以畫面中心等比例放大縮小
+                    double rangeY = _maxY - _minY;
+                    double newRangeY = rangeY * zoomFactor;
+                    if (newRangeY < 0.0001) newRangeY = 0.0001;
+
+                    double midY = (_minY + _maxY) / 2.0;
+                    _minY = midY - newRangeY / 2.0;
+                    _maxY = midY + newRangeY / 2.0;
                 }
             }
 
