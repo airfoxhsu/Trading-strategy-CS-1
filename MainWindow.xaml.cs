@@ -148,11 +148,14 @@ namespace ExtremeSignalAppCS
         // UI 表格資料繫結 Observable 容器
         private readonly ObservableCollection<KlineBar> _klineCollection = [];
         private readonly ObservableCollection<SimulationResult> _obsCollection = [];
+        private readonly ObservableCollection<IntervalStat> _intervalStatsCollection = new();
+        private readonly int[] _allIntervals = { 1, 2, 3, 4, 5, 10, 15, 30, 60 };
 
         // 歷史狀態機回測降頻快取
         private double _lastHeavyCalcTimeMs = 0;
         private List<KlineBar> _lastKlineData = [];
         private List<SimulationResult> _lastSimulationResults = [];
+        private Dictionary<int, List<SimulationResult>>? _lastSharedResultsMap = null;
 
         public MainWindow()
         {
@@ -201,6 +204,7 @@ namespace ExtremeSignalAppCS
             // 2. 繫結 WPF DataGrid 容器
             dgKline.ItemsSource = _klineCollection;
             dgObserver.ItemsSource = _obsCollection;
+            if (icIntervalStats != null) icIntervalStats.ItemsSource = _intervalStatsCollection;
 
             // 3. 註冊視窗載入與關閉事件
             Loaded += MainWindow_Loaded;
@@ -331,22 +335,17 @@ namespace ExtremeSignalAppCS
                     if (_klineCollection.Count > 0)
                     {
                         var lastBar = _klineCollection[^1];
-                        bool changed = false;
-
                         if (mxfPrice > lastBar.High)
                         {
                             lastBar.High = mxfPrice;
-                            changed = true;
                         }
                         if (mxfPrice < lastBar.Low)
                         {
                             lastBar.Low = mxfPrice;
-                            changed = true;
                         }
                         if (mxfPrice != lastBar.Close)
                         {
                             lastBar.Close = mxfPrice;
-                            changed = true;
                             
                             // 動態修改顏色標籤
                             if (lastBar.Close > lastBar.Open) lastBar.Tag = "up";
@@ -425,6 +424,10 @@ namespace ExtremeSignalAppCS
                     tb.FontSize = newFontSize;
                 }
             }
+
+            // 10. 右下方 1/3 統計區塊字體縮放
+            if (lblTotalStats != null) lblTotalStats.FontSize = newFontSize;
+            if (icIntervalStats != null) icIntervalStats.FontSize = newFontSize;
         }
 
         // ==================== 0. 設定載入 ====================
@@ -1036,7 +1039,8 @@ namespace ExtremeSignalAppCS
                 }
 
                 // 增量時序對比運算與單一寫入者狀態聚合 (Disruptor / Single Writer)
-                for (int i = scanIdx; i < trades.Count; i++)
+                int currentTradesCount = trades.Count;
+                for (int i = scanIdx; i < currentTradesCount; i++)
                 {
                     var tick = trades[i];
                     int price = tick.Price;
@@ -1137,7 +1141,7 @@ namespace ExtremeSignalAppCS
                     state.LastPrice = lastPrice;
                     state.LastCheckTimeH = lastCheckTimeH;
                     state.LastCheckTimeB = lastCheckTimeB;
-                    state.ScanIdx = trades.Count;
+                    state.ScanIdx = currentTradesCount;
                 }
 
                 // 更新完畢後，提供一份最新的 Snapshot 供主 UI 使用，並抓取當前 DayMax/DayMin 進行後續運算
@@ -1163,14 +1167,14 @@ namespace ExtremeSignalAppCS
 
                     if (isTrigH)
                     {
-                        _engine.GetDurations(trades, nTicks, item, TradeSide.Outer, TradeSide.Inner);
+                        _engine.GetDurations(trades, nTicks, item, TradeSide.Outer, TradeSide.Inner, currentTradesCount);
                         double? pre = item.PreAvg;
                         double? post = item.ActualPostN >= nTicks ? (item.PostSum / item.ActualPostN) : null;
                         int bIdx = item.ScanIndex - 1;
 
                         string status = _engine.GetStatusStr(pre, post, item.ActualPreN, item.ActualPostN, nTicks);
                         
-                        bool isDead = item.ActualPostN < nTicks && bIdx < trades.Count - 1;
+                        bool isDead = item.ActualPostN < nTicks && bIdx < currentTradesCount - 1;
 
                         if (status == " [達標]" || status == " [邊界達標]" || status == " [未達標]" || isDead)
                         {
@@ -1212,14 +1216,14 @@ namespace ExtremeSignalAppCS
 
                     if (isTrigB)
                     {
-                        _engine.GetDurations(trades, nTicks, item, TradeSide.Inner, TradeSide.Outer);
+                        _engine.GetDurations(trades, nTicks, item, TradeSide.Inner, TradeSide.Outer, currentTradesCount);
                         double? pre = item.PreAvg;
                         double? post = item.ActualPostN >= nTicks ? (item.PostSum / item.ActualPostN) : null;
                         int bIdx = item.ScanIndex - 1;
 
                         string status = _engine.GetStatusStr(pre, post, item.ActualPreN, item.ActualPostN, nTicks);
                         
-                        bool isDead = item.ActualPostN < nTicks && bIdx < trades.Count - 1;
+                        bool isDead = item.ActualPostN < nTicks && bIdx < currentTradesCount - 1;
 
                         if (status == " [達標]" || status == " [邊界達標]" || status == " [未達標]" || isDead)
                         {
@@ -1525,14 +1529,18 @@ namespace ExtremeSignalAppCS
             var txfDetailsRt = currentStatusSnapshot.FirstOrDefault(x => x.Symbol == "TXF").Details ?? [];
             var mxfDetailsRt = currentStatusSnapshot.FirstOrDefault(x => x.Symbol == "MXF").Details ?? [];
 
-            if (txfTradesRt.Count > 0)
+            // 快照 Tick 總數作為報告生成的絕對邊界
+            int txfSnapshotCount = txfTradesRt.Count;
+            int mxfSnapshotCount = mxfTradesRt.Count;
+
+            if (txfSnapshotCount > 0)
             {
-                rtReport += "═══ 大臺即時極值行情 ═══" + GenerateRealtimeReportStr("TXF", activeSession, txfTradesRt, txfDetailsRt, _engine.LoadQuantParams("TXF", _currentTargetDays), stateSnapshot);
+                rtReport += "═══ 大臺即時極值行情 ═══" + GenerateRealtimeReportStr("TXF", activeSession, txfTradesRt, txfDetailsRt, _engine.LoadQuantParams("TXF", _currentTargetDays), stateSnapshot, txfSnapshotCount);
             }
-            if (mxfTradesRt.Count > 0)
+            if (mxfSnapshotCount > 0)
             {
                 if (!string.IsNullOrEmpty(rtReport)) rtReport += "\n";
-                rtReport += "═══ 小臺即時極值行情 ═══" + GenerateRealtimeReportStr("MXF", activeSession, mxfTradesRt, mxfDetailsRt, _engine.LoadQuantParams("MXF", _currentTargetDays), stateSnapshot);
+                rtReport += "═══ 小臺即時極值行情 ═══" + GenerateRealtimeReportStr("MXF", activeSession, mxfTradesRt, mxfDetailsRt, _engine.LoadQuantParams("MXF", _currentTargetDays), stateSnapshot, mxfSnapshotCount);
             }
 
             // 背景分 K 聚合與 K棒 停損狀態機運算 (超大 CPU 負載完全隔離 + 1000ms 降頻保護)
@@ -1541,20 +1549,27 @@ namespace ExtremeSignalAppCS
             {
                 _lastHeavyCalcTimeMs = nowMsHeavy;
                 
+                int currentMxfTradesCount = mxfTradesRt.Count;
                 var (klineData, breakouts) = _engine.CalcKlineData(
                     activeSession, mxfTradesRt,
                     [.. txfDetailsRt.Select(d => ConvertToSimulationResultRaw(d))],
                     [.. mxfDetailsRt.Select(d => ConvertToSimulationResultRaw(d))],
-                    _currentKlineInterval
+                    _currentKlineInterval,
+                    currentMxfTradesCount
                 );
 
                 var simulationResults = _engine.CalcSimulationResults(
                     activeSession, mxfTradesRt, klineData, _currentObsN, true, 
-                    (dynN) => { Dispatcher.BeginInvoke(new System.Action(() => { lblObsN.Content = $"觀察N: {dynN}"; })); }
+                    (dynN) => { Dispatcher.BeginInvoke(new System.Action(() => { lblObsN.Content = $"觀察N: {dynN}"; })); },
+                    currentMxfTradesCount
                 );
 
                 _lastKlineData = klineData;
                 _lastSimulationResults = simulationResults;
+
+                // 產生共用統計快取給 UI
+                var sharedResultsMap = ComputeAllIntervalResults(activeSession, mxfTradesRt, [.. txfDetailsRt.Select(d => ConvertToSimulationResultRaw(d))], [.. mxfDetailsRt.Select(d => ConvertToSimulationResultRaw(d))], _currentObsN, currentMxfTradesCount);
+                _lastSharedResultsMap = sharedResultsMap;
             }
 
             return new Dictionary<string, object>
@@ -1577,7 +1592,8 @@ namespace ExtremeSignalAppCS
                         { "net_mxf_str", netMxfStr },
                         { "net_mxf_color", netMxfColor }
                     }
-                }
+                },
+                { "shared_results_map", _lastSharedResultsMap! }
             };
         }
 
@@ -1683,8 +1699,13 @@ namespace ExtremeSignalAppCS
             // 6. 更新底部狀態計數面板
             RefreshInfoPanel();
 
-            // 7. 標記未破停損監控有新資料需重算 (事件驅動取代無條件輪詢)
-            wndUnbrokenK.MarkDirty();
+            // 7. 派發共用資料至未破分K監控與區間統計 (純渲染)
+            if (result.TryGetValue("shared_results_map", out var sharedObj) && sharedObj is Dictionary<int, List<SimulationResult>> sharedMap && sharedMap != null)
+            {
+                UpdateIntervalStatsUI(sharedMap);
+                string priceStr = _lastMxfPrice.HasValue ? _lastMxfPrice.Value.ToString() : "N/A";
+                wndUnbrokenK.UpdateFromSharedData(sharedMap, priceStr, _lastMxfTime);
+            }
         }
 
         public void PushTelegramMessage(string msg)
@@ -2291,8 +2312,43 @@ namespace ExtremeSignalAppCS
             // 更新頂部大臺/小臺極值行情面板
             UpdateOfflineExtremePanel();
 
-            // 觸發未破停損計算
-            wndUnbrokenK.TriggerUnbrokenCheck(force: true);
+            // 更新共用區間統計並派發至未破監控 (離線模式)
+            UpdateOfflineSharedData();
+        }
+
+        private void UpdateOfflineSharedData()
+        {
+            string session = "日盤";
+            lock (_rtLock)
+            {
+                if (_liveSymbolTrades["MXF"]["夜盤"].Count > 0) session = "夜盤";
+            }
+
+            IReadOnlyList<TradeTick>? mxfT = null;
+            var txfSigs = new List<SimulationResult>();
+            var mxfSigs = new List<SimulationResult>();
+
+            lock (_rtLock)
+            {
+                _liveSymbolTrades["MXF"].TryGetValue(session, out var list);
+                mxfT = list;
+                if (_rtState["TXF"].ContainsKey(session)) txfSigs = GetSimResultsFromSnapshot("TXF", session);
+                if (_rtState["MXF"].ContainsKey(session)) mxfSigs = GetSimResultsFromSnapshot("MXF", session);
+            }
+
+            if (mxfT != null && mxfT.Count > 0)
+            {
+                var sharedMap = ComputeAllIntervalResults(session, mxfT, txfSigs, mxfSigs, _currentObsN);
+                UpdateIntervalStatsUI(sharedMap);
+
+                string priceStr = mxfT[mxfT.Count - 1].Price.ToString();
+                string timeStr = mxfT[mxfT.Count - 1].Time;
+                
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    wndUnbrokenK.UpdateFromSharedData(sharedMap, priceStr, timeStr);
+                }));
+            }
         }
 
         /// <summary>
@@ -2422,8 +2478,8 @@ namespace ExtremeSignalAppCS
                 }
             }
 
-            // 觸發未破停損監控重新計算
-            wndUnbrokenK.TriggerUnbrokenCheck(force: true);
+            // 觸發未破停損監控重新計算 (離線模式共用資料派發)
+            UpdateOfflineSharedData();
         }
 
         private List<SimulationResult> GetSimResultsFromSnapshot(string sym, string session)
@@ -2849,17 +2905,26 @@ namespace ExtremeSignalAppCS
 
         private string GenerateRealtimeReportStr(
             string symbol, string session, IReadOnlyList<TradeTick> trades, List<SimulationResult> filteredDetails, 
-            Dictionary<string, object> quantParams, Dictionary<string, TradingState> stateSnapshot)
+            Dictionary<string, object> quantParams, Dictionary<string, TradingState> stateSnapshot, int maxCount = -1)
         {
-            if (trades.Count == 0) return "";
-            int finalClose = trades[^1].Price;
+            // 快照邊界：確保報告生成過程中不會因其他執行緒新增 Tick 而產生不一致
+            int tradesCount = maxCount < 0 ? trades.Count : maxCount;
+            if (tradesCount == 0) return "";
+            int lastIdx = tradesCount - 1;
+            int finalClose = trades[lastIdx].Price;
 
-            var (oAvg, iAvg, dStr) = _engine.CalcSideSpeed(trades);
-            int oCnt = trades.Count(t => t.Side == TradeSide.Outer);
-            int iCnt = trades.Count(t => t.Side == TradeSide.Inner);
+            var (oAvg, iAvg, dStr) = _engine.CalcSideSpeed(trades, tradesCount);
+            int oCnt = 0, iCnt = 0;
+            long sumPrice = 0;
+            for (int i = 0; i < tradesCount; i++)
+            {
+                if (trades[i].Side == TradeSide.Outer) oCnt++;
+                else if (trades[i].Side == TradeSide.Inner) iCnt++;
+                sumPrice += trades[i].Price;
+            }
             string outerS = oAvg.HasValue ? $"{oAvg.Value:F4}s/{oCnt}筆" : "資料不足";
             string innerS = iAvg.HasValue ? $"{iAvg.Value:F4}s/{iCnt}筆" : "資料不足";
-            int avgPri = (int)Math.Round(trades.Sum(t => (double)t.Price) / trades.Count);
+            int avgPri = tradesCount > 0 ? (int)Math.Round((double)sumPrice / tradesCount) : 0;
 
             string txfN = "--", mxfN = "--";
             if (stateSnapshot.TryGetValue("TXF", out var stT) && stateSnapshot.TryGetValue("MXF", out var stM))
@@ -3915,6 +3980,22 @@ namespace ExtremeSignalAppCS
             txtOutput.Selection.Select(txtOutput.Document.ContentStart, txtOutput.Document.ContentStart);
         }
 
+        private void IntervalStat_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is FrameworkElement fe && fe.DataContext is Models.IntervalStat stat)
+            {
+                string name = stat.IntervalName.Replace(" 分K", "").Replace("分K", "").Trim();
+                foreach (ComboBoxItem item in cboKlineInterval.Items)
+                {
+                    if (item.Content?.ToString() == name)
+                    {
+                        cboKlineInterval.SelectedItem = item;
+                        break;
+                    }
+                }
+            }
+        }
+
         // ==================== 9. 底部參數更改同步槽 ====================
 
         
@@ -4367,6 +4448,90 @@ namespace ExtremeSignalAppCS
             public int Port { get; } = port;
             public string Session { get; } = session;
             public void Deconstruct(out int port, out string session) { port = Port; session = Session; }
+        }
+        // ==================== 11. 共用區間統計計算邏輯 ====================
+        private Dictionary<int, List<SimulationResult>> ComputeAllIntervalResults(string sessionName, IReadOnlyList<TradeTick> trades, List<SimulationResult> txfSigs, List<SimulationResult> mxfSigs, int obsN, int maxCount = -1)
+        {
+            var resultsMap = new Dictionary<int, List<SimulationResult>>();
+            if (trades == null || trades.Count == 0 || _engine == null) return resultsMap;
+
+            foreach (int interval in _allIntervals)
+            {
+                var (klineData, _) = _engine.CalcKlineData(sessionName, trades, txfSigs, mxfSigs, interval, maxCount);
+                var simResults = _engine.CalcSimulationResults(sessionName, trades, klineData, obsN, true, null, maxCount);
+                resultsMap[interval] = simResults;
+            }
+            return resultsMap;
+        }
+
+        private void UpdateIntervalStatsUI(Dictionary<int, List<SimulationResult>> resultsMap)
+        {
+            int totalShort = 0;
+            int totalLong = 0;
+            var statsList = new List<IntervalStat>();
+
+            foreach (var kvp in resultsMap)
+            {
+                int interval = kvp.Key;
+                var results = kvp.Value;
+                int shortCount = 0;
+                int longCount = 0;
+
+                foreach (var r in results)
+                {
+                    if (r.Tags.Contains("history") || r.Tags.Contains("annotation")) continue;
+                    if (r.DisplayTitle.Contains("K高")) longCount++;
+                    if (r.DisplayTitle.Contains("K低")) shortCount++;
+                }
+
+                totalShort += shortCount;
+                totalLong += longCount;
+
+                string color = "#DCDCDC";
+                if (shortCount > longCount) color = "#28A745"; // 綠色
+                else if (longCount > shortCount) color = "#EB4B4B"; // 紅色
+
+                string op = "等於";
+                if (shortCount > longCount) op = ">";
+                else if (shortCount < longCount) op = "<";
+
+                statsList.Add(new IntervalStat
+                {
+                    IntervalName = $"{interval} 分K",
+                    ShortCount = shortCount,
+                    LongCount = longCount,
+                    DisplayText = $"{interval,2} 分K: 觀察 K 低（做空）共 {shortCount,2} 筆 {op} 觀察 K 高（做多）共 {longCount,2} 筆",
+                    DisplayColor = color
+                });
+            }
+
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                _intervalStatsCollection.Clear();
+                foreach (var s in statsList)
+                {
+                    _intervalStatsCollection.Add(s);
+                }
+
+                if (lblTotalStats != null)
+                {
+                    lblTotalStats.Text = $"總計: 觀察 K 低（做空）共 {totalShort} 筆 等於 觀察 K 高（做多）共 {totalLong} 筆";
+                    if (totalShort > totalLong)
+                    {
+                        lblTotalStats.Text = $"總計: 觀察 K 低（做空）共 {totalShort} 筆 > 觀察 K 高（做多）共 {totalLong} 筆";
+                        lblTotalStats.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#28A745"));
+                    }
+                    else if (totalLong > totalShort)
+                    {
+                        lblTotalStats.Text = $"總計: 觀察 K 低（做空）共 {totalShort} 筆 < 觀察 K 高（做多）共 {totalLong} 筆";
+                        lblTotalStats.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EB4B4B"));
+                    }
+                    else
+                    {
+                        lblTotalStats.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#DCDCDC"));
+                    }
+                }
+            }));
         }
     }
 

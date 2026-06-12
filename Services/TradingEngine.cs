@@ -360,9 +360,9 @@ namespace ExtremeSignalAppCS.Services
             return (preAvg, postAvg, threshold, trigTime, trigPrice, actualPreN, actualPostN, curr - 1);
         }
 
-        public void GetDurations(IReadOnlyList<TradeTick> trades, int n, PendingTrigger trigger, TradeSide preSide, TradeSide postSide)
+        public void GetDurations(IReadOnlyList<TradeTick> trades, int n, PendingTrigger trigger, TradeSide preSide, TradeSide postSide, int maxCount = -1)
         {
-            int totalTradesCount = trades.Count;
+            int totalTradesCount = maxCount < 0 ? trades.Count : maxCount;
             int idx = trigger.Index;
 
             if (!trigger.PreScanned)
@@ -445,11 +445,12 @@ namespace ExtremeSignalAppCS.Services
         /// 使用 Binary Search 尋找大於等於 targetTime 的第一筆 Tick 索引。
         /// 找不到則回傳 trades.Count。
         /// </summary>
-        public int FindFirstTickIndexGEQ(IReadOnlyList<TradeTick> trades, double targetTime)
+        public int FindFirstTickIndexGEQ(IReadOnlyList<TradeTick> trades, double targetTime, int maxCount = -1)
         {
+            int tradesCount = maxCount < 0 ? trades.Count : maxCount;
             int left = 0;
-            int right = trades.Count - 1;
-            int ans = trades.Count;
+            int right = tradesCount - 1;
+            int ans = tradesCount;
             while (left <= right)
             {
                 int mid = left + (right - left) / 2;
@@ -747,7 +748,7 @@ namespace ExtremeSignalAppCS.Services
         /// 100% 移植 _calc_kline_data。
         /// </summary>
         public (List<KlineBar> KlineData, List<(string Direction, string BreakTime, string SigTime, List<SimulationResult> SigObjs)> Breakouts)
-            CalcKlineData(string sessionName, IReadOnlyList<TradeTick> trades, List<SimulationResult> txfSigs, List<SimulationResult> mxfSigs, int intervalMins = 30)
+            CalcKlineData(string sessionName, IReadOnlyList<TradeTick> trades, List<SimulationResult> txfSigs, List<SimulationResult> mxfSigs, int intervalMins = 30, int maxCount = -1)
         {
             double startTVal = sessionName == "日盤" ? 31500.0 : 54000.0;
             double interval = intervalMins * 60.0;
@@ -811,7 +812,7 @@ namespace ExtremeSignalAppCS.Services
 
             var buckets = cacheData.Buckets;
             int lastProcessedIdx = cacheData.LastIdx;
-            int totalTradesCount = trades.Count;
+            int totalTradesCount = maxCount < 0 ? trades.Count : maxCount;
 
             for (int i = lastProcessedIdx; i < totalTradesCount; i++)
             {
@@ -1007,9 +1008,10 @@ namespace ExtremeSignalAppCS.Services
         /// 100% 移植 _calc_simulation_results。
         /// 核心停損時序狀態機回測模擬。
         /// </summary>
-        public List<SimulationResult> CalcSimulationResults(string session, IReadOnlyList<TradeTick> trades, List<KlineBar> klines, int obsN, bool useDynamicN = false, Action<int>? onDynamicNUpdated = null)
+        public List<SimulationResult> CalcSimulationResults(string session, IReadOnlyList<TradeTick> trades, List<KlineBar> klines, int obsN, bool useDynamicN = false, Action<int>? onDynamicNUpdated = null, int maxCount = -1)
         {
             int totalTradesCount = trades?.Count ?? 0;
+            if (maxCount >= 0 && totalTradesCount > maxCount) totalTradesCount = maxCount;
             if (klines == null || klines.Count < 2 || totalTradesCount == 0)
                 return new List<SimulationResult>();
 
@@ -1110,8 +1112,8 @@ namespace ExtremeSignalAppCS.Services
                 }
 
                 // 尋找此 K 棒的 Tick 起始點與結束點 (使用 O(log N) 二元搜尋取代 O(N) 全量掃描)
-                int klineStartIdx = FindFirstTickIndexGEQ(trades, klineStart);
-                int klineEndTradeIdx = FindFirstTickIndexGEQ(trades, klineEnd);
+                int klineStartIdx = FindFirstTickIndexGEQ(trades, klineStart, totalTradesCount);
+                int klineEndTradeIdx = Math.Min(FindFirstTickIndexGEQ(trades, klineEnd, totalTradesCount), totalTradesCount);
 
                 lastKnownStartIdx = klineStartIdx;
                 lastKnownEndIdx = klineEndTradeIdx;

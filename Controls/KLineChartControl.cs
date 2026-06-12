@@ -526,6 +526,7 @@ namespace ExtremeSignalAppCS.Controls
         private double _dragStartMinX, _dragStartMaxX;
         private double _dragStartMinY, _dragStartMaxY;
         private bool _isYAxisDragging;
+        private bool _isXAxisDragging;
 
         // 狀態快取，防止 UpdateCandles 時強制蓋掉十字游標所指的 K 棒
         private bool _isMouseInChart;
@@ -853,13 +854,53 @@ namespace ExtremeSignalAppCS.Controls
             _isYAutoRanged = true;
             if (_candles == null || _candles.Count == 0) return;
 
-            // X軸對焦：寬度顯示所有 K棒 (索引區間為 [-1, count+1])
-            _minX = -1.0;
-            _maxX = _candles.Count + 1.0;
+            // X軸對焦：避免歷史資料過大導致 K 線被壓縮成一條線，設定最大可視範圍
+            double drawWidthLocal = Math.Max(1.0, ActualWidth > 0 ? ActualWidth - KLinePainter.RightMargin : 1000.0);
+            
+            // 條件 1：避免畫面擠進超過畫面寬度 2 倍的 K 棒
+            double maxRangeByPixels = drawWidthLocal * 2.0;
+            // 條件 2：避免縮放範圍大於歷史資料太多，產生過多空白
+            double maxRangeByCount = Math.Max(50.0, _candles.Count * 1.2);
+            
+            // 取兩者中較嚴格 (較小) 的那個作為最終極限
+            double maxRange = Math.Min(maxRangeByPixels, maxRangeByCount);
+
+            if (_candles.Count + 2.0 > maxRange)
+            {
+                _maxX = _candles.Count + 1.0;
+                _minX = _maxX - maxRange;
+            }
+            else
+            {
+                _minX = -1.0;
+                _maxX = _candles.Count + 1.0;
+            }
 
             // Y軸對焦：自動尋找此區間內的價格最高與最低
-            double highest = _candles.Max(c => c.High);
-            double lowest = _candles.Min(c => c.Low);
+            int startIdx = (int)Math.Max(0, _minX);
+            int endIdx = (int)Math.Min(_candles.Count - 1, _maxX);
+
+            if (startIdx > endIdx)
+            {
+                startIdx = 0;
+                endIdx = _candles.Count - 1;
+            }
+
+            double highest = -999999;
+            double lowest = 999999;
+
+            for (int i = startIdx; i <= endIdx; i++)
+            {
+                if (_candles[i].High > highest) highest = _candles[i].High;
+                if (_candles[i].Low < lowest) lowest = _candles[i].Low;
+            }
+
+            if (highest == -999999 || lowest == 999999)
+            {
+                highest = _candles.Max(c => c.High);
+                lowest = _candles.Min(c => c.Low);
+            }
+
             double height = highest - lowest;
             if (height <= 0) height = 1.0;
 
@@ -882,6 +923,43 @@ namespace ExtremeSignalAppCS.Controls
             {
                 AutoRange();
             }
+        }
+
+        /// <summary>
+        /// 計算當前可視範圍內合理的 Y 軸最大可視高度，防止手動縮放時被壓扁成一條線。
+        /// </summary>
+        private double GetMaxAllowedRangeY()
+        {
+            if (_candles == null || _candles.Count == 0) return 10000.0;
+
+            int startIdx = (int)Math.Max(0, _minX);
+            int endIdx = (int)Math.Min(_candles.Count - 1, _maxX);
+
+            if (startIdx > endIdx)
+            {
+                startIdx = 0;
+                endIdx = _candles.Count - 1;
+            }
+
+            double highest = -999999;
+            double lowest = 999999;
+
+            for (int i = startIdx; i <= endIdx; i++)
+            {
+                if (_candles[i].High > highest) highest = _candles[i].High;
+                if (_candles[i].Low < lowest) lowest = _candles[i].Low;
+            }
+
+            if (highest == -999999 || lowest == 999999)
+            {
+                highest = _candles.Max(c => c.High);
+                lowest = _candles.Min(c => c.Low);
+            }
+
+            double height = highest - lowest;
+            if (height <= 0) height = 100.0;
+
+            return Math.Max(100.0, height * 10.0); // 最大允許縮小到可視高低差的 10 倍
         }
 
         /// <summary>
@@ -1003,31 +1081,53 @@ namespace ExtremeSignalAppCS.Controls
         {
             if (_candles == null || _candles.Count == 0) return;
 
-            _isZoomedOrPanned = true; // 鎖定為手動狀態
-
             Point mousePoint = e.GetPosition(this);
-            double w = ActualWidth;
-            double h = ActualHeight;
-            double drawWidthLocal = Math.Max(1.0, w - KLinePainter.RightMargin);
-            double drawHeight = Math.Max(1.0, h - KLinePainter.BottomMargin);
-
+            double drawWidthLocal = Math.Max(1.0, ActualWidth - KLinePainter.RightMargin);
             if (mousePoint.X > drawWidthLocal) return; // 若點擊在 Y 軸區域則忽略
 
-            int lastIdx = _candles.Count - 1;
-            var lastCandle = _candles[lastIdx];
+            // 切換為手動鎖定狀態，但保留 Y 軸動態追蹤以適應新行情
+            _isZoomedOrPanned = true; 
+            _isYAutoRanged = true; 
 
-            // 1. 計算 X 軸平移 (保持 rangeX 不變)
+            // 1. X 軸：保持當前可視數量，將最後一根 K 棒對齊到點擊的 X 坐標
+            int lastIdx = _candles.Count - 1;
             double rangeX = _maxX - _minX;
-            _minX = lastIdx - (mousePoint.X / drawWidthLocal) * rangeX;
+            double relativeX = mousePoint.X / drawWidthLocal;
+            
+            _minX = lastIdx - relativeX * rangeX;
             _maxX = _minX + rangeX;
 
-            // 2. 計算 Y 軸平移 (保持 rangeY 不變)
-            double rangeY = _maxY - _minY;
-            _minY = lastCandle.Close - rangeY * (1.0 - mousePoint.Y / drawHeight);
-            _maxY = _minY + rangeY;
+            // 2. Y 軸：根據新的可見區間尋找最高與最低價
+            int startIdx = (int)Math.Max(0, _minX);
+            int endIdx = (int)Math.Min(_candles.Count - 1, _maxX);
 
-            // 3. 強制解除 Y 軸自動對焦，確保平移不會被下個 Tick 蓋掉
-            _isYAutoRanged = false;
+            if (startIdx > endIdx)
+            {
+                startIdx = 0;
+                endIdx = _candles.Count - 1;
+            }
+
+            double highest = -999999;
+            double lowest = 999999;
+
+            for (int i = startIdx; i <= endIdx; i++)
+            {
+                if (_candles[i].High > highest) highest = _candles[i].High;
+                if (_candles[i].Low < lowest) lowest = _candles[i].Low;
+            }
+
+            if (highest == -999999 || lowest == 999999)
+            {
+                highest = _candles.Max(c => c.High);
+                lowest = _candles.Min(c => c.Low);
+            }
+            
+            double height = highest - lowest;
+            if (height <= 0) height = 1.0;
+            
+            // 上下各保留 5% 的視覺緩衝空間
+            _minY = lowest - height * 0.05;
+            _maxY = highest + height * 0.05;
 
             _painter.SetData(_candles, _minX, _maxX, _minY, _maxY);
             UpdatePriceTag();
@@ -1053,7 +1153,9 @@ namespace ExtremeSignalAppCS.Controls
             _dragStartMaxY = _maxY;
 
             double drawWidth = Math.Max(1.0, ActualWidth - KLinePainter.RightMargin);
+            double drawHeight = Math.Max(1.0, ActualHeight - KLinePainter.BottomMargin);
             _isYAxisDragging = _dragStartPoint.X > drawWidth;
+            _isXAxisDragging = _dragStartPoint.Y > drawHeight && _dragStartPoint.X <= drawWidth;
 
             CaptureMouse();
             
@@ -1077,23 +1179,63 @@ namespace ExtremeSignalAppCS.Controls
 
             Point mousePoint = e.GetPosition(this);
 
-            // 1. 拖曳平移 (Pan) 與 Y軸縮放
+            // 1. 拖曳平移 (Pan) 與 XY軸縮放
             if (_isDragging)
             {
                 if (_isYAxisDragging)
                 {
                     double deltaY = mousePoint.Y - _dragStartPoint.Y;
                     double drawHeight = Math.Max(1.0, h - KLinePainter.BottomMargin);
+                    
+                    // 以滑鼠初始點擊位置的價格為縮放錨點
+                    double startRangeY = _dragStartMaxY - _dragStartMinY;
+                    double relativeY = _dragStartPoint.Y / drawHeight; // 0 是頂部(最高價), 1 是底部(最低價)
+                    double anchorPrice = _dragStartMaxY - relativeY * startRangeY;
+
                     double scaleY = 1.0 + (deltaY / drawHeight) * 2.0; 
                     if (scaleY < 0.1) scaleY = 0.1;
                     if (scaleY > 10.0) scaleY = 10.0;
                     
-                    double midY = (_dragStartMinY + _dragStartMaxY) / 2.0;
-                    double rangeY = (_dragStartMaxY - _dragStartMinY) * scaleY;
-                    _minY = midY - rangeY / 2.0;
-                    _maxY = midY + rangeY / 2.0;
+                    double rangeY = startRangeY * scaleY;
+                    
+                    double maxAllowedY = GetMaxAllowedRangeY();
+                    if (rangeY > maxAllowedY) rangeY = maxAllowedY;
+
+                    // 錨點不變，重新計算上下邊界
+                    _maxY = anchorPrice + rangeY * relativeY;
+                    _minY = _maxY - rangeY;
                     
                     _isYAutoRanged = false; 
+                }
+                else if (_isXAxisDragging)
+                {
+                    double deltaX = mousePoint.X - _dragStartPoint.X;
+                    double drawWidthLocal = Math.Max(1.0, w - KLinePainter.RightMargin);
+                    
+                    // 往右拖 (deltaX > 0) 放大，往左拖縮小
+                    double scaleX = 1.0 - (deltaX / drawWidthLocal) * 1.5; 
+                    if (scaleX < 0.1) scaleX = 0.1;
+                    if (scaleX > 10.0) scaleX = 10.0;
+                    
+                    double startRangeX = _dragStartMaxX - _dragStartMinX;
+                    double startRelativeX = _dragStartPoint.X / drawWidthLocal;
+                    double anchorIndex = _dragStartMinX + startRelativeX * startRangeX;
+
+                    double newRangeX = startRangeX * scaleX;
+                    
+                    double maxRangeByPixels = drawWidthLocal * 2.0;
+                    double maxRangeByCount = Math.Max(30.0, _candles.Count * 1.2);
+                    double maxRange = Math.Min(maxRangeByPixels, maxRangeByCount);
+                    if (newRangeX > maxRange) newRangeX = maxRange;
+                    if (newRangeX < 5.0) newRangeX = 5.0;
+
+                    _minX = anchorIndex - newRangeX * startRelativeX;
+                    _maxX = _minX + newRangeX;
+                    
+                    if (_isYAutoRanged)
+                    {
+                        AutoRangeYForVisibleX();
+                    }
                 }
                 else
                 {
@@ -1125,7 +1267,7 @@ namespace ExtremeSignalAppCS.Controls
                     }
                 }
 
-                if (_isYAutoRanged)
+                if (_isYAutoRanged && !_isYAxisDragging)
                 {
                     AutoRangeYForVisibleX();
                 }
@@ -1198,6 +1340,9 @@ namespace ExtremeSignalAppCS.Controls
                 
                 // 防呆，不縮到太小或太大
                 if (newRangeY < 0.0001) newRangeY = 0.0001; 
+                
+                double maxAllowedY = GetMaxAllowedRangeY();
+                if (newRangeY > maxAllowedY) newRangeY = maxAllowedY;
 
                 double topRatio = (_maxY - mousePrice) / rangeY;
                 _maxY = mousePrice + newRangeY * topRatio;
@@ -1207,7 +1352,7 @@ namespace ExtremeSignalAppCS.Controls
             }
             else
             {
-                // 在圖表上滾輪 -> 縮放 X 軸與 Y 軸
+                // 在圖表上滾輪 -> 只縮放 X 軸 (游標為錨點)，Y 軸依據自動對焦狀態決定
                 double rangeX = _maxX - _minX;
 
                 double zoomFactor = e.Delta > 0 ? 0.85 : 1.15;
@@ -1215,26 +1360,26 @@ namespace ExtremeSignalAppCS.Controls
 
                 // 限制最大/最小縮放寬度
                 if (newRange < 5.0) newRange = 5.0;
-                if (newRange > _candles.Count * 2.0) newRange = _candles.Count * 2.0;
+                
+                // 限制最小縮放 (最大可視範圍)：避免 K 線被過度壓縮成橫線，也避免數量少時產生巨大空白
+                double maxRangeByPixels = drawWidthLocal * 2.0;
+                double maxRangeByCount = Math.Max(30.0, _candles.Count * 1.2);
+                double maxRange = Math.Min(maxRangeByPixels, maxRangeByCount);
+                
+                if (newRange > maxRange) newRange = maxRange;
 
-                // 以右側 (_maxX) 為基準固定，縮小/放大只改變左側 (_minX)
-                _minX = _maxX - newRange;
+                // --- 游標錨點縮放 (TradingView 風格) ---
+                double relativeX = mouseX / drawWidthLocal;
+                double mouseIndex = _minX + relativeX * rangeX;
+
+                _minX = mouseIndex - newRange * relativeX;
+                _maxX = _minX + newRange;
 
                 if (_isYAutoRanged)
                 {
                     AutoRangeYForVisibleX();
                 }
-                else
-                {
-                    // 若是手動 Y 軸模式，讓 Y 軸也以畫面中心等比例放大縮小
-                    double rangeY = _maxY - _minY;
-                    double newRangeY = rangeY * zoomFactor;
-                    if (newRangeY < 0.0001) newRangeY = 0.0001;
-
-                    double midY = (_minY + _maxY) / 2.0;
-                    _minY = midY - newRangeY / 2.0;
-                    _maxY = midY + newRangeY / 2.0;
-                }
+                // 如果是手動 Y 軸模式 (_isYAutoRanged == false)，則 Y 軸不動，完全對齊 TV 操作邏輯
             }
 
             _painter.SetData(_candles, _minX, _maxX, _minY, _maxY);

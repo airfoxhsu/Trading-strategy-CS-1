@@ -185,13 +185,45 @@
                 <RowDefinition Height="1.2*"/>
             </Grid.RowDefinitions>
 
-            <!-- 3A. 日誌看板 -->
-            <Border Grid.Row="0" BorderBrush="{StaticResource WidgetBorderBrush}" BorderThickness="1" CornerRadius="4">
-                <RichTextBox x:Name="txtOutput" IsReadOnly="True" Background="#1A1A1A" Foreground="#DCDCDC" 
-                             FontFamily="Consolas" FontSize="13" BorderThickness="0"
-                             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
-                             PreviewMouseLeftButtonDown="TxtOutput_PreviewMouseLeftButtonDown"/>
-            </Border>
+            <!-- 3A. 日誌看板 與 區間統計 -->
+            <Grid Grid.Row="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="2*"/>
+                    <ColumnDefinition Width="1*"/>
+                </Grid.ColumnDefinitions>
+
+                <Border Grid.Column="0" BorderBrush="{StaticResource WidgetBorderBrush}" BorderThickness="1" CornerRadius="4" Margin="0,0,4,0">
+                    <RichTextBox x:Name="txtOutput" IsReadOnly="True" Background="#1A1A1A" Foreground="#DCDCDC" 
+                                 FontFamily="Consolas" FontSize="13" BorderThickness="0"
+                                 VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                                 PreviewMouseLeftButtonDown="TxtOutput_PreviewMouseLeftButtonDown"/>
+                </Border>
+                
+                <GridSplitter Grid.Column="0" Width="4" HorizontalAlignment="Right" VerticalAlignment="Stretch" Background="#333" Margin="0,0,-2,0"/>
+
+                <Border Grid.Column="1" BorderBrush="{StaticResource WidgetBorderBrush}" BorderThickness="1" CornerRadius="4" Margin="4,0,0,0">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+                        <Border Grid.Row="0" BorderBrush="{StaticResource WidgetBorderBrush}" BorderThickness="0,0,0,1" Padding="4">
+                            <TextBlock x:Name="lblTotalStats" Text="總計: 觀察 K 低（做空）共 0 筆 等於 觀察 K 高（做多）共 0 筆" Foreground="#DCDCDC" FontWeight="Bold" Background="Transparent"/>
+                        </Border>
+                        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                            <ItemsControl x:Name="icIntervalStats" Padding="4">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <Border Background="Transparent" Cursor="Hand" MouseLeftButtonDown="IntervalStat_MouseLeftButtonDown">
+                                            <TextBlock Text="{Binding DisplayText}" Foreground="{Binding DisplayColor}" Margin="0,2"/>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </ScrollViewer>
+                    </Grid>
+                </Border>
+            </Grid>
 
             <!-- 橫向拉伸條 1 -->
             <GridSplitter Grid.Row="0" Height="4" VerticalAlignment="Bottom" HorizontalAlignment="Stretch" Background="#333" Margin="0,0,0,-2"/>

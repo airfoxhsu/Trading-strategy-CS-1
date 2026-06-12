@@ -24,9 +24,7 @@ namespace ExtremeSignalAppCS.Controls
         private TradingEngine? _engine;
         private MainWindow? _parentApp;
         
-        private bool _bgCheckInProgress;
         private readonly object _lock = new();
-        private long _currentCheckId = 0;
 
         // 快取當前未破停損價格 (Key: (Type[high/low], PriceStr) -> Value: 分K分鐘數集合)
         private Dictionary<(string Type, string Price), HashSet<int>> _currentUnbrokenMap = new();
@@ -60,250 +58,166 @@ namespace ExtremeSignalAppCS.Controls
             _parentApp = parentApp;
         }
 
-        /// <summary>
-        /// 標記有新行情資料需要重新計算。
-        /// 由 MainWindow 在實時分析完成後呼叫，將受限於 2000ms 的降頻保護。
-        /// </summary>
-        public void MarkDirty()
-        {
-            TriggerUnbrokenCheck(false); // 必須設為 false 以啟動降頻保護
-        }
-
-        private double _lastCheckTimeMs = 0;
-
-        /// <summary>
-        /// 週期性或事件驅動觸發未破停損分析。
-        /// </summary>
-        public void TriggerUnbrokenCheck(bool force = false)
+        public void UpdateFromSharedData(Dictionary<int, List<SimulationResult>> resultsMap, string currentPrice, string tradeTimeStr)
         {
             if (_engine == null || _parentApp == null) return;
-            if (_bgCheckInProgress) return;
 
-            // 加入 2000ms 的操作感知型降頻，因為這牽涉到 7 個時間級別的全局大迴圈狀態機運算
-            double nowMs = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
-            if (!force && nowMs - _lastCheckTimeMs < 2000) return;
-            _lastCheckTimeMs = nowMs;
+            var tempUnbrokenMap = new Dictionary<(string Type, string Price), HashSet<int>>();
+            var tempTimeMap = new Dictionary<(string Type, string Price), string>();
+            var stopLossLifespans = new Dictionary<(string Type, string StopLossVal), List<(double TrigTVal, string TrigTimeStr, double? BreakTVal, string BreakTimeStr, int? TrigPrice, string IntervalStr)>>();
 
-            _bgCheckInProgress = true;
-            long myRunId = Interlocked.Increment(ref _currentCheckId);
-
-            // 在主執行緒提取不可在背景直接讀取的 GUI 變數快照 (避免 Thread Access Exception)
-            int obsN = _parentApp.GetObsN();
-            List<string> intervalsStr = _parentApp.GetKlineIntervals();
-            var sessionDataSnapshot = _parentApp.GatherSessionDataSnapshot();
-
-            if (sessionDataSnapshot == null || sessionDataSnapshot.Count == 0 || !sessionDataSnapshot.Any(x => x.Trades.Count > 0))
+            foreach (var kvp in resultsMap)
             {
-                _bgCheckInProgress = false;
-                return;
+                int intMins = kvp.Key;
+                var results = kvp.Value;
+
+                foreach (var item in results)
+                {
+                    if (item.Tags.Contains("history") || item.Tags.Contains("annotation"))
+                        continue;
+
+                    string sigLabel = item.DisplayTitle;
+                    string stopLossVal = item.StopLossDisplay;
+                    
+                    string? typeObj = null;
+                    if (sigLabel.Contains("K高")) typeObj = "K高";
+                    else if (sigLabel.Contains("K低")) typeObj = "K低";
+                    
+                    if (typeObj != null)
+                    {
+                        double trigTVal = ParseTimeStr(item.TrigTime);
+                        double? breakTVal = null;
+                        string breakTimeStr = "";
+                        if (item.IsBroken && !string.IsNullOrEmpty(item.BreakTime))
+                        {
+                            breakTVal = ParseTimeStr(item.BreakTime);
+                            breakTimeStr = item.BreakTime;
+                        }
+                        
+                        string slKeyStr = item.StopLossPrice.ToString();
+                        var lifeKey = (typeObj, slKeyStr);
+                        
+                        if (!stopLossLifespans.ContainsKey(lifeKey))
+                        {
+                            stopLossLifespans[lifeKey] = new List<(double TrigTVal, string TrigTimeStr, double? BreakTVal, string BreakTimeStr, int? TrigPrice, string IntervalStr)>();
+                        }
+                        int? tp = int.TryParse(item.TrigPrice, out int tpVal) ? tpVal : (int?)null;
+                        stopLossLifespans[lifeKey].Add((trigTVal, item.TrigTime, breakTVal, breakTimeStr, tp, intMins.ToString()));
+                    }
+
+                    if (!string.IsNullOrEmpty(stopLossVal) && stopLossVal != "N/A" && !stopLossVal.Contains("已破"))
+                    {
+                        string? type = null;
+                        if (sigLabel.Contains("K高")) type = "high";
+                        else if (sigLabel.Contains("K低")) type = "low";
+
+                        if (type != null)
+                        {
+                            var key = (type, stopLossVal);
+                            string timeStr = item.BestATimeDisplay;
+                            lock (_lock)
+                            {
+                                if (!tempUnbrokenMap.ContainsKey(key))
+                                {
+                                    tempUnbrokenMap[key] = new HashSet<int>();
+                                }
+                                tempUnbrokenMap[key].Add(intMins);
+
+                                if (!tempTimeMap.ContainsKey(key) || string.Compare(timeStr, tempTimeMap[key]) > 0)
+                                {
+                                    tempTimeMap[key] = timeStr;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
-            // 背景非同步執行緒運行重度 K 線 OHLC 聚合與狀態機運算
-            Task.Run(() =>
+            // 根據 stopLossLifespans 建立歷史時間軸
+            var timeline = new List<(double TVal, string TimeStr, string Type, int Delta, int? Price, string Reason)>();
+            foreach (var kvp in stopLossLifespans)
             {
-                try
+                var spans = kvp.Value;
+                spans.Sort((a, b) => a.TrigTVal.CompareTo(b.TrigTVal));
+                
+                var merged = new List<(double Trig, string TrigStr, double Break, string BreakStr, int? Price, string IntervalStr)>();
+                foreach (var span in spans)
                 {
-                    var tempUnbrokenMap = new Dictionary<(string Type, string Price), HashSet<int>>();
-                    var tempTimeMap = new Dictionary<(string Type, string Price), string>();
-                    var stopLossLifespans = new Dictionary<(string Type, string StopLossVal), List<(double TrigTVal, string TrigTimeStr, double? BreakTVal, string BreakTimeStr, int? TrigPrice, string IntervalStr)>>();
-
-                    foreach (var intervalStr in intervalsStr)
+                    double spanBreak = span.BreakTVal ?? 999999;
+                    if (merged.Count == 0)
                     {
-                        if (!int.TryParse(intervalStr, out int intMins))
-                            continue;
-
-                        foreach (var (sessionName, trades, txfSigs, mxfSigs) in sessionDataSnapshot)
-                        {
-                            // 背景非同步聚合分 K
-                            var (klineData, _) = _engine.CalcKlineData(sessionName, trades, txfSigs, mxfSigs, intMins);
-
-                            // 背景非同步跑停損狀態機模擬
-                            var results = _engine.CalcSimulationResults(sessionName, trades, klineData, obsN, true);
-
-                            foreach (var item in results)
-                            {
-                                if (item.Tags.Contains("history") || item.Tags.Contains("annotation"))
-                                    continue;
-
-                                string sigLabel = item.DisplayTitle;
-                                string stopLossVal = item.StopLossDisplay;
-                                
-                                string? typeObj = null;
-                                if (sigLabel.Contains("K高")) typeObj = "K高";
-                                else if (sigLabel.Contains("K低")) typeObj = "K低";
-                                
-                                if (typeObj != null)
-                                {
-                                    double trigTVal = ParseTimeStr(item.TrigTime);
-                                    double? breakTVal = null;
-                                    string breakTimeStr = "";
-                                    if (item.IsBroken && !string.IsNullOrEmpty(item.BreakTime))
-                                    {
-                                        breakTVal = ParseTimeStr(item.BreakTime);
-                                        breakTimeStr = item.BreakTime;
-                                    }
-                                    
-                                    string slKeyStr = item.StopLossPrice.ToString();
-                                    var lifeKey = (typeObj, slKeyStr);
-                                    
-                                    if (!stopLossLifespans.ContainsKey(lifeKey))
-                                    {
-                                        stopLossLifespans[lifeKey] = new List<(double TrigTVal, string TrigTimeStr, double? BreakTVal, string BreakTimeStr, int? TrigPrice, string IntervalStr)>();
-                                    }
-                                    int? tp = int.TryParse(item.TrigPrice, out int tpVal) ? tpVal : (int?)null;
-                                    stopLossLifespans[lifeKey].Add((trigTVal, item.TrigTime, breakTVal, breakTimeStr, tp, intMins.ToString()));
-                                }
-
-                                if (!string.IsNullOrEmpty(stopLossVal) && stopLossVal != "N/A" && !stopLossVal.Contains("已破"))
-                                {
-                                    string? type = null;
-                                    if (sigLabel.Contains("K高")) type = "high";
-                                    else if (sigLabel.Contains("K低")) type = "low";
-
-                                    if (type != null)
-                                    {
-                                        var key = (type, stopLossVal);
-                                        string timeStr = item.BestATimeDisplay;
-                                        lock (_lock)
-                                        {
-                                            if (!tempUnbrokenMap.ContainsKey(key))
-                                            {
-                                                tempUnbrokenMap[key] = new HashSet<int>();
-                                            }
-                                            tempUnbrokenMap[key].Add(intMins);
-
-                                            if (!tempTimeMap.ContainsKey(key) || string.Compare(timeStr, tempTimeMap[key]) > 0)
-                                            {
-                                                tempTimeMap[key] = timeStr;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        merged.Add((span.TrigTVal, span.TrigTimeStr, spanBreak, span.BreakTimeStr, span.TrigPrice, span.IntervalStr));
                     }
-
-                    // 根據 stopLossLifespans 建立歷史時間軸
-                    var timeline = new List<(double TVal, string TimeStr, string Type, int Delta, int? Price, string Reason)>();
-                    foreach (var kvp in stopLossLifespans)
+                    else
                     {
-                        var spans = kvp.Value;
-                        spans.Sort((a, b) => a.TrigTVal.CompareTo(b.TrigTVal));
-                        
-                        var merged = new List<(double Trig, string TrigStr, double Break, string BreakStr, int? Price, string IntervalStr)>();
-                        foreach (var span in spans)
+                        var last = merged[^1];
+                        if (span.TrigTVal <= last.Break)
                         {
-                            double spanBreak = span.BreakTVal ?? 999999;
-                            if (merged.Count == 0)
+                            if (spanBreak > last.Break)
                             {
-                                merged.Add((span.TrigTVal, span.TrigTimeStr, spanBreak, span.BreakTimeStr, span.TrigPrice, span.IntervalStr));
-                            }
-                            else
-                            {
-                                var last = merged[^1];
-                                if (span.TrigTVal <= last.Break)
-                                {
-                                    if (spanBreak > last.Break)
-                                    {
-                                        merged[^1] = (last.Trig, last.TrigStr, spanBreak, spanBreak == 999999 ? "" : span.BreakTimeStr, last.Price, last.IntervalStr);
-                                    }
-                                }
-                                else
-                                {
-                                    merged.Add((span.TrigTVal, span.TrigTimeStr, spanBreak, span.BreakTimeStr, span.TrigPrice, span.IntervalStr));
-                                }
+                                merged[^1] = (last.Trig, last.TrigStr, spanBreak, spanBreak == 999999 ? "" : span.BreakTimeStr, last.Price, last.IntervalStr);
                             }
                         }
-                        
-                        foreach (var m in merged)
+                        else
                         {
-                            if (m.Trig < 999999)
-                                timeline.Add((m.Trig, m.TrigStr, kvp.Key.Type, 1, m.Price, $"{m.IntervalStr} 分 K"));
-                            
-                            if (m.Break < 999999)
-                            {
-                                int.TryParse(kvp.Key.StopLossVal, out int sl);
-                                timeline.Add((m.Break, m.BreakStr, kvp.Key.Type, -1, sl, "即時破位"));
-                            }
+                            merged.Add((span.TrigTVal, span.TrigTimeStr, spanBreak, span.BreakTimeStr, span.TrigPrice, span.IntervalStr));
                         }
-                    }
-                    
-                    timeline.Sort((a, b) => a.TVal.CompareTo(b.TVal));
-                    
-                    int computedLongCount = 0;
-                    int computedShortCount = 0;
-                    int computedDir = 0;
-                    var computedHistory = new List<TrendEvent>();
-                    
-                    foreach (var ev in timeline)
-                    {
-                        if (ev.Type == "K高") computedLongCount += ev.Delta;
-                        if (ev.Type == "K低") computedShortCount += ev.Delta;
-                        
-                        int newDir = computedDir;
-                        if (computedLongCount > computedShortCount) newDir = 1;
-                        else if (computedShortCount > computedLongCount) newDir = -1;
-                        else if (computedLongCount == 0 && computedShortCount == 0) newDir = 0;
-                        
-                        if (newDir != computedDir)
-                        {
-                            computedDir = newDir;
-                            if (computedDir != 0)
-                            {
-                                computedHistory.Add(new TrendEvent
-                                {
-                                    Direction = computedDir,
-                                    LongCount = computedLongCount,
-                                    ShortCount = computedShortCount,
-                                    EstablishedTime = FormatTimeStr(ev.TimeStr),
-                                    EstablishedPrice = ev.Price,
-                                    Reason = ev.Reason
-                                });
-                                // Keep memory bounded if there are insane amounts of flips
-                                if (computedHistory.Count > 1000) computedHistory.RemoveAt(0);
-                            }
-                        }
-                    }
-
-                    // 取得目前最新小台價格
-                    string currentPrice = "N/A";
-                    string tradeTimeStr = "N/A";
-                    if (sessionDataSnapshot.Count > 0)
-                    {
-                        for (int i = sessionDataSnapshot.Count - 1; i >= 0; i--)
-                        {
-                            var trades = sessionDataSnapshot[i].Trades;
-                            if (trades.Count > 0)
-                            {
-                                currentPrice = trades[^1].Price.ToString();
-                                tradeTimeStr = trades[^1].Time;
-                                break;
-                            }
-                        }
-                    }
-
-                    // 安全 Dispatch 回 UI 執行緒刷新渲染
-                    Dispatcher.BeginInvoke(new Action(() =>
-                    {
-                        if (Interlocked.Read(ref _currentCheckId) != myRunId) return;
-
-                        _currentUnbrokenMap = tempUnbrokenMap;
-                        _currentUnbrokenTimeMap = tempTimeMap;
-                        UpdateUI(currentPrice, tradeTimeStr, computedHistory, computedDir);
-                    }));
-                }
-                catch (Exception)
-                {
-                    // Ignore or log internally
-                }
-                finally
-                {
-                    if (Interlocked.Read(ref _currentCheckId) == myRunId)
-                    {
-                        _bgCheckInProgress = false;
                     }
                 }
-            });
+                
+                foreach (var m in merged)
+                {
+                    if (m.Trig < 999999)
+                        timeline.Add((m.Trig, m.TrigStr, kvp.Key.Type, 1, m.Price, $"{m.IntervalStr} 分 K"));
+                    
+                    if (m.Break < 999999)
+                    {
+                        int.TryParse(kvp.Key.StopLossVal, out int sl);
+                        timeline.Add((m.Break, m.BreakStr, kvp.Key.Type, -1, sl, "即時破位"));
+                    }
+                }
+            }
+            
+            timeline.Sort((a, b) => a.TVal.CompareTo(b.TVal));
+            
+            int computedLongCount = 0;
+            int computedShortCount = 0;
+            int computedDir = 0;
+            var computedHistory = new List<TrendEvent>();
+            
+            foreach (var ev in timeline)
+            {
+                if (ev.Type == "K高") computedLongCount += ev.Delta;
+                if (ev.Type == "K低") computedShortCount += ev.Delta;
+                
+                int newDir = computedDir;
+                if (computedLongCount > computedShortCount) newDir = 1;
+                else if (computedShortCount > computedLongCount) newDir = -1;
+                else if (computedLongCount == 0 && computedShortCount == 0) newDir = 0;
+                
+                if (newDir != computedDir)
+                {
+                    computedDir = newDir;
+                    if (computedDir != 0)
+                    {
+                        computedHistory.Add(new TrendEvent
+                        {
+                            Direction = computedDir,
+                            LongCount = computedLongCount,
+                            ShortCount = computedShortCount,
+                            EstablishedTime = FormatTimeStr(ev.TimeStr),
+                            EstablishedPrice = ev.Price,
+                            Reason = ev.Reason
+                        });
+                        if (computedHistory.Count > 1000) computedHistory.RemoveAt(0);
+                    }
+                }
+            }
+
+            // 更新內部狀態
+            _currentUnbrokenMap = tempUnbrokenMap;
+            _currentUnbrokenTimeMap = tempTimeMap;
+            UpdateUI(currentPrice, tradeTimeStr, computedHistory, computedDir);
         }
 
         /// <summary>
@@ -753,12 +667,12 @@ namespace ExtremeSignalAppCS.Controls
         /// </summary>
         public void Clear()
         {
-            Interlocked.Increment(ref _currentCheckId); // 取消任何執行中的背景更新
+
             lock (_lock)
             {
                 _currentUnbrokenMap.Clear();
             }
-            _bgCheckInProgress = false;
+
             txtDisplay.Document.Blocks.Clear();
             lblTitle.Text = "🛡️ 未破分 K 停損監控";
             lblSummaryShort.Text = "做空共有 0 項";
