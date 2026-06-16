@@ -46,6 +46,11 @@ namespace ExtremeSignalAppCS.Models
         /// </summary>
         public int BestSp { get; }
 
+        /// <summary>
+        /// 當筆成交口數 (Volume)
+        /// </summary>
+        public int Qty { get; }
+
         // === 零分配唯讀屬性封裝 ===
 
         /// <summary>
@@ -66,12 +71,13 @@ namespace ExtremeSignalAppCS.Models
         /// <summary>
         /// 高效能 Zero Allocation 建構子
         /// </summary>
-        public TradeTick(byte symbolId, byte sessionId, double timeVal, int price, TradeSide side, int bestBp = 0, int bestSp = 0)
+        public TradeTick(byte symbolId, byte sessionId, double timeVal, int price, int qty, TradeSide side, int bestBp = 0, int bestSp = 0)
         {
             SymbolId = symbolId;
             SessionId = sessionId;
             TimeVal = timeVal;
             Price = price;
+            Qty = qty;
             Side = side;
             BestBp = bestBp;
             BestSp = bestSp;
@@ -80,12 +86,13 @@ namespace ExtremeSignalAppCS.Models
         /// <summary>
         /// 向下相容建構子，於轉換過程中使用。
         /// </summary>
-        public TradeTick(string symbol, string time, double timeVal, int price, TradeSide side, int bestBp = 0, int bestSp = 0, string session = "")
+        public TradeTick(string symbol, string time, double timeVal, int price, int qty, TradeSide side, int bestBp = 0, int bestSp = 0, string session = "")
         {
             SymbolId = (byte)(symbol == "MXF" ? 1 : 0);
             SessionId = (byte)(session == "夜盤" ? 1 : 0);
             TimeVal = timeVal;
             Price = price;
+            Qty = qty;
             Side = side;
             BestBp = bestBp;
             BestSp = bestSp;

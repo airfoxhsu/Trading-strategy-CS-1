@@ -43,21 +43,36 @@ namespace ExtremeSignalAppCS.Helper
                 return p;
             }
 
+            bool hasRedTag = line.Contains("[C:RED]");
+            bool hasGreenTag = line.Contains("[C:GREEN]");
+
+            if (hasRedTag) line = line.Replace("[C:RED]", "");
+            if (hasGreenTag) line = line.Replace("[C:GREEN]", "");
+
             var run = new Run(line);
 
-            // 💡 100% 遵守規則：若包含 "未達標" 則保持白/預設色，不染任何色
-            if (line.Contains("未達標"))
+            if (hasRedTag)
+            {
+                run.Foreground = UpBrush; // 紅色
+                run.FontWeight = System.Windows.FontWeights.Bold;
+            }
+            else if (hasGreenTag)
+            {
+                run.Foreground = DownBrush; // 綠色
+                run.FontWeight = System.Windows.FontWeights.Bold;
+            }
+            else if (line.Contains("未達標"))
             {
                 run.Foreground = DefaultBrush;
             }
             else if (line.Contains("最高") || line.Contains("K低"))
             {
-                run.Foreground = DownBrush; // Python 做空/綠色高亮 (買賣相反：最高/K低為做空->綠)
+                run.Foreground = DownBrush; // Python 做空/綠色高亮
                 run.FontWeight = System.Windows.FontWeights.Bold;
             }
             else if (line.Contains("最低") || line.Contains("K高"))
             {
-                run.Foreground = UpBrush;   // Python 做多/紅色高亮 (最低/K高為做多->紅)
+                run.Foreground = UpBrush;   // Python 做多/紅色高亮
                 run.FontWeight = System.Windows.FontWeights.Bold;
             }
             else if (line.Contains("共識推播") || line.Contains("觸發推播") || 

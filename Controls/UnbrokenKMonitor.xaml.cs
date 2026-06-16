@@ -183,6 +183,7 @@ namespace ExtremeSignalAppCS.Controls
             int computedLongCount = 0;
             int computedShortCount = 0;
             int computedDir = 0;
+            int lastAddedDir = 0;
             var computedHistory = new List<TrendEvent>();
             
             foreach (var ev in timeline)
@@ -198,8 +199,9 @@ namespace ExtremeSignalAppCS.Controls
                 if (newDir != computedDir)
                 {
                     computedDir = newDir;
-                    if (computedDir != 0)
+                    if (computedDir != 0 && computedDir != lastAddedDir)
                     {
+                        lastAddedDir = computedDir;
                         computedHistory.Add(new TrendEvent
                         {
                             Direction = computedDir,
@@ -455,20 +457,42 @@ namespace ExtremeSignalAppCS.Controls
                 {
                     int oldDir = _trendDirection;
                     _trendDirection = newDir.Value;
+
+                    bool hasNewTrendEvent = false;
+                    TrendEvent? latestNewEvent = null;
+                    if (newHistory.Count > 0)
+                    {
+                        latestNewEvent = newHistory[^1];
+                        if (_trendHistory.Count == 0)
+                        {
+                            hasNewTrendEvent = true;
+                        }
+                        else
+                        {
+                            var lastOldEvent = _trendHistory[^1];
+                            if (lastOldEvent.EstablishedTime != latestNewEvent.EstablishedTime || 
+                                lastOldEvent.Direction != latestNewEvent.Direction)
+                            {
+                                hasNewTrendEvent = true;
+                            }
+                        }
+                    }
+
+                    bool wasEmpty = _trendHistory.Count == 0;
                     _trendHistory.Clear();
                     _trendHistory.AddRange(newHistory);
 
-                    if (oldDir != _trendDirection && _trendDirection != 0 && newHistory.Count > 0)
+                    if (hasNewTrendEvent && latestNewEvent != null)
                     {
-                        var evt = newHistory[^1];
-                        string dirStr = _trendDirection == 1 ? "多方 📈" : "空方 📉";
-                        string op = _trendDirection == 1 ? (evt.LongCount > evt.ShortCount ? ">" : "=") : (evt.ShortCount > evt.LongCount ? ">" : "=");
-                        string statusStr = _trendDirection == 1
+                        var evt = latestNewEvent;
+                        string dirStr = evt.Direction == 1 ? "多方 📈" : "空方 📉";
+                        string op = evt.Direction == 1 ? (evt.LongCount > evt.ShortCount ? ">" : "=") : (evt.ShortCount > evt.LongCount ? ">" : "=");
+                        string statusStr = evt.Direction == 1
                             ? $"做多 {evt.LongCount} 項 {op} 做空 {evt.ShortCount} 項"
                             : $"做空 {evt.ShortCount} 項 {op} 做多 {evt.LongCount} 項";
                         string cpStr = evt.EstablishedPrice.HasValue ? evt.EstablishedPrice.Value.ToString() : "--";
                         string reasonStr = !string.IsNullOrEmpty(evt.Reason) ? $" ({evt.Reason})" : "";
-                        string msgTitle = oldDir == 0 ? "【趨勢確立】" : "【趨勢轉向】";
+                        string msgTitle = wasEmpty ? "【趨勢確立】" : "【趨勢轉向】";
                         string msg = $"{msgTitle}{dirStr}\n" +
                                      $"時間：{evt.EstablishedTime}{reasonStr}\n" +
                                      $"觸發價位：{cpStr}\n" +
@@ -503,34 +527,38 @@ namespace ExtremeSignalAppCS.Controls
                     _trendDirection = newDirection;
                     if (_trendDirection != 0)
                     {
-                        int? currentP = int.TryParse(currentPrice, out int cp) ? cp : (int?)null;
-                        var evt = new TrendEvent 
-                        { 
-                            Direction = _trendDirection, 
-                            EstablishedTime = FormatTimeStr(tradeTimeStr),
-                            EstablishedPrice = currentP,
-                            LongCount = longCount,
-                            ShortCount = shortCount,
-                            Reason = "即時破位"
-                        };
-                        _trendHistory.Add(evt);
-                        if (_trendHistory.Count > 1000) _trendHistory.RemoveAt(0);
+                        int lastAddedDir = _trendHistory.Count > 0 ? _trendHistory[^1].Direction : 0;
+                        if (_trendDirection != lastAddedDir)
+                        {
+                            int? currentP = int.TryParse(currentPrice, out int cp) ? cp : (int?)null;
+                            var evt = new TrendEvent 
+                            { 
+                                Direction = _trendDirection, 
+                                EstablishedTime = FormatTimeStr(tradeTimeStr),
+                                EstablishedPrice = currentP,
+                                LongCount = longCount,
+                                ShortCount = shortCount,
+                                Reason = "即時破位"
+                            };
+                            _trendHistory.Add(evt);
+                            if (_trendHistory.Count > 1000) _trendHistory.RemoveAt(0);
 
-                        // Trigger Telegram push
-                        string dirStr = _trendDirection == 1 ? "多方 📈" : "空方 📉";
-                        string op = _trendDirection == 1 ? (longCount > shortCount ? ">" : "=") : (shortCount > longCount ? ">" : "=");
-                        string statusStr = _trendDirection == 1
-                            ? $"做多 {longCount} 項 {op} 做空 {shortCount} 項"
-                            : $"做空 {shortCount} 項 {op} 做多 {longCount} 項";
-                        string cpStr = currentP.HasValue ? currentP.Value.ToString() : "--";
-                        string reasonStr = !string.IsNullOrEmpty(evt.Reason) ? $" ({evt.Reason})" : "";
-                        string msgTitle = oldDir == 0 ? "【趨勢確立】" : "【趨勢轉向】";
-                        string msg = $"{msgTitle}{dirStr}\n" +
-                                     $"時間：{evt.EstablishedTime}{reasonStr}\n" +
-                                     $"觸發價位：{cpStr}\n" +
-                                     $"未破狀態：{statusStr}";
-                        
-                        _parentApp?.PushTelegramMessage(msg);
+                            // Trigger Telegram push
+                            string dirStr = _trendDirection == 1 ? "多方 📈" : "空方 📉";
+                            string op = _trendDirection == 1 ? (longCount > shortCount ? ">" : "=") : (shortCount > longCount ? ">" : "=");
+                            string statusStr = _trendDirection == 1
+                                ? $"做多 {longCount} 項 {op} 做空 {shortCount} 項"
+                                : $"做空 {shortCount} 項 {op} 做多 {longCount} 項";
+                            string cpStr = currentP.HasValue ? currentP.Value.ToString() : "--";
+                            string reasonStr = !string.IsNullOrEmpty(evt.Reason) ? $" ({evt.Reason})" : "";
+                            string msgTitle = lastAddedDir == 0 ? "【趨勢確立】" : "【趨勢轉向】";
+                            string msg = $"{msgTitle}{dirStr}\n" +
+                                         $"時間：{evt.EstablishedTime}{reasonStr}\n" +
+                                         $"觸發價位：{cpStr}\n" +
+                                         $"未破狀態：{statusStr}";
+                            
+                            _parentApp?.PushTelegramMessage(msg);
+                        }
                     }
                 }
             }

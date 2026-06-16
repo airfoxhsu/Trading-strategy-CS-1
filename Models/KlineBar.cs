@@ -9,28 +9,8 @@ namespace ExtremeSignalAppCS.Models
     /// 用於聚合分 K 資料，供 WPF DataGrid 表格資料綁定及 KLineChartControl 原生硬體加速繪製。
     /// 實作 INotifyPropertyChanged 以支援 WPF DataGrid 差量更新，消滅暴力 Items.Refresh() 全量重繪。
     /// </summary>
-    public class KlineBar : INotifyPropertyChanged
+    public class KlineBar : ObservableObject
     {
-        public event PropertyChangedEventHandler? PropertyChanged;
-
-        /// <summary>
-        /// 觸發屬性變更通知，讓 WPF DataGrid 自動差量更新對應儲存格。
-        /// </summary>
-        private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
-        {
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-        }
-
-        /// <summary>
-        /// 泛型 setter 輔助方法：值相同時跳過通知，避免無謂的 UI 重繪。
-        /// </summary>
-        private bool SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
-        {
-            if (Equals(field, value)) return false;
-            field = value;
-            OnPropertyChanged(propertyName);
-            return true;
-        }
 
         private string _timeLabel = string.Empty;
         private double _high;

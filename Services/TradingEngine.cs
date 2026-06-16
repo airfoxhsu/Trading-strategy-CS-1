@@ -260,7 +260,7 @@ namespace ExtremeSignalAppCS.Services
         /// <summary>
         /// 從當前快取狀態計算內外盤的平均速度與共識方向 (100% 移植原版邏輯)。
         /// </summary>
-        public (double? OuterAvg, double? InnerAvg, string Direction) CalcSideSpeedFromState(TradingState state)
+        public static (double? OuterAvg, double? InnerAvg, string Direction) CalcSideSpeedFromState(TradingState state)
         {
             double? outerAvg = null;
             double? innerAvg = null;
@@ -285,6 +285,68 @@ namespace ExtremeSignalAppCS.Services
             }
 
             return (outerAvg, innerAvg, direction);
+        }
+
+        public static double? CalcNetSpeedFromState(TradingState state)
+        {
+            var (oa, ia, _) = CalcSideSpeedFromState(state);
+            if (oa.HasValue && ia.HasValue)
+                return ia.Value - oa.Value;
+            return null;
+        }
+
+        public static (bool isNormal, bool isContradiction) ClassifyTrigger(string displayTitle, string speedInfo)
+        {
+            bool isUnmet = displayTitle.Contains(" [未達標]");
+            bool isContradiction = false;
+
+            if (isUnmet)
+            {
+                if (displayTitle.Contains("最低") && (speedInfo.Contains("多速增") || speedInfo.Contains("空速減")))
+                    isContradiction = true;
+                else if (displayTitle.Contains("最高") && (speedInfo.Contains("空速增") || speedInfo.Contains("多速減")))
+                    isContradiction = true;
+            }
+
+            bool isNormal = displayTitle.Contains("[達標]") && !displayTitle.Contains("已破") && !displayTitle.Contains("未達標");
+
+            return (isNormal, isContradiction);
+        }
+
+        public static (string maxStr, string minStr, string ampStr) FormatExtremeInfo(TradingState state, Func<string, string> formatTime)
+        {
+            string maxStr = state.DayMax > 0 && !string.IsNullOrEmpty(state.MaxTime)
+                ? $"當日最高: {state.DayMax} ({formatTime(state.MaxTime)})" : "當日最高: --";
+            string minStr = state.DayMin < int.MaxValue && !string.IsNullOrEmpty(state.MinTime)
+                ? $"當日最低: {state.DayMin} ({formatTime(state.MinTime)})" : "當日最低: --";
+            string ampStr = state.DayMax > 0 && state.DayMin < int.MaxValue
+                ? $"當日振幅: {state.DayMax - state.DayMin}" : "當日振幅: --";
+
+            return (maxStr, minStr, ampStr);
+        }
+
+        public static (string consensusStr, string consensusColor) CalcConsensus(string dT, string dM)
+        {
+            string consensusStr = "多空分歧 🤔";
+            string consensusColor = "Orange";
+
+            if (dT.Contains("多方") && dM.Contains("多方"))
+            {
+                consensusStr = "多方共識 🚀";
+                consensusColor = "#EB4B4B";
+            }
+            else if (dT.Contains("空方") && dM.Contains("空方"))
+            {
+                consensusStr = "空方共識 📉";
+                consensusColor = "#28A745";
+            }
+            else if (dT.Contains("持平") && dM.Contains("持平"))
+            {
+                consensusStr = "雙向持平 ⚖️";
+                consensusColor = "Gray";
+            }
+
+            return (consensusStr, consensusColor);
         }
 
         /// <summary>
@@ -770,18 +832,7 @@ namespace ExtremeSignalAppCS.Services
                     bool isUnmet = sig.DisplayTitle.Contains(" [未達標]");
                     string speedInfo = sig.Tags.FirstOrDefault(t => t.Contains("速")) ?? "";
                     
-                    bool isContradiction = false;
-                    if (isUnmet)
-                    {
-                        if (sig.DisplayTitle.Contains("最高") && (speedInfo.Contains("空速增") || speedInfo.Contains("多速減")))
-                            isContradiction = true;
-                        else if (sig.DisplayTitle.Contains("最低") && (speedInfo.Contains("多速增") || speedInfo.Contains("空速減")))
-                            isContradiction = true;
-                    }
-
-                    bool isNormalTrigger = sig.DisplayTitle.Contains("[達標]") && 
-                                           !sig.DisplayTitle.Contains("未") && 
-                                           !sig.DisplayTitle.Contains("邊界");
+                    var (isNormalTrigger, isContradiction) = ClassifyTrigger(sig.DisplayTitle, speedInfo);
 
                     if (isNormalTrigger || isContradiction)
                     {

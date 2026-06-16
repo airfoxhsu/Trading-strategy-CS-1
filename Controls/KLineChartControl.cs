@@ -456,10 +456,13 @@ namespace ExtremeSignalAppCS.Controls
                     pixelsPerDip);
                 
                 double drawWidth = Math.Max(1.0, w - RightMargin);
+                double textY = hy - text.Height / 2;
+                if (textY < 0) textY = 0; // 防止頂部文字被切掉
+                
                 if (hx + 5 + text.Width > drawWidth)
-                    dc.DrawText(text, new Point(hx - text.Width - 5, hy - text.Height / 2));
+                    dc.DrawText(text, new Point(hx - text.Width - 5, textY));
                 else
-                    dc.DrawText(text, new Point(hx + 5, hy - text.Height / 2));
+                    dc.DrawText(text, new Point(hx + 5, textY));
             }
 
             if (lowIdx != -1)
@@ -476,10 +479,14 @@ namespace ExtremeSignalAppCS.Controls
                     pixelsPerDip);
 
                 double drawWidth = Math.Max(1.0, w - RightMargin);
+                double drawHeight = Math.Max(1.0, h - BottomMargin);
+                double textY = ly - text.Height / 2;
+                if (textY + text.Height > drawHeight) textY = drawHeight - text.Height; // 防止底部文字被切掉
+                
                 if (lx + 5 + text.Width > drawWidth)
-                    dc.DrawText(text, new Point(lx - text.Width - 5, ly - text.Height / 2));
+                    dc.DrawText(text, new Point(lx - text.Width - 5, textY));
                 else
-                    dc.DrawText(text, new Point(lx + 5, ly - text.Height / 2));
+                    dc.DrawText(text, new Point(lx + 5, textY));
             }
         }
 
@@ -877,27 +884,11 @@ namespace ExtremeSignalAppCS.Controls
             _isYAutoRanged = true;
             if (_candles == null || _candles.Count == 0) return;
 
-            // X軸對焦：避免歷史資料過大導致 K 線被壓縮成一條線，設定最大可視範圍
-            double drawWidthLocal = Math.Max(1.0, ActualWidth > 0 ? ActualWidth - KLinePainter.RightMargin : 1000.0);
-            
-            // 條件 1：避免畫面擠進超過畫面寬度 2 倍的 K 棒
-            double maxRangeByPixels = drawWidthLocal * 2.0;
-            // 條件 2：避免縮放範圍大於歷史資料太多，產生過多空白
-            double maxRangeByCount = Math.Max(50.0, _candles.Count * 1.2);
-            
-            // 取兩者中較嚴格 (較小) 的那個作為最終極限
-            double maxRange = Math.Min(maxRangeByPixels, maxRangeByCount);
-
-            if (_candles.Count + 2.0 > maxRange)
-            {
-                _maxX = _candles.Count + 1.0;
-                _minX = _maxX - maxRange;
-            }
-            else
-            {
-                _minX = -1.0;
-                _maxX = _candles.Count + 1.0;
-            }
+            // X軸對焦：數學上的完美貼齊邊界。由於 K 棒的繪製寬度佔位是 0.6，
+            // 設定左側從 -0.3 開始，能讓第 0 根 K 棒的左邊緣精準切在畫面 x=0。
+            // 右側到 _candles.Count - 0.7 結束，能讓最後一根的右邊緣精準切在畫面最右側。
+            _minX = -0.3;
+            _maxX = _candles.Count - 0.7;
 
             // Y軸對焦：自動尋找此區間內的價格最高與最低
             int startIdx = (int)Math.Max(0, _minX);
@@ -927,9 +918,9 @@ namespace ExtremeSignalAppCS.Controls
             double height = highest - lowest;
             if (height <= 0) height = 1.0;
 
-            // 加上 5% 上下邊界緩衝
-            _minY = lowest - height * 0.05;
-            _maxY = highest + height * 0.05;
+            // 上下剛好貼齊最高與最低價，完全包覆不留多餘空白
+            _minY = lowest;
+            _maxY = highest;
 
             _painter.SetData(_candles, _minX, _maxX, _minY, _maxY);
             UpdatePriceTag();
@@ -1016,8 +1007,9 @@ namespace ExtremeSignalAppCS.Controls
             double height = highest - lowest;
             if (height <= 0) height = 1.0;
 
-            _minY = lowest - height * 0.05;
-            _maxY = highest + height * 0.05;
+            // Y軸對焦：完全包覆，上下剛好貼齊最高與最低價，不留多餘空白
+            _minY = lowest;
+            _maxY = highest;
         }
 
         // 預建 Frozen 畫刷快取，供 ShowKlineInfo 高頻呼叫使用，消滅每次 new SolidColorBrush 的 GC 壓力
@@ -1384,10 +1376,8 @@ namespace ExtremeSignalAppCS.Controls
                 // 限制最大/最小縮放寬度
                 if (newRange < 5.0) newRange = 5.0;
                 
-                // 限制最小縮放 (最大可視範圍)：避免 K 線被過度壓縮成橫線，也避免數量少時產生巨大空白
-                double maxRangeByPixels = drawWidthLocal * 2.0;
-                double maxRangeByCount = Math.Max(30.0, _candles.Count * 1.2);
-                double maxRange = Math.Min(maxRangeByPixels, maxRangeByCount);
+                // 限制最小縮放 (最大可視範圍)：避免數量少時產生巨大空白，同時允許看見所有K線
+                double maxRange = Math.Max(30.0, _candles.Count * 1.2);
                 
                 if (newRange > maxRange) newRange = maxRange;
 

@@ -10,29 +10,8 @@ namespace ExtremeSignalAppCS.Models
     /// 用於「極值觀測表 DataGrid」的直接資料繫結，並快取歷史狀態以實現增量更新與點選連動。
     /// 實作 INotifyPropertyChanged 以支援 WPF DataGrid 差量更新，消滅暴力 Items.Refresh() 全量重繪。
     /// </summary>
-    public class SimulationResult : INotifyPropertyChanged
+    public class SimulationResult : ObservableObject
     {
-        public event PropertyChangedEventHandler? PropertyChanged;
-
-        /// <summary>
-        /// 觸發屬性變更通知，讓 WPF DataGrid 自動差量更新對應儲存格。
-        /// </summary>
-        private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
-        {
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-        }
-
-        /// <summary>
-        /// 泛型 setter 輔助方法：值相同時跳過通知，避免無謂的 UI 重繪。
-        /// </summary>
-        private bool SetField<T>(ref T field, T value, [CallerMemberName] string? propertyName = null)
-        {
-            if (EqualityComparer<T>.Default.Equals(field, value)) return false;
-            field = value;
-            OnPropertyChanged(propertyName);
-            return true;
-        }
-
         // 唯讀快取 Key，用於去重 (Price, ATime, ObsN)
         public (int Price, string ATime, int ObsN) ConfirmedKey => (BestAPrice, BestATime, ObsN);
 
@@ -55,6 +34,7 @@ namespace ExtremeSignalAppCS.Models
         private string? _breakTime;
         private int _stopLossPrice;
         private int _ampVal;
+        private bool _isTargetPriceHighlighted;
 
         /// <summary>
         /// 顯示標籤 (如 "N=25 觀察K低 18452")
@@ -124,6 +104,15 @@ namespace ExtremeSignalAppCS.Models
 
         public string FontWeightVal => Tags.Contains("obs_high") || Tags.Contains("obs_low") || Tags.Contains("up") || Tags.Contains("down") ? "Bold" : "Normal";
 
+        public void UpdateTags(IEnumerable<string> newTags)
+        {
+            Tags.Clear();
+            Tags.AddRange(newTags);
+            OnPropertyChanged(nameof(ForegroundColor));
+            OnPropertyChanged(nameof(BackgroundColor));
+            OnPropertyChanged(nameof(FontWeightVal));
+        }
+
         // --- 核心狀態追蹤屬性 (不直接綁定 DataGrid，但用於引擎計算與破位檢測) ---
 
         /// <summary>
@@ -175,6 +164,11 @@ namespace ExtremeSignalAppCS.Models
         /// 極值點振幅
         /// </summary>
         public int AmpVal { get => _ampVal; set => SetField(ref _ampVal, value); }
+
+        /// <summary>
+        /// 特殊反白標記 (A點價)
+        /// </summary>
+        public bool IsTargetPriceHighlighted { get => _isTargetPriceHighlighted; set => SetField(ref _isTargetPriceHighlighted, value); }
 
         /// <summary>
         /// 建立空的 SimulationResult。

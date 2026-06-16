@@ -142,6 +142,8 @@ namespace ExtremeSignalAppCS
         
         // 用於「未破分K」點選後，跨執行緒狀態傳遞以便在更新完成後反白特定停損價位
         private string? _targetHighlightStopLossPrice;
+        private bool _isProgrammaticSelection;
+        private bool _isRestoringSelection;
         private string _currentReplaySession = "日盤";
         private string? _lastAutofillKlineTime;
         private List<(string Symbol, string Session, int DayMin, int DayMax, List<SimulationResult> Details)> _lastRtStatusSnapshot = [];
@@ -508,6 +510,32 @@ namespace ExtremeSignalAppCS
                 _txfLastMatchQty = -1;
                 _mxfLastMatchQty = -1;
                 _isRecovering = true;
+
+                // 【新增】徹底清空量化引擎與背景執行緒快取，防止日盤極值與 K 線污染夜盤
+                _engine.ClearCache();
+                _lastHeavyCalcTimeMs = 0;
+                _lastKlineData.Clear();
+                _lastSimulationResults.Clear();
+                _lastSharedResultsMap = null;
+                _lastRtStatusSnapshot.Clear();
+
+                _uiGeneration++; // 阻斷過期背景任務的 UI 推送
+
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    _klineCollection.Clear();
+                    _obsCollection.Clear();
+                    _intervalStatsCollection.Clear();
+                    klineChart?.Reset();
+
+                    // 清空底部觀察狀態設定值
+                    txtObsHigh.Text = "";
+                    txtObsLow.Text = "";
+                    cboObsHigh.Text = "";
+                    cboObsHigh.Items.Clear();
+                    cboObsLow.Text = "";
+                    cboObsLow.Items.Clear();
+                }));
             }
 
             try
@@ -825,15 +853,18 @@ namespace ExtremeSignalAppCS
                 string baseSymbol = symbol.StartsWith("TXF") ? "TXF" : (symbol.StartsWith("MXF") ? "MXF" : "");
                 if (string.IsNullOrEmpty(baseSymbol)) return;
 
+                int tickQty = 1;
                 // 重複/滯後 Tick 行情過濾防線 (Lock-Free)
                 if (baseSymbol == "TXF")
                 {
                     if (currentQty <= _txfLastMatchQty) return;
+                    tickQty = _txfLastMatchQty > 0 ? (currentQty - _txfLastMatchQty) : 1;
                     _txfLastMatchQty = currentQty;
                 }
                 else
                 {
                     if (currentQty <= _mxfLastMatchQty) return;
+                    tickQty = _mxfLastMatchQty > 0 ? (currentQty - _mxfLastMatchQty) : 1;
                     _mxfLastMatchQty = currentQty;
                 }
 
@@ -884,7 +915,7 @@ namespace ExtremeSignalAppCS
 
                 byte symId = (byte)(baseSymbol == "MXF" ? 1 : 0);
                 byte sessId = (byte)(session == "夜盤" ? 1 : 0);
-                var tick = new TradeTick(symId, sessId, tVal, price, side, bestBp, bestSp);
+                var tick = new TradeTick(symId, sessId, tVal, price, tickQty, side, bestBp, bestSp);
                 
                 // 完全 Lock-Free 的資料結構寫入 (Zero GC Allocation & No OS Lock)
                 _liveSymbolTrades[baseSymbol][session].Add(tick);
@@ -978,10 +1009,132 @@ namespace ExtremeSignalAppCS
             }
         }
 
-        private static string FormatExtremeTime(string t)
+        private static string FormatExtremeTime(string? t)
         {
-            if (string.IsNullOrEmpty(t) || t.Length < 6) return t;
+            if (string.IsNullOrEmpty(t) || t.Length < 6) return t ?? string.Empty;
             return $"{t[..2]}:{t[2..4]}:{t[4..6]}";
+        }
+
+        private string GetZoneStr(string side, string bestATime, int bestAPrice, string activeSession, Dictionary<string, object> quantParams)
+        {
+            string zoneStr = "N/A";
+            try
+            {
+                var tDict = (Dictionary<string, (int p50, int p75, int p90)>)quantParams[side == "top" ? "time_top" : "time_bottom"];
+                int totalM = ParseTimeToMinutes(bestATime);
+                if (totalM < 0) return "N/A";
+                if (activeSession == "夜盤" && totalM < 900) totalM += 1440;
+
+                int? p50 = null, p75 = null, p90 = null;
+                foreach (var kvp in tDict)
+                {
+                    if (kvp.Key.Contains(activeSession))
+                    {
+                        string timePart = kvp.Key.Split(' ')[1].Trim();
+                        if (timePart.Contains('-'))
+                        {
+                            var sStr = timePart.Split('-')[0];
+                            var eStr = timePart.Split('-')[1];
+                            int sMins = int.Parse(sStr.Split(':')[0]) * 60 + int.Parse(sStr.Split(':')[1]);
+                            int eMins = int.Parse(eStr.Split(':')[0]) * 60 + int.Parse(eStr.Split(':')[1]);
+                            if (activeSession == "夜盤")
+                            {
+                                if (sMins < 900) sMins += 1440;
+                                if (eMins < 900) eMins += 1440;
+                            }
+                            if (sMins <= totalM && totalM <= eMins)
+                            {
+                                p50 = kvp.Value.p50;
+                                p75 = kvp.Value.p75;
+                                p90 = kvp.Value.p90;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (p50.HasValue && p75.HasValue && p90.HasValue)
+                {
+                    if (side == "top")
+                        zoneStr = $"區:{bestAPrice + p50.Value}~{bestAPrice + p75.Value} 損:{bestAPrice + p90.Value}";
+                    else
+                        zoneStr = $"區:{bestAPrice - p50.Value}~{bestAPrice - p75.Value} 損:{bestAPrice - p90.Value}";
+                }
+            }
+            catch { }
+            return zoneStr;
+        }
+
+        private void ProcessTriggerBlock(
+            PendingTrigger item,
+            bool isTrigH,
+            int price,
+            double tVal,
+            int rMax,
+            int rMin,
+            string symbol,
+            string activeSession,
+            int currentTradesCount,
+            IReadOnlyList<TradeTick> trades,
+            Dictionary<string, IReadOnlyList<TradeTick>> tradesSnapshot,
+            int nTicks)
+        {
+            var side1 = isTrigH ? TradeSide.Outer : TradeSide.Inner;
+            var side2 = isTrigH ? TradeSide.Inner : TradeSide.Outer;
+
+            _engine.GetDurations(trades, nTicks, item, side1, side2, currentTradesCount);
+            double? pre = item.PreAvg;
+            double? post = item.ActualPostN >= nTicks ? (item.PostSum / item.ActualPostN) : null;
+            int bIdx = item.ScanIndex - 1;
+
+            string status = _engine.GetStatusStr(pre, post, item.ActualPreN, item.ActualPostN, nTicks);
+            
+            bool isDead = item.ActualPostN < nTicks && bIdx < currentTradesCount - 1;
+
+            if (status == " [達標]" || status == " [邊界達標]" || status == " [未達標]" || isDead)
+            {
+                if (isDead && status.Contains("邊界未達標")) status = " [未達標]";
+
+                int amp = 0;
+                if (isTrigH)
+                {
+                    amp = rMin != 999999 ? (rMax - rMin) : 0;
+                }
+                else
+                {
+                    amp = rMax != -999999 ? (rMax - rMin) : 0;
+                }
+
+                double? baseNet = null;
+                double? otherNet = null;
+                var (oAvg, iAvg, dDir) = TradingEngine.CalcSideSpeedFromState(item.BaseStateSnapshot);
+                if (oAvg.HasValue && iAvg.HasValue) baseNet = iAvg.Value - oAvg.Value;
+                
+                long sumPrice = item.BaseStateSnapshot.SumPrice;
+                int avgPri = item.BaseStateSnapshot.Count > 0 ? (int)Math.Round((double)sumPrice / item.BaseStateSnapshot.Count) : 0;
+
+                string oSym = symbol == "TXF" ? "MXF" : "TXF";
+                if (tradesSnapshot.TryGetValue(oSym, out var otherTrades))
+                {
+                    double targetTVal = trades[bIdx].TimeVal;
+                    int otherCount = _engine.FindTickCountByTime(otherTrades, targetTVal);
+                    otherNet = _engine.CalcNetSpeed(otherTrades, otherCount);
+                }
+
+                var completed = new CompletedTrigger
+                {
+                    TVal = tVal, StatusOnly = status, ATime = trades[item.Index].Time, PriceVal = price,
+                    TrigTime = item.TrigTime ?? "N/A", TrigPrice = item.TrigPrice ?? 0,
+                    Pre = pre, Post = post, AmpVal = amp, BIdx = bIdx, IsTrigH = isTrigH,
+                    BaseNet = baseNet, OtherNet = otherNet, DStr = dDir, AvgPri = avgPri
+                };
+
+                lock (_rtLock)
+                {
+                    _rtTriggers[symbol][activeSession].Remove(item);
+                    _rtCompletedDetails[symbol][activeSession].Add(completed);
+                }
+            }
         }
 
         private Dictionary<string, object> RunRealtimeAnalysisCompute()
@@ -1172,100 +1325,12 @@ namespace ExtremeSignalAppCS
 
                     if (isTrigH)
                     {
-                        _engine.GetDurations(trades, nTicks, item, TradeSide.Outer, TradeSide.Inner, currentTradesCount);
-                        double? pre = item.PreAvg;
-                        double? post = item.ActualPostN >= nTicks ? (item.PostSum / item.ActualPostN) : null;
-                        int bIdx = item.ScanIndex - 1;
-
-                        string status = _engine.GetStatusStr(pre, post, item.ActualPreN, item.ActualPostN, nTicks);
-                        
-                        bool isDead = item.ActualPostN < nTicks && bIdx < currentTradesCount - 1;
-
-                        if (status == " [達標]" || status == " [邊界達標]" || status == " [未達標]" || isDead)
-                        {
-                            if (isDead && status.Contains("邊界未達標")) status = " [未達標]";
-
-                            int amp = rMin != 999999 ? (rMax - rMin) : 0;
-
-                            double? baseNet = null;
-                            double? otherNet = null;
-                            var (oAvg, iAvg, dDir) = _engine.CalcSideSpeedFromState(item.BaseStateSnapshot);
-                            if (oAvg.HasValue && iAvg.HasValue) baseNet = iAvg.Value - oAvg.Value;
-                            
-                            long sumPrice = item.BaseStateSnapshot.SumPrice;
-                            int avgPri = item.BaseStateSnapshot.Count > 0 ? (int)Math.Round((double)sumPrice / item.BaseStateSnapshot.Count) : 0;
-
-                            string oSym = symbol == "TXF" ? "MXF" : "TXF";
-                            if (tradesSnapshot.TryGetValue(oSym, out var otherTrades))
-                            {
-                                double targetTVal = trades[bIdx].TimeVal;
-                                int otherCount = _engine.FindTickCountByTime(otherTrades, targetTVal);
-                                otherNet = _engine.CalcNetSpeed(otherTrades, otherCount);
-                            }
-
-                            var completed = new CompletedTrigger
-                            {
-                                TVal = tVal, StatusOnly = status, ATime = trades[i].Time, PriceVal = price,
-                                TrigTime = item.TrigTime ?? "N/A", TrigPrice = item.TrigPrice ?? 0,
-                                Pre = pre, Post = post, AmpVal = amp, BIdx = bIdx, IsTrigH = true,
-                                BaseNet = baseNet, OtherNet = otherNet, DStr = dDir, AvgPri = avgPri
-                            };
-
-                            lock (_rtLock)
-                            {
-                                _rtTriggers[symbol][activeSession].Remove(item);
-                                _rtCompletedDetails[symbol][activeSession].Add(completed);
-                            }
-                        }
+                        ProcessTriggerBlock(item, true, price, tVal, rMax, rMin, symbol, activeSession, currentTradesCount, trades, tradesSnapshot, nTicks);
                     }
 
                     if (isTrigB)
                     {
-                        _engine.GetDurations(trades, nTicks, item, TradeSide.Inner, TradeSide.Outer, currentTradesCount);
-                        double? pre = item.PreAvg;
-                        double? post = item.ActualPostN >= nTicks ? (item.PostSum / item.ActualPostN) : null;
-                        int bIdx = item.ScanIndex - 1;
-
-                        string status = _engine.GetStatusStr(pre, post, item.ActualPreN, item.ActualPostN, nTicks);
-                        
-                        bool isDead = item.ActualPostN < nTicks && bIdx < currentTradesCount - 1;
-
-                        if (status == " [達標]" || status == " [邊界達標]" || status == " [未達標]" || isDead)
-                        {
-                            if (isDead && status.Contains("邊界未達標")) status = " [未達標]";
-
-                            int amp = rMax != -999999 ? (rMax - rMin) : 0;
-
-                            double? baseNet = null;
-                            double? otherNet = null;
-                            var (oAvg, iAvg, dDir) = _engine.CalcSideSpeedFromState(item.BaseStateSnapshot);
-                            if (oAvg.HasValue && iAvg.HasValue) baseNet = iAvg.Value - oAvg.Value;
-                            
-                            long sumPrice = item.BaseStateSnapshot.SumPrice;
-                            int avgPri = item.BaseStateSnapshot.Count > 0 ? (int)Math.Round((double)sumPrice / item.BaseStateSnapshot.Count) : 0;
-
-                            string oSym = symbol == "TXF" ? "MXF" : "TXF";
-                            if (tradesSnapshot.TryGetValue(oSym, out var otherTrades))
-                            {
-                                double targetTVal = trades[bIdx].TimeVal;
-                                int otherCount = _engine.FindTickCountByTime(otherTrades, targetTVal);
-                                otherNet = _engine.CalcNetSpeed(otherTrades, otherCount);
-                            }
-
-                            var completed = new CompletedTrigger
-                            {
-                                TVal = tVal, StatusOnly = status, ATime = trades[i].Time, PriceVal = price,
-                                TrigTime = item.TrigTime ?? "N/A", TrigPrice = item.TrigPrice ?? 0,
-                                Pre = pre, Post = post, AmpVal = amp, BIdx = bIdx, IsTrigH = false,
-                                BaseNet = baseNet, OtherNet = otherNet, DStr = dDir, AvgPri = avgPri
-                            };
-
-                            lock (_rtLock)
-                            {
-                                _rtTriggers[symbol][activeSession].Remove(item);
-                                _rtCompletedDetails[symbol][activeSession].Add(completed);
-                            }
-                        }
+                        ProcessTriggerBlock(item, false, price, tVal, rMax, rMin, symbol, activeSession, currentTradesCount, trades, tradesSnapshot, nTicks);
                     }
                 }
 
@@ -1348,7 +1413,42 @@ namespace ExtremeSignalAppCS
                         var lastSpeeds = d.IsTrigH ? rtLastNetSpeedsTop : rtLastNetSpeedsBot;
                         string baseNetStr = FormatNet(baseSym, d.BaseNet, lastSpeeds);
                         string otherNetStr = FormatNet(otherSym, d.OtherNet, lastSpeeds);
-                        speedStr = $"    成交速度: {d.DStr} | 大台速差: {(baseSym == "TXF" ? baseNetStr : otherNetStr)}  小台速差: {(baseSym == "MXF" ? baseNetStr : otherNetStr)} | 均價:{d.AvgPri}";
+                        double aTimeRaw = ExtremeSignalAppCS.Helper.TimeParser.ParseTime(d.ATime);
+                        int aIdx = Math.Max(0, _engine.FindTickCountByTime(trades, aTimeRaw) - 1);
+
+                        TradeSide preSide = d.IsTrigH ? TradeSide.Outer : TradeSide.Inner;
+                        TradeSide postSide = d.IsTrigH ? TradeSide.Inner : TradeSide.Outer;
+
+                        int windowSize = nTicks;
+                        int preTicksCollected = 0, preVolume = 0;
+                        for (int i = aIdx; i >= 0; i--)
+                        {
+                            if (trades[i].Side == preSide)
+                            {
+                                preTicksCollected++;
+                                preVolume += trades[i].Qty;
+                                if (preTicksCollected >= windowSize) break;
+                            }
+                        }
+
+                        int postTicksCollected = 0, postVolume = 0;
+                        for (int i = aIdx; i <= d.BIdx && i < trades.Count; i++)
+                        {
+                            if (trades[i].Side == postSide)
+                            {
+                                postTicksCollected++;
+                                postVolume += trades[i].Qty;
+                                if (postTicksCollected >= windowSize) break;
+                            }
+                        }
+
+                        int windowICnt = d.IsTrigH ? postVolume : preVolume;
+                        int windowOCnt = d.IsTrigH ? preVolume : postVolume;
+
+                        string op = windowICnt > windowOCnt ? ">" : (windowICnt < windowOCnt ? "<" : "=");
+                        string ioCompare = $" 內:{windowICnt} {op} 外:{windowOCnt}";
+
+                        speedStr = $"    成交速度: {d.DStr} | 大台速差: {(baseSym == "TXF" ? baseNetStr : otherNetStr)}  小台速差: {(baseSym == "MXF" ? baseNetStr : otherNetStr)} | 均價:{d.AvgPri}{ioCompare}";
                     }
 
                     var res = new SimulationResult
@@ -1377,70 +1477,15 @@ namespace ExtremeSignalAppCS
                     if (d.Post == "N/A") continue;
 
                     string speedInfo = d.Tags.FirstOrDefault() ?? "";
-                    bool isUnmet = d.DisplayTitle.Contains(" [未達標]");
-                    bool isContradiction = false;
-                    
-                    if (isUnmet)
-                    {
-                        if (d.DisplayTitle.Contains("最高") && (speedInfo.Contains("空速增") || speedInfo.Contains("多速減")))
-                            isContradiction = true;
-                        else if (d.DisplayTitle.Contains("最低") && (speedInfo.Contains("多速增") || speedInfo.Contains("空速減")))
-                            isContradiction = true;
-                    }
-
-                    bool isNormal = d.DisplayTitle.Contains("[達標]") && !d.DisplayTitle.Contains('未') && !d.DisplayTitle.Contains("邊界");
+                    var (isNormal, isContradiction) = TradingEngine.ClassifyTrigger(d.DisplayTitle, speedInfo);
 
                     if (isNormal || isContradiction)
                     {
                         var notifyKey = (symbol, activeSession, d.Type, d.BestAPrice, d.BestATime);
                         if (_rtNotifiedKeys.Add(notifyKey))
                         {
-                            string zoneStr = "N/A";
-                            try
-                            {
-                                string side = d.Type == "K低" ? "top" : "bottom";
-                                var tDict = (Dictionary<string, (int p50, int p75, int p90)>)quantParams[side == "top" ? "time_top" : "time_bottom"];
-                                int totalM = ParseTimeToMinutes(d.BestATime);
-                                if (totalM < 0) throw new Exception("Invalid time");
-                                if (activeSession == "夜盤" && totalM < 900) totalM += 1440;
-
-                                int? p50 = null, p75 = null, p90 = null;
-                                foreach (var kvp in tDict)
-                                {
-                                    if (kvp.Key.Contains(activeSession))
-                                    {
-                                        string timePart = kvp.Key.Split(' ')[1].Trim();
-                                        if (timePart.Contains('-'))
-                                        {
-                                            var sStr = timePart.Split('-')[0];
-                                            var eStr = timePart.Split('-')[1];
-                                            int sMins = int.Parse(sStr.Split(':')[0]) * 60 + int.Parse(sStr.Split(':')[1]);
-                                            int eMins = int.Parse(eStr.Split(':')[0]) * 60 + int.Parse(eStr.Split(':')[1]);
-                                            if (activeSession == "夜盤")
-                                            {
-                                                if (sMins < 900) sMins += 1440;
-                                                if (eMins < 900) eMins += 1440;
-                                            }
-                                            if (sMins <= totalM && totalM <= eMins)
-                                            {
-                                                p50 = kvp.Value.p50;
-                                                p75 = kvp.Value.p75;
-                                                p90 = kvp.Value.p90;
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if (p50.HasValue && p75.HasValue && p90.HasValue)
-                                {
-                                    if (side == "top")
-                                        zoneStr = $"區:{d.BestAPrice + p50.Value}~{d.BestAPrice + p75.Value} 損:{d.BestAPrice + p90.Value}";
-                                    else
-                                        zoneStr = $"區:{d.BestAPrice - p50.Value}~{d.BestAPrice - p75.Value} 損:{d.BestAPrice - p90.Value}";
-                                }
-                            }
-                            catch { }
+                            string side = d.Type == "K低" ? "top" : "bottom";
+                            string zoneStr = GetZoneStr(side, d.BestATime, d.BestAPrice, activeSession, quantParams);
 
                             string displayTitle = isContradiction ? d.DisplayTitle.Replace("未達標", "矛盾") : d.DisplayTitle;
                             string dirText = d.Type == "K低" ? $"做空  {displayTitle}" : $"做多  {displayTitle}";
@@ -1476,25 +1521,14 @@ namespace ExtremeSignalAppCS
                 txfState = new TradingState();
             }
 
-            string maxStr = mxfState.DayMax != -999999 ? $"最高價: {mxfState.DayMax} ({FormatExtremeTime(mxfState.MaxTime)})" : "最高價: -- (--)";
-            string minStr = mxfState.DayMax != -999999 ? $"最低價: {mxfState.DayMin} ({FormatExtremeTime(mxfState.MinTime)})" : "最低價: -- (--)";
-            string ampStr = mxfState.DayMax != -999999 ? $"振幅: {mxfState.DayMax - mxfState.DayMin}" : "振幅: --";
+            var (maxStr, minStr, ampStr) = TradingEngine.FormatExtremeInfo(mxfState, FormatExtremeTime);
 
             // 計算即時速差文字與顏色
-            var (_, _, dT) = _engine.CalcSideSpeedFromState(txfState);
-            var (_, _, dM) = _engine.CalcSideSpeedFromState(mxfState);
+            var (_, _, dT) = TradingEngine.CalcSideSpeedFromState(txfState);
+            var (_, _, dM) = TradingEngine.CalcSideSpeedFromState(mxfState);
 
-            double? netT = (txfState.OuterCount >= 2 && txfState.LastOuterTime.HasValue && txfState.FirstOuterTime.HasValue &&
-                           txfState.InnerCount >= 2 && txfState.LastInnerTime.HasValue && txfState.FirstInnerTime.HasValue)
-                           ? ((txfState.LastInnerTime.Value - txfState.FirstInnerTime.Value) / (txfState.InnerCount - 1)) -
-                             ((txfState.LastOuterTime.Value - txfState.FirstOuterTime.Value) / (txfState.OuterCount - 1))
-                           : null;
-
-            double? netM = (mxfState.OuterCount >= 2 && mxfState.LastOuterTime.HasValue && mxfState.FirstOuterTime.HasValue &&
-                           mxfState.InnerCount >= 2 && mxfState.LastInnerTime.HasValue && mxfState.FirstInnerTime.HasValue)
-                           ? ((mxfState.LastInnerTime.Value - mxfState.FirstInnerTime.Value) / (mxfState.InnerCount - 1)) -
-                             ((mxfState.LastOuterTime.Value - mxfState.FirstOuterTime.Value) / (mxfState.OuterCount - 1))
-                           : null;
+            double? netT = TradingEngine.CalcNetSpeedFromState(txfState);
+            double? netM = TradingEngine.CalcNetSpeedFromState(mxfState);
 
             string netTxfStr = netT.HasValue ? $"| 大臺速差: {netT.Value:+0.0000;-0.0000;+0.0000}s" : "| 大臺速差: --";
             string netTxfColor = netT.HasValue ? (netT.Value > 0 ? "#EB4B4B" : netT.Value < 0 ? "#28A745" : "Gray") : "Gray";
@@ -1502,23 +1536,7 @@ namespace ExtremeSignalAppCS
             string netMxfStr = netM.HasValue ? $"| 小臺速差: {netM.Value:+0.0000;-0.0000;+0.0000}s" : "| 小臺速差: --";
             string netMxfColor = netM.HasValue ? (netM.Value > 0 ? "#EB4B4B" : netM.Value < 0 ? "#28A745" : "Gray") : "Gray";
 
-            string consensusStr = "| 共識: --";
-            string consensusColor = "Gray";
-            if (dT.Contains("多方") && dM.Contains("多方"))
-            {
-                consensusStr = "| 共識: 多方 📈";
-                consensusColor = "#EB4B4B";
-            }
-            else if (dT.Contains("空方") && dM.Contains("空方"))
-            {
-                consensusStr = "| 共識: 空方 📉";
-                consensusColor = "#28A745";
-            }
-            else if (dT != "資料不足" && dM != "資料不足")
-            {
-                consensusStr = "| 共識: 持平 ⚖️";
-                consensusColor = "Gray";
-            }
+            var (consensusStr, consensusColor) = TradingEngine.CalcConsensus(dT, dM);
 
             // 產生即時極值詳情報告文字 (與離線日誌完全同構)
             string rtReport = "";
@@ -1887,53 +1905,47 @@ namespace ExtremeSignalAppCS
             }
         }
 
-        private void UpdateKlineViews(List<KlineBar> klineData)
+        private void DiffMerge<T>(ObservableCollection<T> target, List<T> source, Action<T, T> copyFields)
         {
-            // 差量合併 K線，保留 DataGrid 的 SelectIndex 反白
-            int oldLen = _klineCollection.Count;
-            int newLen = klineData.Count;
+            int oldLen = target.Count;
+            int newLen = source.Count;
 
             if (oldLen == 0 && newLen == 0) return;
 
             if (oldLen == newLen)
             {
                 for (int i = 0; i < newLen; i++)
-                {
-                    _klineCollection[i].TimeLabel = klineData[i].TimeLabel;
-                    _klineCollection[i].High = klineData[i].High;
-                    _klineCollection[i].Low = klineData[i].Low;
-                    _klineCollection[i].Open = klineData[i].Open;
-                    _klineCollection[i].Close = klineData[i].Close;
-                    _klineCollection[i].Signals = klineData[i].Signals;
-                    _klineCollection[i].BreakHigh = klineData[i].BreakHigh;
-                    _klineCollection[i].BreakLow = klineData[i].BreakLow;
-                    _klineCollection[i].Tag = klineData[i].Tag;
-                }
+                    copyFields(target[i], source[i]);
             }
             else if (newLen > oldLen)
             {
                 for (int i = 0; i < oldLen; i++)
-                {
-                    _klineCollection[i].TimeLabel = klineData[i].TimeLabel;
-                    _klineCollection[i].High = klineData[i].High;
-                    _klineCollection[i].Low = klineData[i].Low;
-                    _klineCollection[i].Open = klineData[i].Open;
-                    _klineCollection[i].Close = klineData[i].Close;
-                    _klineCollection[i].Signals = klineData[i].Signals;
-                    _klineCollection[i].BreakHigh = klineData[i].BreakHigh;
-                    _klineCollection[i].BreakLow = klineData[i].BreakLow;
-                    _klineCollection[i].Tag = klineData[i].Tag;
-                }
+                    copyFields(target[i], source[i]);
                 for (int i = oldLen; i < newLen; i++)
-                {
-                    _klineCollection.Add(klineData[i]);
-                }
+                    target.Add(source[i]);
             }
             else
             {
-                _klineCollection.Clear();
-                foreach (var k in klineData) _klineCollection.Add(k);
+                target.Clear();
+                foreach (var s in source) target.Add(s);
             }
+        }
+
+        private void UpdateKlineViews(List<KlineBar> klineData)
+        {
+            // 差量合併 K線，保留 DataGrid 的 SelectIndex 反白
+            DiffMerge(_klineCollection, klineData, (t, s) =>
+            {
+                t.TimeLabel = s.TimeLabel;
+                t.High = s.High;
+                t.Low = s.Low;
+                t.Open = s.Open;
+                t.Close = s.Close;
+                t.Signals = s.Signals;
+                t.BreakHigh = s.BreakHigh;
+                t.BreakLow = s.BreakLow;
+                t.Tag = s.Tag;
+            });
 
             // 若沒有手動反白，自動滾動到最末行
             if (dgKline.SelectedIndex == -1 && _klineCollection.Count > 0)
@@ -1974,53 +1986,34 @@ namespace ExtremeSignalAppCS
             SimulationResult? prevSelected = dgObserver.SelectedItem as SimulationResult;
             string? prevSelectedTime = prevSelected?.BestATime;
             string? prevSelectedPrice = prevSelected?.StopLossPrice.ToString();
+            bool prevHighlighted = prevSelected?.IsTargetPriceHighlighted ?? false;
 
-            int oldLen = _obsCollection.Count;
-            int newLen = simulationResults.Count;
+            // 在更新列表前，先清空舊的反白狀態，避免被 DiffMerge 殘留導致多個項目同時被反白
+            foreach (var obs in _obsCollection)
+            {
+                obs.IsTargetPriceHighlighted = false;
+            }
 
-            if (oldLen == 0 && newLen == 0) return;
-
-            if (oldLen == newLen)
+            DiffMerge(_obsCollection, simulationResults, (t, s) =>
             {
-                for (int i = 0; i < newLen; i++)
-                {
-                    _obsCollection[i].DisplayTitle = simulationResults[i].DisplayTitle;
-                    _obsCollection[i].BestATime = simulationResults[i].BestATime;
-                    _obsCollection[i].BestAPrice = simulationResults[i].BestAPrice;
-                    _obsCollection[i].TrigTime = simulationResults[i].TrigTime;
-                    _obsCollection[i].TrigPrice = simulationResults[i].TrigPrice;
-                    _obsCollection[i].Pre = simulationResults[i].Pre;
-                    _obsCollection[i].Post = simulationResults[i].Post;
-                    _obsCollection[i].StopLossDisplay = simulationResults[i].StopLossDisplay;
-                    _obsCollection[i].IsBroken = simulationResults[i].IsBroken;
-                    _obsCollection[i].StopLossPrice = simulationResults[i].StopLossPrice;
-                }
-            }
-            else if (newLen > oldLen)
-            {
-                for (int i = 0; i < oldLen; i++)
-                {
-                    _obsCollection[i].DisplayTitle = simulationResults[i].DisplayTitle;
-                    _obsCollection[i].BestATime = simulationResults[i].BestATime;
-                    _obsCollection[i].BestAPrice = simulationResults[i].BestAPrice;
-                    _obsCollection[i].TrigTime = simulationResults[i].TrigTime;
-                    _obsCollection[i].TrigPrice = simulationResults[i].TrigPrice;
-                    _obsCollection[i].Pre = simulationResults[i].Pre;
-                    _obsCollection[i].Post = simulationResults[i].Post;
-                    _obsCollection[i].StopLossDisplay = simulationResults[i].StopLossDisplay;
-                    _obsCollection[i].IsBroken = simulationResults[i].IsBroken;
-                    _obsCollection[i].StopLossPrice = simulationResults[i].StopLossPrice;
-                }
-                for (int i = oldLen; i < newLen; i++)
-                {
-                    _obsCollection.Add(simulationResults[i]);
-                }
-            }
-            else
-            {
-                _obsCollection.Clear();
-                foreach (var o in simulationResults) _obsCollection.Add(o);
-            }
+                t.Type = s.Type;
+                t.DisplayTitle = s.DisplayTitle;
+                t.BestATime = s.BestATime;
+                t.BestAPrice = s.BestAPrice;
+                t.TrigTime = s.TrigTime;
+                t.TrigPrice = s.TrigPrice;
+                t.Pre = s.Pre;
+                t.Post = s.Post;
+                t.StopLossDisplay = s.StopLossDisplay;
+                t.IsBroken = s.IsBroken;
+                t.StopLossPrice = s.StopLossPrice;
+                t.ObsEntry = s.ObsEntry;
+                t.PrevHigh = s.PrevHigh;
+                t.PrevLow = s.PrevLow;
+                t.BIndex = s.BIndex;
+                t.ObsN = s.ObsN;
+                t.UpdateTags(s.Tags);
+            });
 
             if (prevSelectedPrice != null && string.IsNullOrEmpty(_targetHighlightStopLossPrice))
             {
@@ -2034,8 +2027,11 @@ namespace ExtremeSignalAppCS
 
                 if (match != null)
                 {
+                    match.IsTargetPriceHighlighted = prevHighlighted;
+                    _isRestoringSelection = true;
                     dgObserver.SelectedItem = match;
-                    dgObserver.ScrollIntoView(match);
+                    // 背景更新還原選擇時，不強制 ScrollIntoView，讓使用者能自由滾動查看其他資料
+                    _isRestoringSelection = false;
                 }
             }
             else if (_obsCollection.Count > 0)
@@ -2175,7 +2171,7 @@ namespace ExtremeSignalAppCS
 
                 if (state.Count > 0)
                 {
-                    var (oAvg, iAvg, dStr) = _engine.CalcSideSpeedFromState(state);
+                    var (oAvg, iAvg, dStr) = TradingEngine.CalcSideSpeedFromState(state);
                     string oS = oAvg.HasValue ? $"{oAvg.Value:F4}s/{state.OuterCount,5}筆" : "--/筆";
                     string iS = iAvg.HasValue ? $"{iAvg.Value:F4}s/{state.InnerCount,5}筆" : "--/筆";
                     int avgPri = (int)Math.Round((double)state.SumPrice / state.Count);
@@ -2403,36 +2399,21 @@ namespace ExtremeSignalAppCS
             }
 
             // 組合極值資訊字串
-            string maxStr = mxfState.DayMax != -999999 ? $"最高價: {mxfState.DayMax} ({FormatExtremeTime(mxfState.MaxTime)})" : "最高價: -- (--)";
-            string minStr = mxfState.DayMax != -999999 ? $"最低價: {mxfState.DayMin} ({FormatExtremeTime(mxfState.MinTime)})" : "最低價: -- (--)";
-            string ampStr = mxfState.DayMax != -999999 ? $"振幅: {mxfState.DayMax - mxfState.DayMin}" : "振幅: --";
+            var (maxStr, minStr, ampStr) = TradingEngine.FormatExtremeInfo(mxfState, FormatExtremeTime);
 
             // 計算速差方向
-            var (_, _, dT) = _engine.CalcSideSpeedFromState(txfState);
-            var (_, _, dM) = _engine.CalcSideSpeedFromState(mxfState);
+            var (_, _, dT) = TradingEngine.CalcSideSpeedFromState(txfState);
+            var (_, _, dM) = TradingEngine.CalcSideSpeedFromState(mxfState);
 
-            double? netT = (txfState.OuterCount >= 2 && txfState.LastOuterTime.HasValue && txfState.FirstOuterTime.HasValue &&
-                           txfState.InnerCount >= 2 && txfState.LastInnerTime.HasValue && txfState.FirstInnerTime.HasValue)
-                           ? ((txfState.LastInnerTime.Value - txfState.FirstInnerTime.Value) / (txfState.InnerCount - 1)) -
-                             ((txfState.LastOuterTime.Value - txfState.FirstOuterTime.Value) / (txfState.OuterCount - 1))
-                           : null;
-
-            double? netM = (mxfState.OuterCount >= 2 && mxfState.LastOuterTime.HasValue && mxfState.FirstOuterTime.HasValue &&
-                           mxfState.InnerCount >= 2 && mxfState.LastInnerTime.HasValue && mxfState.FirstInnerTime.HasValue)
-                           ? ((mxfState.LastInnerTime.Value - mxfState.FirstInnerTime.Value) / (mxfState.InnerCount - 1)) -
-                             ((mxfState.LastOuterTime.Value - mxfState.FirstOuterTime.Value) / (mxfState.OuterCount - 1))
-                           : null;
+            double? netT = TradingEngine.CalcNetSpeedFromState(txfState);
+            double? netM = TradingEngine.CalcNetSpeedFromState(mxfState);
 
             string netTxfStr = netT.HasValue ? $"| 大臺速差: {netT.Value:+0.0000;-0.0000;+0.0000}s" : "| 大臺速差: --";
             string netTxfColor = netT.HasValue ? (netT.Value > 0 ? "#EB4B4B" : netT.Value < 0 ? "#28A745" : "Gray") : "Gray";
             string netMxfStr = netM.HasValue ? $"| 小臺速差: {netM.Value:+0.0000;-0.0000;+0.0000}s" : "| 小臺速差: --";
             string netMxfColor = netM.HasValue ? (netM.Value > 0 ? "#EB4B4B" : netM.Value < 0 ? "#28A745" : "Gray") : "Gray";
 
-            string consensusStr = "| 共識: --";
-            string consensusColor = "Gray";
-            if (dT.Contains("多方") && dM.Contains("多方")) { consensusStr = "| 共識: 多方 📈"; consensusColor = "#EB4B4B"; }
-            else if (dT.Contains("空方") && dM.Contains("空方")) { consensusStr = "| 共識: 空方 📉"; consensusColor = "#28A745"; }
-            else if (dT != "資料不足" && dM != "資料不足") { consensusStr = "| 共識: 持平 ⚖️"; consensusColor = "Gray"; }
+            var (consensusStr, consensusColor) = TradingEngine.CalcConsensus(dT, dM);
 
             // 套用至頂部標籤
             runMaxInfo.Text = maxStr;
@@ -2567,76 +2548,17 @@ namespace ExtremeSignalAppCS
 
                     while ((line = sr.ReadLine()) != null)
                     {
-                        if (!line.Contains("TXF") && !line.Contains("MXF")) continue;
+                        var tick = TickParser.ParseLogLine(line, lastTmatqty, null, timeFilter, path);
+                        if (tick == null) continue;
 
-                        var match = pattern.Match(line);
-                        if (!match.Success) continue;
-                        string symbol = match.Groups[1].Value;
-
-                        string baseSym = symbol.Contains("TXF") ? "TXF" : (symbol.Contains("MXF") ? "MXF" : "");
-                        if (string.IsNullOrEmpty(baseSym)) continue;
-
-                        var mtMatch = mattimePat.Match(line);
-                        var mpMatch = matPriPat.Match(line);
-                        var tqMatch = tmatqtyPat.Match(line);
-                        if (!mtMatch.Success || !mpMatch.Success || !tqMatch.Success) continue;
-
-                        string timeStr = mtMatch.Groups[1].Value;
-                        double tValRaw = TimeParser.ParseTime(timeStr);
-
-                        if (!timeFilter(tValRaw)) continue;
-
-                        string session = "";
-                        double tVal = tValRaw;
-
-                        if (tValRaw >= 31500.0 && tValRaw <= 49500.0)
+                        if (tick.Value.Side == TradeSide.Unknown)
                         {
-                            session = "日盤";
-                        }
-                        else if (tValRaw >= 54000.0 || tValRaw <= 18000.0)
-                        {
-                            session = "夜盤";
-                            if (tValRaw <= 18000.0) tVal += 86400.0;
-                        }
-                        else
-                        {
-                            continue;
+                            var prevTrades = allSymbolTrades[tick.Value.Symbol][tick.Value.Session];
+                            TradeSide fallbackSide = prevTrades.Count > 0 ? prevTrades[^1].Side : TradeSide.Outer;
+                            tick = new TradeTick(tick.Value.Symbol, tick.Value.Time, tick.Value.TimeVal, tick.Value.Price, tick.Value.Qty, fallbackSide, tick.Value.BestBp, tick.Value.BestSp, tick.Value.Session);
                         }
 
-                        int tmatqty = int.Parse(tqMatch.Groups[1].Value);
-                        var qtyKey = (baseSym, session, path);
-                        if (tmatqty < 0 || (lastTmatqty.ContainsKey(qtyKey) && tmatqty <= lastTmatqty[qtyKey]))
-                            continue;
-
-                        lastTmatqty[qtyKey] = tmatqty;
-
-                        var bpM = bestbpPat.Match(line);
-                        var spM = bestspPat.Match(line);
-                        if (!bpM.Success || !spM.Success) continue;
-
-                        int bestBp = 0, bestSp = 0;
-                        try
-                        {
-                            string bPrices = bpM.Groups[1].Value;
-                            string sPrices = spM.Groups[1].Value;
-                            bestBp = !string.IsNullOrEmpty(bPrices) ? (int)double.Parse(bPrices.Split(',')[0]) : 0;
-                            bestSp = !string.IsNullOrEmpty(sPrices) ? (int)double.Parse(sPrices.Split(',')[0]) : 0;
-                            if (bestBp <= 0 || bestSp <= 0) continue;
-                        }
-                        catch { continue; }
-
-                        int price = int.Parse(mpMatch.Groups[1].Value);
-                        TradeSide side = TradeSide.Unknown;
-                        if (price >= bestSp) side = TradeSide.Outer;
-                        else if (price <= bestBp) side = TradeSide.Inner;
-
-                        if (side == TradeSide.Unknown)
-                        {
-                            var prevTrades = allSymbolTrades[baseSym][session];
-                            side = prevTrades.Count > 0 ? prevTrades[^1].Side : TradeSide.Outer;
-                        }
-
-                        allSymbolTrades[baseSym][session].Add(new TradeTick(baseSym, timeStr, tVal, price, side, bestBp, bestSp, session));
+                        allSymbolTrades[tick.Value.Symbol][tick.Value.Session].Add(tick.Value);
                     }
                 }
 
@@ -2956,20 +2878,11 @@ namespace ExtremeSignalAppCS
             string txfN = "--", mxfN = "--";
             if (stateSnapshot.TryGetValue("TXF", out var stT) && stateSnapshot.TryGetValue("MXF", out var stM))
             {
-                var (_, _, dT) = _engine.CalcSideSpeedFromState(stT);
-                var (_, _, dM) = _engine.CalcSideSpeedFromState(stM);
+                var (_, _, dT) = TradingEngine.CalcSideSpeedFromState(stT);
+                var (_, _, dM) = TradingEngine.CalcSideSpeedFromState(stM);
                 
-                double? netT = (stT.OuterCount >= 2 && stT.LastOuterTime.HasValue && stT.FirstOuterTime.HasValue &&
-                               stT.InnerCount >= 2 && stT.LastInnerTime.HasValue && stT.FirstInnerTime.HasValue)
-                               ? ((stT.LastInnerTime.Value - stT.FirstInnerTime.Value) / (stT.InnerCount - 1)) -
-                                 ((stT.LastOuterTime.Value - stT.FirstOuterTime.Value) / (stT.OuterCount - 1))
-                               : null;
-                
-                double? netM = (stM.OuterCount >= 2 && stM.LastOuterTime.HasValue && stM.FirstOuterTime.HasValue &&
-                               stM.InnerCount >= 2 && stM.LastInnerTime.HasValue && stM.FirstInnerTime.HasValue)
-                               ? ((stM.LastInnerTime.Value - stM.FirstInnerTime.Value) / (stM.InnerCount - 1)) -
-                                 ((stM.LastOuterTime.Value - stM.FirstOuterTime.Value) / (stM.OuterCount - 1))
-                               : null;
+                double? netT = TradingEngine.CalcNetSpeedFromState(stT);
+                double? netM = TradingEngine.CalcNetSpeedFromState(stM);
 
                 txfN = netT.HasValue ? $"{netT.Value:+0.0000;-0.0000;+0.0000}s" : "--";
                 mxfN = netM.HasValue ? $"{netM.Value:+0.0000;-0.0000;+0.0000}s" : "--";
@@ -3004,7 +2917,18 @@ namespace ExtremeSignalAppCS
 
             var sb = new StringBuilder();
             sb.AppendLine($"\n    [{symbol} 即時極值詳情 (平均每筆間隔)]  最新價: {finalClose}");
-            sb.AppendLine($"    ● 成交速度: {dStr} | 大台速差: {txfN,-15} 小台速差: {mxfN,-15} | 均價:{avgPri}");
+            int windowSize = _engine.AbsNTicks;
+            int startIdx = Math.Max(0, tradesCount - windowSize);
+            int windowOCnt = 0, windowICnt = 0;
+            for (int i = startIdx; i < tradesCount; i++)
+            {
+                if (trades[i].Side == TradeSide.Outer) windowOCnt++;
+                else if (trades[i].Side == TradeSide.Inner) windowICnt++;
+            }
+            string ioCompare = windowICnt > windowOCnt ? $" 內:{windowICnt} > 外:{windowOCnt}" :
+                               (windowOCnt > windowICnt ? $" 外:{windowOCnt} > 內:{windowICnt}" : $" 內:{windowICnt} = 外:{windowOCnt}");
+
+            sb.AppendLine($"    ● 成交速度: {dStr} | 大台速差: {txfN,-15} 小台速差: {mxfN,-15} | 均價:{avgPri}{ioCompare}");
             sb.AppendLine($"    {header}");
             sb.AppendLine(sep);
 
@@ -3045,69 +2969,38 @@ namespace ExtremeSignalAppCS
                 bool forceShowUnmet = false;
                 string displayTypeStr = d.DisplayTitle;
                 
-                if (isUnmet)
+                var (isNormal, isContradiction) = TradingEngine.ClassifyTrigger(d.DisplayTitle, speedInfo);
+                
+                if (isUnmet && isContradiction)
                 {
-                    if (d.DisplayTitle.Contains("最高") && (speedInfo.Contains("空速增") || speedInfo.Contains("多速減")))
-                        forceShowUnmet = true;
-                    else if (d.DisplayTitle.Contains("最低") && (speedInfo.Contains("多速增") || speedInfo.Contains("空速減")))
-                        forceShowUnmet = true;
-
-                    if (forceShowUnmet)
-                        displayTypeStr = displayTypeStr.Replace("未達標", "矛盾");
+                    forceShowUnmet = true;
+                    displayTypeStr = displayTypeStr.Replace("未達標", "矛盾");
                 }
 
                 string zoneStr = "";
                 if (d.DisplayTitle.Contains(" [達標]") || (isUnmet && forceShowUnmet))
                 {
-                    try
-                    {
-                        var tDict = (Dictionary<string, (int p50, int p75, int p90)>)quantParams[side == "top" ? "time_top" : "time_bottom"];
-                        int totalM = ParseTimeToMinutes(d.BestATime);
-                        if (totalM < 0) throw new Exception("Invalid time");
-                        if (session == "夜盤" && totalM < 900) totalM += 1440;
-
-                        int? p50 = null, p75 = null, p90 = null;
-                        foreach (var kvp in tDict)
-                        {
-                            if (kvp.Key.Contains(session))
-                            {
-                                string timePart = kvp.Key.Split(' ')[1].Trim();
-                                if (timePart.Contains('-'))
-                                {
-                                    var sStr = timePart.Split('-')[0];
-                                    var eStr = timePart.Split('-')[1];
-                                    int sMins = int.Parse(sStr.Split(':')[0]) * 60 + int.Parse(sStr.Split(':')[1]);
-                                    int eMins = int.Parse(eStr.Split(':')[0]) * 60 + int.Parse(eStr.Split(':')[1]);
-                                    if (session == "夜盤")
-                                    {
-                                        if (sMins < 900) sMins += 1440;
-                                        if (eMins < 900) eMins += 1440;
-                                    }
-                                    if (sMins <= totalM && totalM <= eMins)
-                                    {
-                                        p50 = kvp.Value.p50;
-                                        p75 = kvp.Value.p75;
-                                        p90 = kvp.Value.p90;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if (p50.HasValue && p75.HasValue && p90.HasValue)
-                        {
-                            if (side == "top")
-                                zoneStr = $"區:{d.BestAPrice + p50.Value}~{d.BestAPrice + p75.Value} 損:{d.BestAPrice + p90.Value}";
-                            else
-                                zoneStr = $"區:{d.BestAPrice - p50.Value}~{d.BestAPrice - p75.Value} 損:{d.BestAPrice - p90.Value}";
-                        }
-                    }
-                    catch { }
+                    zoneStr = GetZoneStr(side, d.BestATime, d.BestAPrice, session, quantParams);
+                    if (zoneStr == "N/A") zoneStr = "";
                 }
 
                 sb.AppendLine($"    {FmtPadLeft(displayTypeStr, 22)}|{FmtPadLeft(zoneStr, 24)}|{FmtPadRight(aTimeVal, 9)}|{FmtPadRight(d.BestAPrice.ToString(), 6)}|{FmtPadRight(bTimeVal, 9)}|{FmtPadRight(bPriVal, 6)}|{preS}|{postS}|{d.AmpVal,5}");
                 if (!string.IsNullOrEmpty(speedInfo))
                 {
+                    bool isKLow = currentType == "最低";
+                    bool isKHigh = currentType == "最高";
+                    bool isIlessO = speedInfo.Contains(" < 外:");
+                    bool isIgreaterO = speedInfo.Contains(" > 外:");
+
+                    if (isKLow && (isNormal || isContradiction) && isIlessO)
+                    {
+                        speedInfo = "[C:RED]" + speedInfo;
+                    }
+                    else if (isKHigh && (isNormal || isContradiction) && isIgreaterO)
+                    {
+                        speedInfo = "[C:GREEN]" + speedInfo;
+                    }
+
                     sb.AppendLine($"    {speedInfo.Trim()}");
                 }
             }
@@ -3333,15 +3226,8 @@ namespace ExtremeSignalAppCS
             {
                 try
                 {
-                    var pattern = SymbolRegex();
-                    var mattimePat = MatTimeRegex();
-                    var matPriPat = MatPriRegex();
-                    var tmatqtyPat = TMatQtyRegex();
-                    var bestbpPat = BestBpRegex();
-                    var bestspPat = BestSpRegex();
-
                     var parsedTicks = new List<TradeTick>();
-                    var lastTmatqty = new Dictionary<(string, string), int>();
+                    var lastTmatqty = new Dictionary<(string, string, string), int>();
 
                     using var fs = new FileStream(logFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
                     using var sr = new StreamReader(fs, Encoding.GetEncoding("big5"));
@@ -3349,70 +3235,16 @@ namespace ExtremeSignalAppCS
 
                     while ((line = sr.ReadLine()) != null)
                     {
-                        if (!line.Contains("TXF") && !line.Contains("MXF")) continue;
+                        var tick = TickParser.ParseLogLine(line, lastTmatqty, activeSession, null, logFile);
+                        if (tick == null) continue;
 
-                        var match = pattern.Match(line);
-                        if (!match.Success) continue;
-                        string symbol = match.Groups[1].Value;
-
-                        string baseSym = symbol.Contains("TXF") ? "TXF" : (symbol.Contains("MXF") ? "MXF" : "");
-                        if (string.IsNullOrEmpty(baseSym)) continue;
-
-                        var mtMatch = mattimePat.Match(line);
-                        var mpMatch = matPriPat.Match(line);
-                        var tqMatch = tmatqtyPat.Match(line);
-                        if (!mtMatch.Success || !mpMatch.Success || !tqMatch.Success) continue;
-
-                        string timeStr = mtMatch.Groups[1].Value;
-                        double tValRaw = TimeParser.ParseTime(timeStr);
-
-                        string session = "";
-                        double tVal = tValRaw;
-
-                        if (tValRaw >= 31500.0 && tValRaw <= 49500.0)
+                        if (tick.Value.Side == TradeSide.Unknown)
                         {
-                            session = "日盤";
-                        }
-                        else if (tValRaw >= 54000.0 || tValRaw <= 18000.0)
-                        {
-                            session = "夜盤";
-                            if (tValRaw <= 18000.0) tVal += 86400.0;
-                        }
-                        else
-                        {
-                            continue;
+                            TradeSide fallbackSide = parsedTicks.Count > 0 ? parsedTicks[^1].Side : TradeSide.Outer;
+                            tick = new TradeTick(tick.Value.Symbol, tick.Value.Time, tick.Value.TimeVal, tick.Value.Price, tick.Value.Qty, fallbackSide, tick.Value.BestBp, tick.Value.BestSp, tick.Value.Session);
                         }
 
-                        if (session != activeSession) continue;
-
-                        int tmatqty = int.Parse(tqMatch.Groups[1].Value);
-                        var qtyKey = (baseSym, session);
-                        if (tmatqty < 0 || (lastTmatqty.ContainsKey(qtyKey) && tmatqty <= lastTmatqty[qtyKey]))
-                            continue;
-
-                        lastTmatqty[qtyKey] = tmatqty;
-
-                        var bpM = bestbpPat.Match(line);
-                        var spM = bestspPat.Match(line);
-                        if (!bpM.Success || !spM.Success) continue;
-
-                        int bestBp = 0, bestSp = 0;
-                        try
-                        {
-                            string bPrices = bpM.Groups[1].Value;
-                            string sPrices = spM.Groups[1].Value;
-                            bestBp = !string.IsNullOrEmpty(bPrices) ? (int)double.Parse(bPrices.Split(',')[0]) : 0;
-                            bestSp = !string.IsNullOrEmpty(sPrices) ? (int)double.Parse(sPrices.Split(',')[0]) : 0;
-                            if (bestBp <= 0 || bestSp <= 0) continue;
-                        }
-                        catch { continue; }
-
-                        int price = int.Parse(mpMatch.Groups[1].Value);
-                        TradeSide side = TradeSide.Unknown;
-                        if (price >= bestSp) side = TradeSide.Outer;
-                        else if (price <= bestBp) side = TradeSide.Inner;
-
-                        parsedTicks.Add(new TradeTick(baseSym, timeStr, tVal, price, side, bestBp, bestSp, session));
+                        parsedTicks.Add(tick.Value);
                     }
 
                     parsedTicks.Sort((x, y) => x.TimeVal.CompareTo(y.TimeVal));
@@ -3502,6 +3334,64 @@ namespace ExtremeSignalAppCS
             }
         }
 
+        private void ProcessReplayTick(TradeTick tick, string activeSession)
+        {
+            string baseSym = tick.Symbol;
+            int price = tick.Price;
+            string mt = tick.Time;
+            double tVal = tick.TimeVal;
+            TradeSide side = tick.Side;
+
+            if (side == TradeSide.Unknown)
+            {
+                var prevTrades = _replaySymbolTrades[baseSym][activeSession];
+                side = prevTrades.Count > 0 ? prevTrades[^1].Side : TradeSide.Outer;
+            }
+
+            _replaySymbolTrades[baseSym][activeSession].Add(new TradeTick(baseSym, mt, tVal, price, tick.Qty, side, tick.BestBp, tick.BestSp, activeSession));
+
+            var state = _replayRtState[baseSym][activeSession];
+            state.Count++;
+            state.SumPrice += price;
+            
+            if (price > state.DayMax)
+            {
+                state.DayMax = price;
+                state.MaxTime = mt;
+            }
+            if (price < state.DayMin)
+            {
+                state.DayMin = price;
+                state.MinTime = mt;
+            }
+
+            if (side == TradeSide.Outer)
+            {
+                state.OuterCount++;
+                state.FirstOuterTime ??= tVal;
+                state.LastOuterTime = tVal;
+            }
+            else if (side == TradeSide.Inner)
+            {
+                state.InnerCount++;
+                state.FirstInnerTime ??= tVal;
+                state.LastInnerTime = tVal;
+            }
+
+            if (baseSym == "MXF")
+            {
+                _renderMxfPrice = price;
+                Volatile.Write(ref _renderMxfTime, mt);
+                _lastMxfPrice = price;
+                _lastMxfTime = mt;
+            }
+            else if (baseSym == "TXF")
+            {
+                _renderTxfPrice = price;
+                Volatile.Write(ref _renderTxfTime, mt);
+            }
+        }
+
         /// <summary>
         /// 瞬間 O(1) 反射重組 0 到給定索引的歷史狀態與 UI ( Slider 拖曳核心)。
         /// </summary>
@@ -3520,60 +3410,7 @@ namespace ExtremeSignalAppCS
             {
                 foreach (var tick in subset)
                 {
-                    string baseSym = tick.Symbol;
-                    int price = tick.Price;
-                    string mt = tick.Time;
-                    double tVal = tick.TimeVal;
-                    TradeSide side = tick.Side;
-
-                    if (side == TradeSide.Unknown)
-                    {
-                        var prevTrades = _replaySymbolTrades[baseSym][activeSession];
-                        side = prevTrades.Count > 0 ? prevTrades[^1].Side : TradeSide.Outer;
-                    }
-
-                    _replaySymbolTrades[baseSym][activeSession].Add(new TradeTick(baseSym, mt, tVal, price, side, tick.BestBp, tick.BestSp, activeSession));
-
-                    var state = _replayRtState[baseSym][activeSession];
-                    state.Count++;
-                    state.SumPrice += price;
-                    
-                    if (price > state.DayMax)
-                    {
-                        state.DayMax = price;
-                        state.MaxTime = mt;
-                    }
-                    if (price < state.DayMin)
-                    {
-                        state.DayMin = price;
-                        state.MinTime = mt;
-                    }
-
-                    if (side == TradeSide.Outer)
-                    {
-                        state.OuterCount++;
-                        state.FirstOuterTime ??= tVal;
-                        state.LastOuterTime = tVal;
-                    }
-                    else if (side == TradeSide.Inner)
-                    {
-                        state.InnerCount++;
-                        state.FirstInnerTime ??= tVal;
-                        state.LastInnerTime = tVal;
-                    }
-
-                    if (baseSym == "MXF")
-                    {
-                        _renderMxfPrice = price;
-                        Volatile.Write(ref _renderMxfTime, mt);
-                        _lastMxfPrice = price;
-                        _lastMxfTime = mt;
-                    }
-                    else if (baseSym == "TXF")
-                    {
-                        _renderTxfPrice = price;
-                        Volatile.Write(ref _renderTxfTime, mt);
-                    }
+                    ProcessReplayTick(tick, activeSession);
                 }
             }
 
@@ -3722,60 +3559,7 @@ namespace ExtremeSignalAppCS
                 // 餵入回放 Tick
                 lock (_rtLock)
                 {
-                    string baseSym = tick.Symbol;
-                    int price = tick.Price;
-                    string mt = tick.Time;
-                    double tVal = tick.TimeVal;
-                    TradeSide side = tick.Side;
-
-                    if (side == TradeSide.Unknown)
-                    {
-                        var prevTrades = _replaySymbolTrades[baseSym][activeSession];
-                        side = prevTrades.Count > 0 ? prevTrades[^1].Side : TradeSide.Outer;
-                    }
-
-                    _replaySymbolTrades[baseSym][activeSession].Add(new TradeTick(baseSym, mt, tVal, price, side, tick.BestBp, tick.BestSp, activeSession));
-
-                    var state = _replayRtState[baseSym][activeSession];
-                    state.Count++;
-                    state.SumPrice += price;
-                    
-                    if (price > state.DayMax)
-                    {
-                        state.DayMax = price;
-                        state.MaxTime = mt;
-                    }
-                    if (price < state.DayMin)
-                    {
-                        state.DayMin = price;
-                        state.MinTime = mt;
-                    }
-
-                    if (side == TradeSide.Outer)
-                    {
-                        state.OuterCount++;
-                        state.FirstOuterTime ??= tVal;
-                        state.LastOuterTime = tVal;
-                    }
-                    else if (side == TradeSide.Inner)
-                    {
-                        state.InnerCount++;
-                        state.FirstInnerTime ??= tVal;
-                        state.LastInnerTime = tVal;
-                    }
-
-                    if (baseSym == "MXF")
-                    {
-                        _renderMxfPrice = price;
-                        Volatile.Write(ref _renderMxfTime, mt);
-                        _lastMxfPrice = price;
-                        _lastMxfTime = mt;
-                    }
-                    else if (baseSym == "TXF")
-                    {
-                        _renderTxfPrice = price;
-                        Volatile.Write(ref _renderTxfTime, mt);
-                    }
+                    ProcessReplayTick(tick, activeSession);
                 }
 
                 // 批次計數器節流 (Batching)，高頻行情下合併重繪
@@ -3927,6 +3711,15 @@ namespace ExtremeSignalAppCS
         {
             if (e.AddedItems.Count > 0)
             {
+                if (!_isProgrammaticSelection && !_isRestoringSelection)
+                {
+                    // 使用者手動選擇，清除先前的所有特別反白
+                    foreach (var obs in _obsCollection)
+                    {
+                        obs.IsTargetPriceHighlighted = false;
+                    }
+                }
+
                 // 如果使用者手動（或系統成功）選取了某個項目，就清除待處理的目標
                 _targetHighlightStopLossPrice = null;
             }
@@ -3998,7 +3791,12 @@ namespace ExtremeSignalAppCS
                 int targetKlineRow = targetRowIdx - 1;
                 
                 dgKline.SelectedIndex = targetKlineRow;
-                dgKline.ScrollIntoView(_klineCollection[targetKlineRow]);
+                
+                // 如果是系統自動背景還原（例如即時行情更新），不要強制捲動畫面，讓使用者自由瀏覽
+                if (!_isRestoringSelection && !_isProgrammaticSelection)
+                {
+                    dgKline.ScrollIntoView(_klineCollection[targetKlineRow]);
+                }
             }
         }
 
@@ -4012,7 +3810,14 @@ namespace ExtremeSignalAppCS
             int idx = dgKline.SelectedIndex;
             if (idx >= 0 && idx < _klineCollection.Count)
             {
-                klineChart.FocusCandle(idx);
+                if (_isRestoringSelection || _isProgrammaticSelection)
+                {
+                    klineChart.SetHighlightIndexOnly(idx);
+                }
+                else
+                {
+                    klineChart.FocusCandle(idx);
+                }
             }
         }
 
@@ -4216,28 +4021,49 @@ namespace ExtremeSignalAppCS
 
         private void ApplyTargetHighlight()
         {
+            if (!string.IsNullOrEmpty(_targetHighlightStopLossPrice))
+            {
+                // 有新的搜尋目標時，清除所有的特殊反白標記
+                foreach (var obs in _obsCollection)
+                {
+                    obs.IsTargetPriceHighlighted = false;
+                }
+            }
+            
             if (string.IsNullOrEmpty(_targetHighlightStopLossPrice)) return;
             
-            SimulationResult? targetObs = null;
-            double earliestTime = double.MaxValue;
+            var matches = _obsCollection.Where(o => !o.IsBroken && o.StopLossPrice.ToString() == _targetHighlightStopLossPrice).ToList();
+            if (matches.Count == 0) return;
 
-            foreach (var obs in _obsCollection)
+            SimulationResult? targetObs = null;
+
+            var kHighs = matches.Where(o => o.Type != null && o.Type.Contains("K高")).ToList();
+            var kLows = matches.Where(o => o.Type != null && o.Type.Contains("K低")).ToList();
+
+            if (kHighs.Count > 0)
             {
-                if (!obs.IsBroken && obs.StopLossPrice.ToString() == _targetHighlightStopLossPrice)
-                {
-                    double trigTime = TimeParser.ParseTime(obs.TrigTime);
-                    if (trigTime < earliestTime)
-                    {
-                        earliestTime = trigTime;
-                        targetObs = obs;
-                    }
-                }
+                // 如果是觀察 K 高，尋找最低的 A 點價
+                targetObs = kHighs.OrderBy(o => o.BestAPrice).First();
+            }
+            else if (kLows.Count > 0)
+            {
+                // 如果是觀察 K 低，尋找最高的 A 點價
+                targetObs = kLows.OrderByDescending(o => o.BestAPrice).First();
+            }
+            else
+            {
+                // 如果都不符合，沿用舊邏輯，尋找最早的觸發時間
+                targetObs = matches.OrderBy(o => TimeParser.ParseTime(o.TrigTime)).First();
             }
 
             if (targetObs != null)
             {
+                targetObs.IsTargetPriceHighlighted = true; // 特別彰顯該欄位
+                
+                _isProgrammaticSelection = true;
                 dgObserver.SelectedItem = targetObs;
                 dgObserver.ScrollIntoView(targetObs);
+                _isProgrammaticSelection = false;
                 
                 // 只有成功找到並選取後，才清除目標，避免過早被舊的即時 tick 清掉
                 _targetHighlightStopLossPrice = null;
@@ -4358,18 +4184,7 @@ namespace ExtremeSignalAppCS
                     foreach (var d in sigs)
                     {
                         string speedInfo = d.Tags.FirstOrDefault() ?? "";
-                        bool isUnmet = d.DisplayTitle.Contains(" [未達標]");
-                        bool isContradiction = false;
-
-                        if (isUnmet)
-                        {
-                            if (d.DisplayTitle.Contains("最高") && (speedInfo.Contains("空速增") || speedInfo.Contains("多速減")))
-                                isContradiction = true;
-                            else if (d.DisplayTitle.Contains("最低") && (speedInfo.Contains("多速增") || speedInfo.Contains("空速減")))
-                                isContradiction = true;
-                        }
-
-                        bool isNormal = d.DisplayTitle.Contains("[達標]") && !d.DisplayTitle.Contains('未') && !d.DisplayTitle.Contains("邊界");
+                        var (isNormal, isContradiction) = TradingEngine.ClassifyTrigger(d.DisplayTitle, speedInfo);
 
                         if (!(isNormal || isContradiction)) continue;
 
