@@ -139,6 +139,9 @@ namespace ExtremeSignalAppCS
         private string _lastMxfTime = "";
         private string? _currentReplayDir;
         private string? _lastSelectedReplayDir;
+        
+        // 用於「未破分K」點選後，跨執行緒狀態傳遞以便在更新完成後反白特定停損價位
+        private string? _targetHighlightStopLossPrice;
         private string _currentReplaySession = "日盤";
         private string? _lastAutofillKlineTime;
         private List<(string Symbol, string Session, int DayMin, int DayMax, List<SimulationResult> Details)> _lastRtStatusSnapshot = [];
@@ -297,7 +300,7 @@ namespace ExtremeSignalAppCS
         // 60/120 FPS 畫面渲染迴圈 (Render Loop)
         private void OnCompositionTargetRendering(object? sender, EventArgs e)
         {
-            if (!_isInitialized || _isReplaying) return;
+            if (!_isInitialized) return;
             
             // 每幀無鎖撈取最新的 volatile 變數
             int mxfPrice = _renderMxfPrice;
@@ -886,23 +889,25 @@ namespace ExtremeSignalAppCS
                 // 完全 Lock-Free 的資料結構寫入 (Zero GC Allocation & No OS Lock)
                 _liveSymbolTrades[baseSymbol][session].Add(tick);
 
-                // 實時 Render Loop 快取 (無鎖寫入)
-                if (baseSymbol == "TXF")
+                // 實時 Render Loop 快取 (單向寫入)
+                if (!_isReplaying)
                 {
-                    _renderTxfPrice = price;
-                    _renderTxfBestBp = bestBp;
-                    _renderTxfBestSp = bestSp;
-                    Interlocked.Exchange(ref _renderTxfTime, mt);
+                    if (baseSymbol == "TXF")
+                    {
+                        _renderTxfPrice = price;
+                        _renderTxfBestBp = bestBp;
+                        _renderTxfBestSp = bestSp;
+                        Interlocked.Exchange(ref _renderTxfTime, mt);
+                    }
+                    else if (baseSymbol == "MXF")
+                    {
+                        _renderMxfPrice = price;
+                        _renderMxfBestBp = bestBp;
+                        _renderMxfBestSp = bestSp;
+                        Interlocked.Exchange(ref _renderMxfTime, mt);
+                    }
                 }
-                else if (baseSymbol == "MXF")
-                {
-                    _renderMxfPrice = price;
-                    _renderMxfBestBp = bestBp;
-                    _renderMxfBestSp = bestSp;
-                    Interlocked.Exchange(ref _renderMxfTime, mt);
-                }
-
-                // 雙軌隔離與預載延遲：在回放或預載時實時Tick靜默寫入，不在回放且非預載且啟用實時UI時才通知背景分析 UI 重繪
+                // 與 UI 分離，延遲處理：背景即時 Tick 的寫入，不應被 UI 的更新拖慢
                 if (!_isReplaying && !_isPreloading && _isRealtimeUIEnabled)
                 {
                     _analysisEvent.Set();
@@ -1966,6 +1971,10 @@ namespace ExtremeSignalAppCS
         {
             RefreshObserverComboboxes();
 
+            SimulationResult? prevSelected = dgObserver.SelectedItem as SimulationResult;
+            string? prevSelectedTime = prevSelected?.BestATime;
+            string? prevSelectedPrice = prevSelected?.StopLossPrice.ToString();
+
             int oldLen = _obsCollection.Count;
             int newLen = simulationResults.Count;
 
@@ -2013,9 +2022,25 @@ namespace ExtremeSignalAppCS
                 foreach (var o in simulationResults) _obsCollection.Add(o);
             }
 
-            if (_obsCollection.Count > 0)
+            if (prevSelectedPrice != null && string.IsNullOrEmpty(_targetHighlightStopLossPrice))
             {
-                if (dgObserver.SelectedIndex == -1)
+                var match = _obsCollection.FirstOrDefault(o => o.BestATime == prevSelectedTime && o.StopLossPrice.ToString() == prevSelectedPrice);
+                
+                // 當切換分 K 時，BestATime 可能會改變，此時退而求其次只比對停損價
+                if (match == null)
+                {
+                    match = _obsCollection.FirstOrDefault(o => !o.IsBroken && o.StopLossPrice.ToString() == prevSelectedPrice);
+                }
+
+                if (match != null)
+                {
+                    dgObserver.SelectedItem = match;
+                    dgObserver.ScrollIntoView(match);
+                }
+            }
+            else if (_obsCollection.Count > 0)
+            {
+                if (dgObserver.SelectedIndex == -1 && string.IsNullOrEmpty(_targetHighlightStopLossPrice))
                 {
                     dgObserver.ScrollIntoView(_obsCollection[^1]);
                 }
@@ -2025,6 +2050,8 @@ namespace ExtremeSignalAppCS
 
             // 更新底部 ComboBox 壓力支撐下拉選項
             RefreshObserverComboboxes();
+
+            ApplyTargetHighlight();
         }
 
         private void ApplyObserverHighlightsToKline()
@@ -3143,6 +3170,7 @@ namespace ExtremeSignalAppCS
 
             AppendLog($"【預載】偵測到今日歷史日誌，開始背景非同步載入: {Path.GetFileName(todayLog)}...", forceScrollToEnd: true);
             btnRealtime.IsEnabled = false; // 預載時先鎖定按鈕，防止二次進入
+            btnUpdate.IsEnabled = false;
 
             string activeSession = _currentRealtimePort == 442 ? "夜盤" : "日盤";
 
@@ -3156,6 +3184,7 @@ namespace ExtremeSignalAppCS
                     Dispatcher.BeginInvoke(new Action(() =>
                     {
                         btnRealtime.IsEnabled = true;
+                        btnUpdate.IsEnabled = true;
                         klineChart.EnableAutoRange(); // 預載成功強制 autoRange 重對焦
 
                         if (success && result is Dictionary<string, string> reports)
@@ -3535,8 +3564,15 @@ namespace ExtremeSignalAppCS
 
                     if (baseSym == "MXF")
                     {
+                        _renderMxfPrice = price;
+                        Volatile.Write(ref _renderMxfTime, mt);
                         _lastMxfPrice = price;
                         _lastMxfTime = mt;
+                    }
+                    else if (baseSym == "TXF")
+                    {
+                        _renderTxfPrice = price;
+                        Volatile.Write(ref _renderTxfTime, mt);
                     }
                 }
             }
@@ -3730,8 +3766,15 @@ namespace ExtremeSignalAppCS
 
                     if (baseSym == "MXF")
                     {
+                        _renderMxfPrice = price;
+                        Volatile.Write(ref _renderMxfTime, mt);
                         _lastMxfPrice = price;
                         _lastMxfTime = mt;
+                    }
+                    else if (baseSym == "TXF")
+                    {
+                        _renderTxfPrice = price;
+                        Volatile.Write(ref _renderTxfTime, mt);
                     }
                 }
 
@@ -3882,10 +3925,33 @@ namespace ExtremeSignalAppCS
 
         private void DgObserver_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
+            if (e.AddedItems.Count > 0)
+            {
+                // 如果使用者手動（或系統成功）選取了某個項目，就清除待處理的目標
+                _targetHighlightStopLossPrice = null;
+            }
+
             if (dgObserver.SelectedItem is not SimulationResult selected || selected.BestATime == "N/A" || string.IsNullOrEmpty(selected.BestATime))
             {
                 dgKline.SelectedIndex = -1;
+                klineChart?.SetObserverStopLossPrice(null);
                 return;
+            }
+
+            int direction = 0;
+            if (selected.Type != null)
+            {
+                if (selected.Type.Contains("K高")) direction = 1; // 做多 (預設邏輯)
+                else if (selected.Type.Contains("K低")) direction = -1; // 做空
+            }
+
+            if (selected.StopLossDisplay != "N/A" && selected.StopLossPrice > 0)
+            {
+                klineChart?.SetObserverStopLossPrice(selected.StopLossPrice, direction);
+            }
+            else
+            {
+                klineChart?.SetObserverStopLossPrice(null);
             }
 
             double aTVal = TimeParser.ParseTime(selected.BestATime);
@@ -4081,7 +4147,7 @@ namespace ExtremeSignalAppCS
 
         private void BtnUpdate_Click(object sender, RoutedEventArgs e)
         {
-            TriggerReanalyze();
+            PreloadTodayLog();
         }
 
         private void BtnRealtime_Click(object sender, RoutedEventArgs e)
@@ -4119,6 +4185,62 @@ namespace ExtremeSignalAppCS
             catch
             {
                 return "極值載入發生錯誤，使用預設值";
+            }
+        }
+
+        /// <summary>
+        /// 處理未破分K監控表單中的分K數字點擊事件。
+        /// </summary>
+        public void HandleUnbrokenKIntervalClick(string price, int interval)
+        {
+            _targetHighlightStopLossPrice = price;
+
+            foreach (ComboBoxItem item in cboKlineInterval.Items)
+            {
+                if (item.Content?.ToString() == interval.ToString())
+                {
+                    if (cboKlineInterval.SelectedItem == item)
+                    {
+                        // 若分K未改變，不會觸發非同步分析重繪，直接呼叫反白
+                        ApplyTargetHighlight();
+                    }
+                    else
+                    {
+                        // 改變分K會觸發 CboKlineInterval_SelectionChanged -> 非同步分析 -> 最終在 UpdateObserverViews 中反白
+                        cboKlineInterval.SelectedItem = item;
+                    }
+                    break;
+                }
+            }
+        }
+
+        private void ApplyTargetHighlight()
+        {
+            if (string.IsNullOrEmpty(_targetHighlightStopLossPrice)) return;
+            
+            SimulationResult? targetObs = null;
+            double earliestTime = double.MaxValue;
+
+            foreach (var obs in _obsCollection)
+            {
+                if (!obs.IsBroken && obs.StopLossPrice.ToString() == _targetHighlightStopLossPrice)
+                {
+                    double trigTime = TimeParser.ParseTime(obs.TrigTime);
+                    if (trigTime < earliestTime)
+                    {
+                        earliestTime = trigTime;
+                        targetObs = obs;
+                    }
+                }
+            }
+
+            if (targetObs != null)
+            {
+                dgObserver.SelectedItem = targetObs;
+                dgObserver.ScrollIntoView(targetObs);
+                
+                // 只有成功找到並選取後，才清除目標，避免過早被舊的即時 tick 清掉
+                _targetHighlightStopLossPrice = null;
             }
         }
 

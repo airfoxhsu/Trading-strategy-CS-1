@@ -49,6 +49,7 @@ namespace ExtremeSignalAppCS.Controls
         private readonly Brush _lowTextBrush = new SolidColorBrush(Color.FromRgb(40, 167, 69));
         private readonly Pen _highlightPen = new(new SolidColorBrush(Color.FromRgb(255, 255, 255)), 2.0);
         private readonly Pen _stopLossPen = new(new SolidColorBrush(Color.FromRgb(255, 215, 0)), 1.5);
+        private readonly Pen _observerStopLossPen = new(new SolidColorBrush(Color.FromRgb(255, 0, 255)), 2.0);
 
         private double? _highlightPrice;
         /// <summary>
@@ -92,6 +93,20 @@ namespace ExtremeSignalAppCS.Controls
             }
         }
 
+        private double? _observerStopLossPrice;
+        /// <summary>
+        /// 停損價格（桃紅色橫線），由極值觀測表選取連動而得
+        /// </summary>
+        public double? ObserverStopLossPrice
+        {
+            get => _observerStopLossPrice;
+            set
+            {
+                _observerStopLossPrice = value;
+                InvalidateVisual();
+            }
+        }
+
         private int _highlightDirection = 0;
         /// <summary>
         /// 趨勢方向：1=多方, -1=空方, 0=無
@@ -120,6 +135,7 @@ namespace ExtremeSignalAppCS.Controls
             _lowTextBrush.Freeze();
             _highlightPen.Freeze();
             _stopLossPen.Freeze();
+            _observerStopLossPen.Freeze();
         }
 
         public void SetData(List<KlineBar> candles, double minX, double maxX, double minY, double maxY)
@@ -281,6 +297,13 @@ namespace ExtremeSignalAppCS.Controls
                 {
                     double sly = GetCanvasY(_stopLossPrice.Value, h);
                     drawingContext.DrawLine(_stopLossPen, new Point(0, sly), new Point(Math.Max(0, w - RightMargin), sly));
+                }
+
+                // 6.6. 繪製觀測表反白停損桃紅色橫線
+                if (_observerStopLossPrice.HasValue)
+                {
+                    double osly = GetCanvasY(_observerStopLossPrice.Value, h);
+                    drawingContext.DrawLine(_observerStopLossPen, new Point(0, osly), new Point(Math.Max(0, w - RightMargin), osly));
                 }
 
                 // 7. 繪製選取的 K 棒白色外框
@@ -1446,6 +1469,15 @@ namespace ExtremeSignalAppCS.Controls
         public void SetStopLossPrice(double? stopLossPrice, int direction = 0)
         {
             _painter.StopLossPrice = stopLossPrice;
+            _painter.HighlightDirection = direction;
+        }
+
+        /// <summary>
+        /// 設定極值觀測表選取的停損價格桃紅色橫線與方向
+        /// </summary>
+        public void SetObserverStopLossPrice(double? stopLossPrice, int direction = 0)
+        {
+            _painter.ObserverStopLossPrice = stopLossPrice;
             _painter.HighlightDirection = direction;
         }
 

@@ -358,6 +358,43 @@ namespace ExtremeSignalAppCS.Controls
             // 使用單一 Paragraph 且設定 Margin=0 以精準控制換行距離
             var pContent = new Paragraph { Margin = new Thickness(0) };
 
+            void AppendUnbrokenEntry(Paragraph pContent, string price, string intervalsStr, string timeStr)
+            {
+                pContent.Inlines.Add(new Run($"  停損價: {price}  未破: "));
+                var intervals = intervalsStr.Split('、');
+                for (int i = 0; i < intervals.Length; i++)
+                {
+                    var intervalStr = intervals[i];
+                    if (int.TryParse(intervalStr, out int interval))
+                    {
+                        var runNum = new Run(intervalStr)
+                        {
+                            Cursor = System.Windows.Input.Cursors.Hand,
+                            Foreground = new SolidColorBrush(Color.FromRgb(0, 162, 237)), // #00A2ED
+                            FontWeight = FontWeights.Bold
+                        };
+                        runNum.MouseEnter += (s, e) => runNum.TextDecorations = TextDecorations.Underline;
+                        runNum.MouseLeave += (s, e) => runNum.TextDecorations = null;
+                        runNum.PreviewMouseLeftButtonDown += (s, e) => 
+                        {
+                            _parentApp?.HandleUnbrokenKIntervalClick(price, interval);
+                            e.Handled = true;
+                        };
+                        pContent.Inlines.Add(runNum);
+                    }
+                    else
+                    {
+                        pContent.Inlines.Add(new Run(intervalStr));
+                    }
+
+                    if (i < intervals.Length - 1)
+                    {
+                        pContent.Inlines.Add(new Run("、"));
+                    }
+                }
+                pContent.Inlines.Add(new Run($" 分K  ({timeStr})\n"));
+            }
+
             if (shortEntries.Count > 0)
             {
                 var run = new Run($"═══ 做空（觀察 K 低） 共 {shortEntries.Count} 項 ═══\n")
@@ -369,7 +406,7 @@ namespace ExtremeSignalAppCS.Controls
 
                 foreach (var item in shortEntries)
                 {
-                    pContent.Inlines.Add(new Run($"  停損價: {item.price}  未破: {item.intervalsStr} 分K  ({item.timeStr})\n"));
+                    AppendUnbrokenEntry(pContent, item.price, item.intervalsStr, item.timeStr);
                 }
             }
 
@@ -388,7 +425,7 @@ namespace ExtremeSignalAppCS.Controls
 
                 foreach (var item in longEntries)
                 {
-                    pContent.Inlines.Add(new Run($"  停損價: {item.price}  未破: {item.intervalsStr} 分K  ({item.timeStr})\n"));
+                    AppendUnbrokenEntry(pContent, item.price, item.intervalsStr, item.timeStr);
                 }
             }
 
