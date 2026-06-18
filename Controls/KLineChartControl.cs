@@ -1510,9 +1510,14 @@ namespace ExtremeSignalAppCS.Controls
             
             // 讓上半部的價格文字垂直置中對齊價格線
             double topOffset = _priceText.DesiredSize.Height / 2.0 + _priceTagBorder.Padding.Top;
+            
+            double tagY = y - topOffset;
+            double tagHeight = _priceTagBorder.DesiredSize.Height;
+            if (tagY < 0) tagY = 0;
+            if (tagY + tagHeight > ActualHeight) tagY = ActualHeight - tagHeight;
 
             _priceTagTransform.X = x;
-            _priceTagTransform.Y = y - topOffset;
+            _priceTagTransform.Y = tagY;
             _priceTagBorder.Visibility = Visibility.Visible;
 
             if (lastCandle.Close > lastCandle.Open)

@@ -238,11 +238,11 @@ namespace ExtremeSignalAppCS.Controls
                     var (sigType, stopLossVal) = kvp.Key;
                     if (double.TryParse(stopLossVal, out double slPrice))
                     {
-                        if (sigType == "low" && price >= slPrice)
+                        if (sigType == "low" && price > slPrice)
                         {
                             brokenKeys.Add(kvp.Key);
                         }
-                        else if (sigType == "high" && price <= slPrice)
+                        else if (sigType == "high" && price < slPrice)
                         {
                             brokenKeys.Add(kvp.Key);
                         }
@@ -486,10 +486,8 @@ namespace ExtremeSignalAppCS.Controls
                     {
                         var evt = latestNewEvent;
                         string dirStr = evt.Direction == 1 ? "多方 📈" : "空方 📉";
-                        string op = evt.Direction == 1 ? (evt.LongCount > evt.ShortCount ? ">" : "=") : (evt.ShortCount > evt.LongCount ? ">" : "=");
-                        string statusStr = evt.Direction == 1
-                            ? $"做多 {evt.LongCount} 項 {op} 做空 {evt.ShortCount} 項"
-                            : $"做空 {evt.ShortCount} 項 {op} 做多 {evt.LongCount} 項";
+                        string op = evt.ShortCount > evt.LongCount ? ">" : (evt.ShortCount < evt.LongCount ? "<" : "=");
+                        string statusStr = $"做空 {evt.ShortCount} 項 {op} 做多 {evt.LongCount} 項";
                         string cpStr = evt.EstablishedPrice.HasValue ? evt.EstablishedPrice.Value.ToString() : "--";
                         string reasonStr = !string.IsNullOrEmpty(evt.Reason) ? $" ({evt.Reason})" : "";
                         string msgTitle = wasEmpty ? "【趨勢確立】" : "【趨勢轉向】";
@@ -545,10 +543,8 @@ namespace ExtremeSignalAppCS.Controls
 
                             // Trigger Telegram push
                             string dirStr = _trendDirection == 1 ? "多方 📈" : "空方 📉";
-                            string op = _trendDirection == 1 ? (longCount > shortCount ? ">" : "=") : (shortCount > longCount ? ">" : "=");
-                            string statusStr = _trendDirection == 1
-                                ? $"做多 {longCount} 項 {op} 做空 {shortCount} 項"
-                                : $"做空 {shortCount} 項 {op} 做多 {longCount} 項";
+                            string op = shortCount > longCount ? ">" : (shortCount < longCount ? "<" : "=");
+                            string statusStr = $"做空 {shortCount} 項 {op} 做多 {longCount} 項";
                             string cpStr = currentP.HasValue ? currentP.Value.ToString() : "--";
                             string reasonStr = !string.IsNullOrEmpty(evt.Reason) ? $" ({evt.Reason})" : "";
                             string msgTitle = lastAddedDir == 0 ? "【趨勢確立】" : "【趨勢轉向】";
@@ -585,7 +581,7 @@ namespace ExtremeSignalAppCS.Controls
 
                 bool hasNewTrend = false;
 
-                Paragraph CreateTrendParagraph(TrendEvent evt, string signature, bool isSelected)
+                Paragraph CreateTrendParagraph(TrendEvent evt, string signature, bool isSelected, int seqIndex)
                 {
                     var para = new Paragraph { Margin = new Thickness(0, 0, 0, 4), Tag = signature };
                     para.Background = isSelected ? new SolidColorBrush(Color.FromArgb(80, 255, 255, 255)) : Brushes.Transparent;
@@ -612,22 +608,23 @@ namespace ExtremeSignalAppCS.Controls
                         e.Handled = true;
                     };
 
+                    para.Inlines.Add(new Run($"{seqIndex} ") { Foreground = Brushes.White });
+
+                    string op = evt.ShortCount > evt.LongCount ? ">" : (evt.ShortCount < evt.LongCount ? "<" : "=");
+                    string pStr = evt.EstablishedPrice.HasValue ? $" {evt.EstablishedPrice.Value}" : "";
+                    string reasonStr = !string.IsNullOrEmpty(evt.Reason) ? $" ({evt.Reason})" : "";
+                    string contentStr = $"做空 {evt.ShortCount} 項 {op} 做多 {evt.LongCount} 項 {evt.EstablishedTime}{pStr}{reasonStr}";
+
                     if (evt.Direction == 1)
                     {
-                        string op = evt.LongCount > evt.ShortCount ? ">" : "=";
-                        string pStr = evt.EstablishedPrice.HasValue ? $" {evt.EstablishedPrice.Value}" : "";
-                        string reasonStr = !string.IsNullOrEmpty(evt.Reason) ? $" ({evt.Reason})" : "";
-                        para.Inlines.Add(new Run($"多方 做多 {evt.LongCount} 項 {op} 做空 {evt.ShortCount} 項 {evt.EstablishedTime}{pStr}{reasonStr}")
+                        para.Inlines.Add(new Run(contentStr)
                         {
                             Foreground = new SolidColorBrush(Color.FromRgb(235, 75, 75))
                         });
                     }
                     else if (evt.Direction == -1)
                     {
-                        string op = evt.ShortCount > evt.LongCount ? ">" : "=";
-                        string pStr = evt.EstablishedPrice.HasValue ? $" {evt.EstablishedPrice.Value}" : "";
-                        string reasonStr = !string.IsNullOrEmpty(evt.Reason) ? $" ({evt.Reason})" : "";
-                        para.Inlines.Add(new Run($"空方 做空 {evt.ShortCount} 項 {op} 做多 {evt.LongCount} 項 {evt.EstablishedTime}{pStr}{reasonStr}")
+                        para.Inlines.Add(new Run(contentStr)
                         {
                             Foreground = new SolidColorBrush(Color.FromRgb(40, 167, 69))
                         });
@@ -649,7 +646,7 @@ namespace ExtremeSignalAppCS.Controls
                         if (currentTag != signature)
                         {
                             // 內容實質改變，取代舊行
-                            var newPara = CreateTrendParagraph(evt, signature, isSelected);
+                            var newPara = CreateTrendParagraph(evt, signature, isSelected, i + 1);
                             txtTrendHistory.Document.Blocks.InsertBefore(para, newPara);
                             txtTrendHistory.Document.Blocks.Remove(para);
                         }
@@ -665,12 +662,18 @@ namespace ExtremeSignalAppCS.Controls
                             {
                                 para.Background = expectedBg;
                             }
+                            
+                            // 更新序號 (如果序號改變的話)
+                            if (para.Inlines.FirstInline is Run runSeq && runSeq.Text != $"{i + 1} ")
+                            {
+                                runSeq.Text = $"{i + 1} ";
+                            }
                         }
                     }
                     else
                     {
                         // 新增的行
-                        var newPara = CreateTrendParagraph(evt, signature, isSelected);
+                        var newPara = CreateTrendParagraph(evt, signature, isSelected, i + 1);
                         txtTrendHistory.Document.Blocks.Add(newPara);
                         hasNewTrend = true;
                     }

@@ -128,8 +128,8 @@ namespace ExtremeSignalAppCS.Services
             int daysUntilWednesday = ((int)DayOfWeek.Wednesday - (int)firstDayOfMonth.DayOfWeek + 7) % 7;
             DateTime thirdWednesday = firstDayOfMonth.AddDays(daysUntilWednesday + 14);
             
-            // 第三個星期三 14:00 結算切換點
-            DateTime thirdWedCutoff = new DateTime(thirdWednesday.Year, thirdWednesday.Month, thirdWednesday.Day, 14, 0, 0);
+            // 第三個星期三 14:50 結算切換點 (與 CheckSessionPort 的日/夜盤分界一致)
+            DateTime thirdWedCutoff = new DateTime(thirdWednesday.Year, thirdWednesday.Month, thirdWednesday.Day, 14, 50, 0);
 
             DateTime targetMonth;
             if (now >= thirdWedCutoff)
@@ -353,13 +353,13 @@ namespace ExtremeSignalAppCS.Services
         /// GetDurations 實作已移至上方並改為增量版。
         /// 這裡提供 GetDurationsFull 供離線回測或全量重算使用 (一次掃描到底)。
         /// </summary>
-        public (double? PreAvg, double? PostAvg, int? Threshold, string? TrigTime, int? TrigPrice, int ActPre, int ActPost, int LastIndex)
+        public (double? PreAvg, int PreVol, double? PostAvg, int PostVol, int? Threshold, string? TrigTime, int? TrigPrice, int ActPre, int ActPost, int LastIndex)
             GetDurationsFull(IReadOnlyList<TradeTick> trades, int n, int idx, TradeSide preSide, TradeSide postSide, int maxCount = -1)
         {
             int totalTradesCount = trades.Count;
             int limit = maxCount < 0 ? totalTradesCount : maxCount;
             if (idx >= limit || idx < 0)
-                return (null, null, null, null, null, 0, 0, idx);
+                return (null, 0, null, 0, null, null, null, 0, 0, idx);
 
             var preList = new List<TradeTick> { trades[idx] };
             int curr = idx - 1;
@@ -377,11 +377,11 @@ namespace ExtremeSignalAppCS.Services
             {
                 if (postSide == TradeSide.Inner) 
                 {
-                    if (trades[curr].Price > extremePrice) return (null, null, null, null, null, preList.Count - 1, postList.Count - 1, curr - 1);
+                    if (trades[curr].Price > extremePrice) return (null, 0, null, 0, null, null, null, preList.Count - 1, postList.Count - 1, curr - 1);
                 }
                 else 
                 {
-                    if (trades[curr].Price < extremePrice) return (null, null, null, null, null, preList.Count - 1, postList.Count - 1, curr - 1);
+                    if (trades[curr].Price < extremePrice) return (null, 0, null, 0, null, null, null, preList.Count - 1, postList.Count - 1, curr - 1);
                 }
 
                 if (trades[curr].Side == postSide) postList.Add(trades[curr]);
@@ -391,6 +391,9 @@ namespace ExtremeSignalAppCS.Services
             int actualPreN = preList.Count - 1;
             int actualPostN = postList.Count - 1;
 
+            int preVol = 0;
+            for (int i = 0; i < preList.Count; i++) preVol += preList[i].Qty;
+
             double? preAvg = null;
             if (actualPreN >= 1)
             {
@@ -398,6 +401,9 @@ namespace ExtremeSignalAppCS.Services
                 for (int i = 0; i < actualPreN; i++) preSum += (preList[i].TimeVal - preList[i + 1].TimeVal);
                 preAvg = preSum / actualPreN;
             }
+
+            int postVol = 0;
+            for (int i = 0; i < postList.Count; i++) postVol += postList[i].Qty;
 
             double? postAvg = null;
             if (actualPostN >= n)
@@ -419,7 +425,7 @@ namespace ExtremeSignalAppCS.Services
                 trigPrice = postList[^1].Price;
             }
 
-            return (preAvg, postAvg, threshold, trigTime, trigPrice, actualPreN, actualPostN, curr - 1);
+            return (preAvg, preVol, postAvg, postVol, threshold, trigTime, trigPrice, actualPreN, actualPostN, curr - 1);
         }
 
         public void GetDurations(IReadOnlyList<TradeTick> trades, int n, PendingTrigger trigger, TradeSide preSide, TradeSide postSide, int maxCount = -1)
@@ -434,6 +440,7 @@ namespace ExtremeSignalAppCS.Services
                 int currPre = idx - 1;
                 double preSum = 0;
                 double? lastPreTime = trades[idx].TimeVal;
+                int preVol = trades[idx].Qty;
 
                 while (currPre >= 0 && preCount < (n + 1))
                 {
@@ -442,12 +449,14 @@ namespace ExtremeSignalAppCS.Services
                         preCount++;
                         preSum += (lastPreTime.Value - trades[currPre].TimeVal);
                         lastPreTime = trades[currPre].TimeVal;
+                        preVol += trades[currPre].Qty;
                     }
                     currPre--;
                 }
                 
                 trigger.ActualPreN = preCount - 1;
                 trigger.PreAvg = (trigger.ActualPreN >= 1) ? (preSum / trigger.ActualPreN) : null;
+                trigger.PreVol = preVol;
                 trigger.PreScanned = true;
             }
 
@@ -459,6 +468,7 @@ namespace ExtremeSignalAppCS.Services
             if (trigger.ActualPostN == 0 && trigger.LastPostTimeVal == null)
             {
                 trigger.LastPostTimeVal = trades[idx].TimeVal;
+                trigger.PostVol = trades[idx].Qty;
                 if (postSide == TradeSide.Inner) trigger.Threshold = extremePrice; // 初始化為極值
                 else trigger.Threshold = extremePrice;
             }
@@ -1231,10 +1241,10 @@ namespace ExtremeSignalAppCS.Services
                     {
                         int aPrice = trades[aIdx].Price;
                         int currentN = useDynamicN && dynamicNMap != null ? dynamicNMap[aIdx] : obsN;
-                        var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
+                        var (pre, preVol, post, postVol, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
                             GetDurationsFull(trades, currentN, aIdx, TradeSide.Outer, TradeSide.Inner, klineEndTradeIdx);
 
-                        if (pre.HasValue && post.HasValue && actPre >= currentN && actPost >= currentN && post.Value < pre.Value && trigPrice.HasValue)
+                        if (pre.HasValue && post.HasValue && actPre >= currentN && actPost >= currentN && post.Value < pre.Value && preVol < postVol && trigPrice.HasValue)
                         {
                             var key = (aPrice, trades[aIdx].Time, currentN);
                             if (!newShortResults.Any(k => k.Key == key) && (!isLastKline || !_simCurrentKlineResults.Any(k => k.Key == key)))
@@ -1247,8 +1257,8 @@ namespace ExtremeSignalAppCS.Services
                                     BestAPrice = aPrice,
                                     TrigTime = trigTime ?? trades[aIdx].Time,
                                     TrigPrice = trigPrice.Value.ToString(),
-                                    Pre = pre.HasValue ? $"{pre.Value:F4}s" : "N/A",
-                                    Post = post.HasValue ? $"{post.Value:F4}s" : "N/A",
+                                    Pre = pre.HasValue ? $"{pre.Value:F4}-{preVol}" : "N/A",
+                                    Post = post.HasValue ? $"{post.Value:F4}-{postVol}" : "N/A",
                                     PrevHigh = prevHigh,
                                     PrevLow = prevLow,
                                     BIndex = bIdx,
@@ -1319,10 +1329,10 @@ namespace ExtremeSignalAppCS.Services
                     {
                         int aPrice = trades[aIdx].Price;
                         int currentN = useDynamicN && dynamicNMap != null ? dynamicNMap[aIdx] : obsN;
-                        var (pre, post, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
+                        var (pre, preVol, post, postVol, threshold, trigTime, trigPrice, actPre, actPost, bIdx) =
                             GetDurationsFull(trades, currentN, aIdx, TradeSide.Inner, TradeSide.Outer, klineEndTradeIdx);
 
-                        if (pre.HasValue && post.HasValue && actPre >= currentN && actPost >= currentN && post.Value < pre.Value && trigPrice.HasValue)
+                        if (pre.HasValue && post.HasValue && actPre >= currentN && actPost >= currentN && post.Value < pre.Value && preVol < postVol && trigPrice.HasValue)
                         {
                             var key = (aPrice, trades[aIdx].Time, currentN);
                             if (!newLongResults.Any(k => k.Key == key) && (!isLastKline || !_simCurrentKlineResults.Any(k => k.Key == key)))
@@ -1335,8 +1345,8 @@ namespace ExtremeSignalAppCS.Services
                                     BestAPrice = aPrice,
                                     TrigTime = trigTime ?? trades[aIdx].Time,
                                     TrigPrice = trigPrice.Value.ToString(),
-                                    Pre = pre.HasValue ? $"{pre.Value:F4}s" : "N/A",
-                                    Post = post.HasValue ? $"{post.Value:F4}s" : "N/A",
+                                    Pre = pre.HasValue ? $"{pre.Value:F4}-{preVol}" : "N/A",
+                                    Post = post.HasValue ? $"{post.Value:F4}-{postVol}" : "N/A",
                                     PrevHigh = prevHigh,
                                     PrevLow = prevLow,
                                     BIndex = bIdx,
@@ -1872,12 +1882,14 @@ namespace ExtremeSignalAppCS.Models
         
         // 前向掃描 (Pre) 快取結果，因為發生當下就已經固定了
         public double? PreAvg { get; set; }
+        public int PreVol { get; set; }
         public int ActualPreN { get; set; }
         public bool PreScanned { get; set; }
 
         // 後向掃描 (Post) 增量狀態
         public int ActualPostN { get; set; }
         public double PostSum { get; set; }
+        public int PostVol { get; set; }
         public double? LastPostTimeVal { get; set; }
         public int? Threshold { get; set; }
         public string? TrigTime { get; set; }
@@ -1908,7 +1920,9 @@ namespace ExtremeSignalAppCS.Models
         public string TrigTime { get; set; } = "";
         public int TrigPrice { get; set; }
         public double? Pre { get; set; }
+        public int PreVol { get; set; }
         public double? Post { get; set; }
+        public int PostVol { get; set; }
         public int AmpVal { get; set; }
         public int BIdx { get; set; }
         public bool IsTrigH { get; set; }
