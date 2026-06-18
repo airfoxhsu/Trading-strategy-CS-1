@@ -1981,22 +1981,25 @@ namespace ExtremeSignalAppCS
 
             if (oldLen == 0 && newLen == 0) return;
 
-            if (oldLen == newLen)
+            int minLen = Math.Min(oldLen, newLen);
+            for (int i = 0; i < minLen; i++)
             {
-                for (int i = 0; i < newLen; i++)
-                    copyFields(target[i], source[i]);
+                copyFields(target[i], source[i]);
             }
-            else if (newLen > oldLen)
+
+            if (newLen > oldLen)
             {
-                for (int i = 0; i < oldLen; i++)
-                    copyFields(target[i], source[i]);
                 for (int i = oldLen; i < newLen; i++)
+                {
                     target.Add(source[i]);
+                }
             }
-            else
+            else if (newLen < oldLen)
             {
-                target.Clear();
-                foreach (var s in source) target.Add(s);
+                for (int i = oldLen - 1; i >= newLen; i--)
+                {
+                    target.RemoveAt(i);
+                }
             }
         }
 

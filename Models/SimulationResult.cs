@@ -106,11 +106,17 @@ namespace ExtremeSignalAppCS.Models
 
         public void UpdateTags(IEnumerable<string> newTags)
         {
-            Tags.Clear();
-            Tags.AddRange(newTags);
-            OnPropertyChanged(nameof(ForegroundColor));
-            OnPropertyChanged(nameof(BackgroundColor));
-            OnPropertyChanged(nameof(FontWeightVal));
+            var newList = newTags.ToList();
+            bool isChanged = Tags.Count != newList.Count || !Tags.SequenceEqual(newList);
+
+            if (isChanged)
+            {
+                Tags.Clear();
+                Tags.AddRange(newList);
+                OnPropertyChanged(nameof(ForegroundColor));
+                OnPropertyChanged(nameof(BackgroundColor));
+                OnPropertyChanged(nameof(FontWeightVal));
+            }
         }
 
         // --- 核心狀態追蹤屬性 (不直接綁定 DataGrid，但用於引擎計算與破位檢測) ---
