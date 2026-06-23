@@ -846,6 +846,19 @@ namespace ExtremeSignalAppCS
                     int weekday = (int)now.DayOfWeek;
                     int timeVal = now.Hour * 3600 + now.Minute * 60 + now.Second;
 
+                    // 檢查是否為週末休盤 (週日全天，或週六早上 5 點後)
+                    bool isWeekendClosed = (weekday == 0) || (weekday == 6 && timeVal > 5 * 3600);
+                    if (isWeekendClosed)
+                    {
+                        AppendLog("【系統】目前為週末休盤期間，停止自動重新連線。");
+                        if (chkTelegram.IsChecked == true)
+                        {
+                            _tgService.PushMessage($"🚨 台指極值元大行情網路中斷！目前為週末休盤，已停止自動重連 ({status})");
+                        }
+                        StopRealtime();
+                        return;
+                    }
+
                     bool isDaySession = (1 <= weekday && weekday <= 5) && (timeVal >= 8 * 3600 + 45 * 60 && timeVal <= 13 * 3600 + 45 * 60);
                     bool isNightSession1 = (1 <= weekday && weekday <= 5) && (timeVal >= 15 * 3600);
                     bool isNightSession2 = (2 <= weekday && weekday <= 6) && (timeVal <= 5 * 3600);

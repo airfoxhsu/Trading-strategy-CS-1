@@ -62,6 +62,22 @@ namespace ExtremeSignalAppCS.Helper
             string timeStr = mtMatch.Groups[1].Value;
             double tValRaw = TimeParser.ParseTime(timeStr);
 
+            // 擷取 Log 寫入時間 (格式例如 "06:32:16.975") 進行防呆，過濾盤後結算假 Tick
+            if (line.Length >= 12 && line[2] == ':' && line[5] == ':')
+            {
+                int h = (line[0] - '0') * 10 + (line[1] - '0');
+                int m = (line[3] - '0') * 10 + (line[4] - '0');
+                int s = (line[6] - '0') * 10 + (line[7] - '0');
+                double logTimeRaw = h * 3600 + m * 60 + s;
+                
+                double delay = logTimeRaw - tValRaw;
+                if (delay < -43200) delay += 86400;      // 跨日處理: LogTime 在凌晨，mattime 在深夜
+                else if (delay > 43200) delay -= 86400;  // 跨日處理 (極端異常保護)
+                
+                if (delay > 300) 
+                    return null; // 延遲超過 5 分鐘，視為結算價或無效 Tick 捨棄
+            }
+
             string session = "";
             double tVal = tValRaw;
 
